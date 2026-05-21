@@ -7,7 +7,7 @@ main technical workstreams around Go-IMPaCT genomic data operations:
 
 | Area | Purpose | Current status |
 | --- | --- | --- |
-| Beacon | Support data discovery workflows around Beacon v2 deployments. | Documentation scaffold. |
+| Beacon | Support data discovery workflows around Beacon v2 deployments. | Initial CLI tools available. |
 | Affiliated EGA | Prepare, encrypt and transfer files for a LocalEGA / Federated EGA Affiliate deployment. | Initial CLI tools available. |
 
 ## Repository Map
@@ -16,6 +16,9 @@ main technical workstreams around Go-IMPaCT genomic data operations:
 impact-tools/
 ├── impact_tools/
 │   ├── __main__.py              # CLI entry point: impact-tools
+│   ├── beacon/
+│   │   ├── liftover.py          # Beacon liftover workflow (GRCh37 -> GRCh38)
+│   │   └── pgx.py               # pgx_pilot workspace preparation and execution
 │   └── ega/
 │       ├── encrypt.py           # Crypt4GH encryption workflow
 │       └── upload_inbox.py      # LocalEGA Inbox SFTP upload workflow
@@ -39,28 +42,168 @@ Check the CLI:
 
 ```bash
 impact-tools --help
+impact-tools beacon --help
 impact-tools ega --help
 ```
 
 ## Beacon Workstream
 
-The Beacon part of this repository is intended to collect tools and operational
-documentation for the Go-IMPaCT Beacon v2 deployment.
+The Beacon tooling covers the operational steps needed to prepare genomic data
+for ingestion into a Beacon v2 deployment.
 
-Planned scope:
+Current focus:
 
-| Topic | Description |
-| --- | --- |
-| Data preparation | Helpers to validate and transform genomic metadata before Beacon ingestion. |
-| Ingestion support | Scripts and checks around loading data into the Beacon backend. |
-| Deployment notes | Operational documentation for running and maintaining the Beacon stack. |
-| Query validation | Reproducible checks for Beacon discovery and variant queries. |
+1. Detect the genome build of input VCFs.
+2. Lift over variants from GRCh37 to GRCh38 using CrossMap via Docker.
+3. Fix contig headers, sort, compress and index the output.
+4. Clean obsolete INFO annotations incompatible with downstream ingestion.
+5. Infer sample sex from non-ref chrY variant counts.
+6. Prepare per-sample pgx_pilot workspaces (symlinks, config, samples.tsv).
+7. Run the pgx_pilot Snakemake pipeline via Docker to produce sites-only VCFs.
 
-Documentation entry point:
+### Workflow Overview
 
 ```text
-docs/beacon/README.md
+WGS VCFs (GRCh37, inputs/)
+        |
+        v
+impact-tools beacon liftover
+        |
+        |  <sample>.GRCh38.clean.vcf.gz
+        |  <sample>.GRCh38.clean.vcf.gz.tbi
+        v
+Lifted VCFs (GRCh38, liftover/)
+        |
+        v
+impact-tools beacon pgx
+        |
+        |  inputs/samples.tsv          (sex inferred from chrY)
+        |  pgx_runs/<sample>/          (workspace per sample)
+        |  <sample>.sites.pass.vcf.gz  (Beacon-ready, PASS QC)
+        v
+Beacon v2 ingestion pipeline
 ```
+
+### Liftover VCFs
+
+The command expects input VCFs under `<base-dir>/inputs/` and liftover resources
+under `<base-dir>/liftover/resources/`:
+
+```text
+<base-dir>/
+├── inputs/                                                    # *.vcf.gz, may be symlinks
+└── liftover/
+    └── resources/
+        ├── hg19ToHg38.over.chain.gz
+        ├── GRCh38_full_analysis_set_plus_decoy_hla.fa
+        └── GRCh38_full_analysis_set_plus_decoy_hla.fa.fai
+```
+
+The `liftover/` and `logs/` directories are created automatically on first run.
+
+Check input builds without running liftover:
+
+```bash
+impact-tools beacon liftover --check
+```
+
+Run liftover from a specific working directory:
+
+```bash
+impact-tools beacon liftover \
+  --base-dir /home/mmatitos/beacon_demo
+```
+
+Remove intermediate files after a successful run:
+
+```bash
+impact-tools beacon liftover \
+  --base-dir /home/mmatitos/beacon_demo \
+  --cleanup
+```
+
+Use alternative resource paths when chain and reference FASTA are not in the
+default `resources/` location:
+
+```bash
+impact-tools beacon liftover \
+  --chain /data/resources/hg19ToHg38.over.chain.gz \
+  --fasta /data/resources/GRCh38_full_analysis_set_plus_decoy_hla.fa
+```
+
+Process samples in parallel (default 4 workers):
+
+```bash
+impact-tools beacon liftover --base-dir /home/mmatitos/beacon_demo --workers 8
+```
+
+### Liftover Outputs
+
+Each liftover run writes per sample under `<base-dir>/liftover/`:
+
+| File | Content |
+| --- | --- |
+| `<sample>.GRCh38.clean.vcf.gz` | Lifted, sorted VCF with obsolete INFO tags removed. |
+| `<sample>.GRCh38.clean.vcf.gz.tbi` | Tabix index. |
+| `<sample>_liftover.log` | Full stdout/stderr log from bcftools and CrossMap. |
+
+### Prepare and Run pgx_pilot
+
+The command reads lifted VCFs from `liftover/`, infers sample sex by counting
+non-ref variants on chrY, creates one workspace per sample under `pgx_runs/`,
+and runs the pgx_pilot Snakemake pipeline via Docker.
+
+Sex inference is automatic. Samples whose chrY variant count falls between
+`--sex-ambiguous-min` (default 5 000) and `--sex-ambiguous-max` (default 7 000)
+are flagged and the user is prompted to enter the sex manually.
+
+The `pgx_runs/Snakefile` must exist with the local patches applied before
+running. The `pgx_pilot` Docker image must also be available locally.
+
+Run the full pipeline (prepare workspaces + execute pgx_pilot):
+
+```bash
+impact-tools beacon pgx \
+  --base-dir /home/mmatitos/beacon_demo \
+  --pgx-repo /home/mmatitos/git/beacon2/pgx_pilot
+```
+
+Only prepare workspaces and `inputs/samples.tsv` without running the pipeline:
+
+```bash
+impact-tools beacon pgx --base-dir /home/mmatitos/beacon_demo --prepare
+```
+
+Only run pgx_pilot on already-prepared workspaces:
+
+```bash
+impact-tools beacon pgx \
+  --base-dir /home/mmatitos/beacon_demo \
+  --pgx-repo /home/mmatitos/git/beacon2/pgx_pilot \
+  --run 
+```
+
+Process samples in parallel (default 4 workers — applies to sex inference, workspace prep and pgx_pilot runs):
+
+```bash
+impact-tools beacon pgx \
+  --base-dir /home/mmatitos/beacon_demo \
+  --pgx-repo /home/mmatitos/git/beacon2/pgx_pilot \
+  --workers 8
+```
+
+The `--pgx-repo` path can also be set via the `PGX_REPO` environment variable.
+
+### pgx_pilot Outputs
+
+| File | Content |
+| --- | --- |
+| `inputs/samples.tsv` | Global sample manifest with inferred sex. Created and updated automatically. |
+| `pgx_runs/<sample>/config.yaml` | pgx_pilot config for this sample. |
+| `pgx_runs/<sample>/data/samples.tsv` | Single-row per-sample metadata (sex, country code). |
+| `pgx_runs/<sample>/results/<sample>.sites.all.vcf.gz` | Sites-only VCF, all variants. |
+| `pgx_runs/<sample>/results/<sample>.sites.pass.vcf.gz` | Sites-only VCF, PASS QC only (Beacon-ready). |
+| `logs/<sample>_pgx.log` | Snakemake stdout/stderr log. |
 
 ## Affiliated EGA Workstream
 
@@ -234,6 +377,14 @@ The upload command transfers encrypted files to the Inbox. The subsequent
 LocalEGA ingestion, accessioning, dataset mapping, release, DAC permission
 propagation and distribution steps are handled by the LocalEGA / CEGA workflow.
 
+### Parallel Execution
+
+Both `beacon liftover` and `beacon pgx` support `--workers N` to process
+multiple samples concurrently using threads. Each worker runs independent Docker
+containers, so `--workers` also controls the maximum number of simultaneous
+containers. The default is 4. Tune this value to your available CPU, memory, and
+Docker daemon capacity.
+
 ## Development
 
 Run syntax checks:
@@ -241,6 +392,8 @@ Run syntax checks:
 ```bash
 python3 -m py_compile \
   impact_tools/__main__.py \
+  impact_tools/beacon/liftover.py \
+  impact_tools/beacon/pgx.py \
   impact_tools/ega/encrypt.py \
   impact_tools/ega/upload_inbox.py
 ```
@@ -249,6 +402,8 @@ Inspect CLI help:
 
 ```bash
 python3 -m impact_tools --help
+python3 -m impact_tools beacon liftover --help
+python3 -m impact_tools beacon pgx --help
 python3 -m impact_tools ega encrypt --help
 python3 -m impact_tools ega upload-inbox --help
 ```
