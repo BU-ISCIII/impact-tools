@@ -13,7 +13,8 @@ from rich.traceback import install as install_rich_traceback
 from impact_tools import __version__
 from impact_tools.ega.encrypt import EncryptionConfig, run_encryption
 from impact_tools.ega.upload_inbox import InboxUploadConfig, run_inbox_upload
-from impact_tools.beacon import liftover, pgx
+from impact_tools.beacon import liftover as beacon_liftover
+from impact_tools.beacon import pgx as beacon_pgx
 
 log = logging.getLogger(__name__)
 
@@ -350,13 +351,13 @@ def beacon() -> None:
 )
 @click.option(
     "--bcftools-image",
-    default=liftover.BCFTOOLS_IMAGE,
+    default=beacon_liftover.BCFTOOLS_IMAGE,
     show_default=True,
     help="Docker image for bcftools.",
 )
 @click.option(
     "--crossmap-image",
-    default=liftover.CROSSMAP_IMAGE,
+    default=beacon_liftover.CROSSMAP_IMAGE,
     show_default=True,
     help="Docker image for CrossMap.",
 )
@@ -404,7 +405,7 @@ def liftover_cmd(
     base_dir = base_dir.resolve()
 
     try:
-        check_results = liftover.check_liftover_inputs(base_dir)
+        check_results = beacon_liftover.check_liftover_inputs(base_dir)
     except Exception as exc:  # noqa: BLE001 - CLI boundary converts to clean error
         raise click.ClickException(str(exc)) from exc
 
@@ -460,7 +461,7 @@ def liftover_cmd(
             log.info("Cancelled.")
             return
 
-    config = liftover.LiftoverConfig(
+    config = beacon_liftover.LiftoverConfig(
         base_dir=base_dir,
         chain=chain,
         fasta=fasta,
@@ -472,7 +473,7 @@ def liftover_cmd(
     )
 
     try:
-        result = liftover.run_liftover(config)
+        result = beacon_liftover.run_liftover(config)
     except Exception as exc:  # noqa: BLE001 - CLI boundary converts to clean error
         raise click.ClickException(str(exc)) from exc
 
@@ -507,25 +508,25 @@ def liftover_cmd(
 )
 @click.option(
     "--sex-ambiguous-min",
-    default=pgx.DEFAULT_SEX_AMBIGUOUS_MIN,
+    default=beacon_pgx.DEFAULT_SEX_AMBIGUOUS_MIN,
     show_default=True,
     help="Lower bound of the ambiguous sex zone (manual input required).",
 )
 @click.option(
     "--sex-ambiguous-max",
-    default=pgx.DEFAULT_SEX_AMBIGUOUS_MAX,
+    default=beacon_pgx.DEFAULT_SEX_AMBIGUOUS_MAX,
     show_default=True,
     help="Upper bound of the ambiguous sex zone (manual input required).",
 )
 @click.option(
     "--bcftools-image",
-    default=pgx.BCFTOOLS_IMAGE,
+    default=beacon_pgx.BCFTOOLS_IMAGE,
     show_default=True,
     help="Docker image for bcftools (used for chrY sex inference).",
 )
 @click.option(
     "--pgx-image",
-    default=pgx.PGX_IMAGE,
+    default=beacon_pgx.PGX_IMAGE,
     show_default=True,
     help="Docker image for pgx_pilot.",
 )
@@ -597,7 +598,7 @@ def pgx_cmd(
 
     base_dir = base_dir.resolve()
 
-    config = pgx.PgxConfig(
+    config = beacon_pgx.PgxConfig(
         base_dir=base_dir,
         country_code=country_code,
         sex_ambiguous_min=sex_ambiguous_min,
@@ -610,16 +611,16 @@ def pgx_cmd(
     )
 
     try:
-        pgx.validate_pgx_layout(config)
+        beacon_pgx.validate_pgx_layout(config)
         if not prepare:
-            pgx.validate_pgx_run_prereqs(config)
+            beacon_pgx.validate_pgx_run_prereqs(config)
     except Exception as exc:  # noqa: BLE001
         raise click.ClickException(str(exc)) from exc
 
     # ----------------------------------------------------------------
     # Discover lifted VCFs; compare against existing samples.tsv
     # ----------------------------------------------------------------
-    lifted_vcfs = pgx.discover_lifted_vcfs(base_dir)
+    lifted_vcfs = beacon_pgx.discover_lifted_vcfs(base_dir)
     if not lifted_vcfs:
         raise click.ClickException(
             f"No *.GRCh38.clean.vcf.gz files found in {base_dir / 'liftover'}. "
@@ -627,7 +628,7 @@ def pgx_cmd(
         )
 
     existing = (
-        pgx.read_samples_tsv(config.samples_tsv)
+        beacon_pgx.read_samples_tsv(config.samples_tsv)
         if config.samples_tsv.exists()
         else []
     )
@@ -635,7 +636,7 @@ def pgx_cmd(
 
     new_vcfs = [
         vcf for vcf in lifted_vcfs
-        if pgx.vcf_to_sample_id(vcf) not in existing_ids
+        if beacon_pgx.vcf_to_sample_id(vcf) not in existing_ids
     ]
 
     log.info("==========================================")
@@ -650,13 +651,13 @@ def pgx_cmd(
     # Infer sex for new samples in parallel; prompt for ambiguous cases
     # sequentially; write TSV once after all records are resolved
     # ----------------------------------------------------------------
-    new_records: list[pgx.SampleRecord] = []
+    new_records: list[beacon_pgx.SampleRecord] = []
     if new_vcfs:
         log.info(
             "Counting non-ref chrY variants for %d new sample(s) (workers=%d)...",
             len(new_vcfs), workers,
         )
-        inferences = pgx.infer_sex_batch(config, [v.name for v in new_vcfs])
+        inferences = beacon_pgx.infer_sex_batch(config, [v.name for v in new_vcfs])
 
         for vcf, inference in zip(new_vcfs, inferences):
             if inference is None:
@@ -681,14 +682,14 @@ def pgx_cmd(
                     vcf.name, inference.sample_id, inference.n_chry, sex,
                 )
 
-            new_records.append(pgx.SampleRecord(
+            new_records.append(beacon_pgx.SampleRecord(
                 sample_id=inference.sample_id,
                 sex=sex,
                 country_code=country_code,
             ))
 
         for record in new_records:
-            pgx.append_sample_to_tsv(config.samples_tsv, record)
+            beacon_pgx.append_sample_to_tsv(config.samples_tsv, record)
             log.info("[%s] Added to samples.tsv", record.sample_id)
 
     all_records = existing + new_records
@@ -714,24 +715,24 @@ def pgx_cmd(
     # ----------------------------------------------------------------
     # Prepare workspaces (parallel)
     # ----------------------------------------------------------------
-    prepare_results: list[pgx.WorkspaceResult] = []
+    prepare_results: list[beacon_pgx.WorkspaceResult] = []
     if not run:
         log.info("==========================================")
         log.info("Preparing workspaces  (workers=%d)", workers)
         log.info("==========================================")
-        prepare_results = pgx.prepare_workspaces(config, all_records)
+        prepare_results = beacon_pgx.prepare_workspaces(config, all_records)
 
     # ----------------------------------------------------------------
     # Run pgx_pilot (parallel)
     # ----------------------------------------------------------------
-    run_results: list[pgx.PgxRunResult] = []
+    run_results: list[beacon_pgx.PgxRunResult] = []
     if not prepare:
         log.info("==========================================")
         log.info("Running pgx_pilot  (workers=%d)", workers)
         log.info("==========================================")
-        run_results = pgx.run_pgx_pilots(config, all_records)
+        run_results = beacon_pgx.run_pgx_pilots(config, all_records)
 
-    pipeline_result = pgx.PgxPipelineResult(
+    pipeline_result = beacon_pgx.PgxPipelineResult(
         prepare_results=prepare_results,
         run_results=run_results,
     )
