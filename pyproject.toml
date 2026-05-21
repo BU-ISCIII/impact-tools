@@ -1,5 +1,29 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "impact-tools"
 version = "0.1.0"
 description = "Utilities for Go-IMPaCT Beacon and EGA workflows"
 requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1",
+    "paramiko>=3.4",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+plots = [
+    "matplotlib>=3.7",
+]
+
+[project.scripts]
+impact-tools = "impact_tools.__main__:main"
+
+[tool.setuptools.packages.find]
+exclude = ["docs"]
+
+[tool.setuptools]
+include-package-data = true
+zip-safe = false

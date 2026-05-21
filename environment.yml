@@ -3,3 +3,11 @@ channels:
   - conda-forge
 dependencies:
   - python>=3.10
+  - click
+  - paramiko
+  - rich
+  - matplotlib
+  - crypt4gh
+  - pip
+  - pip:
+      - -e .
