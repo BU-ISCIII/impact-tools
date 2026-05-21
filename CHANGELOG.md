@@ -17,6 +17,7 @@ where possible.
 ### Credits
 
 - [Alejandro Bernabeu](https://github.com/Aberdur)
+- [Magdalena Matito](https://github.com/magdasmat)
 
 ### Added
 
@@ -25,3 +26,6 @@ where possible.
 - Added Affiliated EGA commands to encrypt files with Crypt4GH and upload
   encrypted `.c4gh` files to a LocalEGA Inbox, including logs, metrics,
   summaries and manifests. [#2](https://github.com/BU-ISCIII/impact-tools/pull/2)
+- Added Beacon `liftover` command to detect genome build and lift over VCFs from
+  GRCh37 to GRCh38 using CrossMap via Docker and `pgx` command to prepare
+  per-sample pgx_pilot workspaces and run the pgx_pilot Snakemake pipeline [#3](https://github.com/BU-ISCIII/impact-tools/pull/3)
