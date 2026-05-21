@@ -21,7 +21,7 @@ where possible.
 ### Added
 
 - Created the initial `impact-tools` package and CLI structure for Go-IMPaCT
-  Beacon and Affiliated EGA operational workflows.
+  Beacon and Affiliated EGA operational workflows.[#2](https://github.com/BU-ISCIII/impact-tools/pull/2)
 - Added Affiliated EGA commands to encrypt files with Crypt4GH and upload
   encrypted `.c4gh` files to a LocalEGA Inbox, including logs, metrics,
-  summaries and manifests.
+  summaries and manifests. [#2](https://github.com/BU-ISCIII/impact-tools/pull/2)
