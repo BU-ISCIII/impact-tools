@@ -3,6 +3,7 @@ channels:
   - conda-forge
 dependencies:
   - python>=3.10
+  - pyyaml>=5.1.2
   - click
   - paramiko
   - rich
