@@ -49,7 +49,7 @@ impact-tools ega --help
 ## Beacon Workstream
 
 The Beacon tooling covers the operational steps needed to prepare genomic data
-for ingestion into a Beacon v2 deployment.
+for ingestion into the Go-IMPaCT Beacon v2 deployment.
 
 Current focus:
 
@@ -377,7 +377,7 @@ The upload command transfers encrypted files to the Inbox. The subsequent
 LocalEGA ingestion, accessioning, dataset mapping, release, DAC permission
 propagation and distribution steps are handled by the LocalEGA / CEGA workflow.
 
-### Parallel Execution
+### Parallel execution for Beacon preprocessing
 
 Both `beacon liftover` and `beacon pgx` support `--workers N` to process
 multiple samples concurrently using threads. Each worker runs independent Docker
