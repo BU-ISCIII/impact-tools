@@ -13,6 +13,9 @@ from rich.traceback import install as install_rich_traceback
 from impact_tools import __version__
 from impact_tools.ega.encrypt import EncryptionConfig, run_encryption
 from impact_tools.ega.upload_inbox import InboxUploadConfig, run_inbox_upload
+from impact_tools.beacon import liftover, pgx
+
+log = logging.getLogger(__name__)
 
 
 def configure_logging(verbose: bool, log_file: Path | None) -> None:
@@ -306,6 +309,448 @@ def upload_inbox_cmd(
         raise click.ClickException(
             f"Inbox upload finished with {result.failed} failed file(s). "
             f"See log: {result.log_file}"
+        )
+
+
+@cli.group()
+def beacon() -> None:
+    """Tools for Beacon workflows."""
+
+
+@beacon.command("liftover")
+@click.option(
+    "-b",
+    "--base-dir",
+    type=click.Path(path_type=Path, file_okay=False, exists=True),
+    default=Path("."),
+    show_default="current working directory",
+    help="Base working directory. Defaults to the current directory.",
+)
+@click.option(
+    "--chain",
+    type=click.Path(path_type=Path, dir_okay=False),
+    help=(
+        "Chain file for liftover. "
+        "Defaults to <base-dir>/liftover/resources/hg19ToHg38.over.chain.gz."
+    ),
+)
+@click.option(
+    "--fasta",
+    type=click.Path(path_type=Path, dir_okay=False),
+    help=(
+        "Reference FASTA for target build. "
+        "Defaults to <base-dir>/liftover/resources/GRCh38_full_analysis_set_plus_decoy_hla.fa."
+    ),
+)
+@click.option(
+    "--hpc-mount",
+    default="/data/ucct/bi",
+    show_default=True,
+    help="HPC mount point passed as a read-only Docker volume to resolve input symlinks.",
+)
+@click.option(
+    "--bcftools-image",
+    default=liftover.BCFTOOLS_IMAGE,
+    show_default=True,
+    help="Docker image for bcftools.",
+)
+@click.option(
+    "--crossmap-image",
+    default=liftover.CROSSMAP_IMAGE,
+    show_default=True,
+    help="Docker image for CrossMap.",
+)
+@click.option(
+    "--cleanup",
+    is_flag=True,
+    help="Remove intermediate files after the pipeline completes.",
+)
+@click.option(
+    "-w",
+    "--workers",
+    default=4,
+    show_default=True,
+    help="Parallel worker threads for processing multiple samples.",
+)
+@click.option(
+    "--check",
+    "check_only",
+    is_flag=True,
+    help="Only check inputs and detected genome builds; do not run liftover.",
+)
+@click.option(
+    "-y",
+    "--yes",
+    is_flag=True,
+    help="Continue without interactive confirmation.",
+)
+def liftover_cmd(
+    base_dir: Path,
+    chain: Path | None,
+    fasta: Path | None,
+    hpc_mount: str,
+    bcftools_image: str,
+    crossmap_image: str,
+    cleanup: bool,
+    workers: int,
+    check_only: bool,
+    yes: bool,
+) -> None:
+    """Run Beacon liftover workflow (GRCh37 -> GRCh38) using CrossMap via Docker.
+
+    The command first validates input VCFs and detects their genome build.
+    If all inputs are already GRCh38, liftover is skipped.
+    """
+    base_dir = base_dir.resolve()
+
+    try:
+        check_results = liftover.check_liftover_inputs(base_dir)
+    except Exception as exc:  # noqa: BLE001 - CLI boundary converts to clean error
+        raise click.ClickException(str(exc)) from exc
+
+    log.info("==========================================")
+    log.info("Beacon liftover")
+    log.info("==========================================")
+    log.info("Base directory: %s", base_dir)
+    log.info("Target build:   GRCh38")
+    log.info("==========================================")
+
+    detected_builds: set[str] = set()
+
+    for vcf, build, contig_style, chr1_length in check_results:
+        detected_builds.add(build)
+        log.info(
+            "  %s: build=%s, contig_style=%s, chr1_length=%s",
+            vcf.name,
+            build,
+            contig_style,
+            chr1_length if chr1_length is not None else "N/A",
+        )
+
+    log.info("==========================================")
+
+    if "unknown" in detected_builds:
+        log.warning("At least one VCF build could not be detected.")
+
+    if len(detected_builds) > 1:
+        log.warning(
+            "Mixed or uncertain builds detected: %s",
+            ", ".join(sorted(detected_builds)),
+        )
+
+    if detected_builds == {"GRCh38"}:
+        log.info("Status: input already matches GRCh38. Liftover not required.")
+        if check_only:
+            log.info("Check completed.")
+        return
+    elif detected_builds == {"GRCh37"}:
+        log.info("Status: liftover GRCh37 -> GRCh38 is required.")
+    else:
+        log.warning("Status: manual review recommended before running liftover.")
+
+    if check_only:
+        log.info("Check completed. Liftover was not executed because --check was used.")
+        return
+
+    if not yes:
+        msg = "Continue with liftover execution?"
+        if cleanup:
+            msg = "Continue with liftover execution? (intermediate files will be removed on success)"
+        if not click.confirm(msg, default=False):
+            log.info("Cancelled.")
+            return
+
+    config = liftover.LiftoverConfig(
+        base_dir=base_dir,
+        chain=chain,
+        fasta=fasta,
+        hpc_mount=hpc_mount,
+        bcftools_image=bcftools_image,
+        crossmap_image=crossmap_image,
+        cleanup=cleanup,
+        workers=workers,
+    )
+
+    try:
+        result = liftover.run_liftover(config)
+    except Exception as exc:  # noqa: BLE001 - CLI boundary converts to clean error
+        raise click.ClickException(str(exc)) from exc
+
+    log.info("==========================================")
+    log.info("Liftover summary")
+    log.info("==========================================")
+    log.info("  Samples OK:       %d", len(result.results) - result.failed - result.warned)
+    log.info("  Samples warnings: %d", result.warned)
+    log.info("  Samples failed:   %d", result.failed)
+
+    if result.failed > 0:
+        raise click.ClickException(
+            f"Liftover finished with {result.failed} failed sample(s). "
+            "Check logs in <base-dir>/logs/ for details."
+        )
+
+
+@beacon.command("pgx")
+@click.option(
+    "-b",
+    "--base-dir",
+    type=click.Path(path_type=Path, file_okay=False, exists=True),
+    default=Path("."),
+    show_default="current working directory",
+    help="Base working directory.",
+)
+@click.option(
+    "--country-code",
+    default="ES",
+    show_default=True,
+    help="ISO 3166-1 alpha-2 country code written into each workspace samples.tsv.",
+)
+@click.option(
+    "--sex-ambiguous-min",
+    default=pgx.DEFAULT_SEX_AMBIGUOUS_MIN,
+    show_default=True,
+    help="Lower bound of the ambiguous sex zone (manual input required).",
+)
+@click.option(
+    "--sex-ambiguous-max",
+    default=pgx.DEFAULT_SEX_AMBIGUOUS_MAX,
+    show_default=True,
+    help="Upper bound of the ambiguous sex zone (manual input required).",
+)
+@click.option(
+    "--bcftools-image",
+    default=pgx.BCFTOOLS_IMAGE,
+    show_default=True,
+    help="Docker image for bcftools (used for chrY sex inference).",
+)
+@click.option(
+    "--pgx-image",
+    default=pgx.PGX_IMAGE,
+    show_default=True,
+    help="Docker image for pgx_pilot.",
+)
+@click.option(
+    "--pgx-repo",
+    type=click.Path(path_type=Path, file_okay=False),
+    envvar="PGX_REPO",
+    help=(
+        "Path to the pgx_pilot repository. "
+        "scripts/ and resources/ are mounted read-only into each run container. "
+        "Can also be set via the PGX_REPO environment variable."
+    ),
+)
+@click.option(
+    "--snakemake-jobs",
+    default=8,
+    show_default=True,
+    help="Parallel jobs passed to Snakemake (-j).",
+)
+@click.option(
+    "-w",
+    "--workers",
+    default=4,
+    show_default=True,
+    help="Parallel worker threads (sex inference, workspace prep, pgx runs).",
+)
+@click.option(
+    "--prepare",
+    is_flag=True,
+    help="Only prepare workspaces and samples.tsv; do not run pgx_pilot.",
+)
+@click.option(
+    "--run",
+    is_flag=True,
+    help="Only run pgx_pilot; skip workspace preparation (workspaces must already exist).",
+)
+@click.option(
+    "-y",
+    "--yes",
+    is_flag=True,
+    help="Continue without interactive confirmation.",
+)
+def pgx_cmd(
+    base_dir: Path,
+    country_code: str,
+    sex_ambiguous_min: int,
+    sex_ambiguous_max: int,
+    bcftools_image: str,
+    pgx_image: str,
+    pgx_repo: Path | None,
+    snakemake_jobs: int,
+    workers: int,
+    prepare: bool,
+    run: bool,
+    yes: bool,
+) -> None:
+    """Prepare pgx_pilot workspaces and run the AF pipeline for each WGS sample.
+
+    Reads lifted VCFs from <base-dir>/liftover/, infers sample sex from chrY
+    variant counts (ambiguous cases are asked interactively), creates one
+    workspace per sample under <base-dir>/pgx_runs/, then runs the pgx_pilot
+    Snakemake pipeline via Docker.
+
+    Use --prepare to stop after workspace creation, or --run to skip
+    preparation and go straight to execution.
+    """
+    if prepare and run:
+        raise click.UsageError("--prepare and --run are mutually exclusive.")
+
+    base_dir = base_dir.resolve()
+
+    config = pgx.PgxConfig(
+        base_dir=base_dir,
+        country_code=country_code,
+        sex_ambiguous_min=sex_ambiguous_min,
+        sex_ambiguous_max=sex_ambiguous_max,
+        bcftools_image=bcftools_image,
+        pgx_image=pgx_image,
+        pgx_repo=pgx_repo,
+        snakemake_jobs=snakemake_jobs,
+        workers=workers,
+    )
+
+    try:
+        pgx.validate_pgx_layout(config)
+        if not prepare:
+            pgx.validate_pgx_run_prereqs(config)
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(str(exc)) from exc
+
+    # ----------------------------------------------------------------
+    # Discover lifted VCFs; compare against existing samples.tsv
+    # ----------------------------------------------------------------
+    lifted_vcfs = pgx.discover_lifted_vcfs(base_dir)
+    if not lifted_vcfs:
+        raise click.ClickException(
+            f"No *.GRCh38.clean.vcf.gz files found in {base_dir / 'liftover'}. "
+            "Run `impact-tools beacon liftover` first."
+        )
+
+    existing = (
+        pgx.read_samples_tsv(config.samples_tsv)
+        if config.samples_tsv.exists()
+        else []
+    )
+    existing_ids = {r.sample_id for r in existing}
+
+    new_vcfs = [
+        vcf for vcf in lifted_vcfs
+        if pgx.vcf_to_sample_id(vcf) not in existing_ids
+    ]
+
+    log.info("==========================================")
+    log.info("Beacon pgx")
+    log.info("==========================================")
+    log.info("Base directory:      %s", base_dir)
+    log.info("Lifted VCFs found:   %d", len(lifted_vcfs))
+    log.info("Already in samples.tsv: %d  |  new: %d", len(existing), len(new_vcfs))
+    log.info("==========================================")
+
+    # ----------------------------------------------------------------
+    # Infer sex for new samples in parallel; prompt for ambiguous cases
+    # sequentially; write TSV once after all records are resolved
+    # ----------------------------------------------------------------
+    new_records: list[pgx.SampleRecord] = []
+    if new_vcfs:
+        log.info(
+            "Counting non-ref chrY variants for %d new sample(s) (workers=%d)...",
+            len(new_vcfs), workers,
+        )
+        inferences = pgx.infer_sex_batch(config, [v.name for v in new_vcfs])
+
+        for vcf, inference in zip(new_vcfs, inferences):
+            if inference is None:
+                log.warning("[%s] chrY count failed — skipping", vcf.name)
+                continue
+
+            sex = inference.sex
+            if sex is None:
+                log.warning(
+                    "[%s] %s: %d chrY variants — ambiguous zone (%d–%d), manual input required",
+                    vcf.name, inference.sample_id, inference.n_chry,
+                    sex_ambiguous_min, sex_ambiguous_max,
+                )
+                raw = click.prompt(
+                    f"  Sex for {inference.sample_id} (M/F)",
+                    type=click.Choice(["M", "F"], case_sensitive=False),
+                ).upper()
+                sex = "M" if raw == "M" else "F"
+            else:
+                log.info(
+                    "[%s] %s: %d chrY -> %s",
+                    vcf.name, inference.sample_id, inference.n_chry, sex,
+                )
+
+            new_records.append(pgx.SampleRecord(
+                sample_id=inference.sample_id,
+                sex=sex,
+                country_code=country_code,
+            ))
+
+        for record in new_records:
+            pgx.append_sample_to_tsv(config.samples_tsv, record)
+            log.info("[%s] Added to samples.tsv", record.sample_id)
+
+    all_records = existing + new_records
+
+    if not all_records:
+        raise click.ClickException("No samples to process.")
+
+    log.info("==========================================")
+    log.info("Samples to process (%d):", len(all_records))
+    for r in all_records:
+        log.info("  %s  sex=%s  country=%s", r.sample_id, r.sex, r.country_code)
+    log.info("==========================================")
+
+    if not yes:
+        proceed = click.confirm("Continue?", default=False)
+        if not proceed:
+            log.info("Cancelled.")
+            return
+
+    (base_dir / "logs").mkdir(parents=True, exist_ok=True)
+    config.pgx_runs_dir.mkdir(parents=True, exist_ok=True)
+
+    # ----------------------------------------------------------------
+    # Prepare workspaces (parallel)
+    # ----------------------------------------------------------------
+    prepare_results: list[pgx.WorkspaceResult] = []
+    if not run:
+        log.info("==========================================")
+        log.info("Preparing workspaces  (workers=%d)", workers)
+        log.info("==========================================")
+        prepare_results = pgx.prepare_workspaces(config, all_records)
+
+    # ----------------------------------------------------------------
+    # Run pgx_pilot (parallel)
+    # ----------------------------------------------------------------
+    run_results: list[pgx.PgxRunResult] = []
+    if not prepare:
+        log.info("==========================================")
+        log.info("Running pgx_pilot  (workers=%d)", workers)
+        log.info("==========================================")
+        run_results = pgx.run_pgx_pilots(config, all_records)
+
+    pipeline_result = pgx.PgxPipelineResult(
+        prepare_results=prepare_results,
+        run_results=run_results,
+    )
+
+    total = len(prepare_results) + len(run_results)
+    log.info("==========================================")
+    log.info("pgx summary")
+    log.info("==========================================")
+    log.info(
+        "  Steps OK:       %d",
+        total - pipeline_result.failed - pipeline_result.warned,
+    )
+    log.info("  Steps warnings: %d", pipeline_result.warned)
+    log.info("  Steps failed:   %d", pipeline_result.failed)
+
+    if pipeline_result.failed > 0:
+        raise click.ClickException(
+            f"pgx pipeline finished with {pipeline_result.failed} failed step(s). "
+            "Check logs in <base-dir>/logs/ for details."
         )
 
 
