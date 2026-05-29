@@ -10,6 +10,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Literal
+from importlib.resources import files
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +65,7 @@ class SampleRecord:
     sample_id: str
     sex: Sex
     country_code: str
+    vcf_basename: str = ""
 
 
 @dataclasses.dataclass
@@ -257,12 +259,6 @@ def validate_pgx_layout(config: PgxConfig) -> None:
 
 def validate_pgx_run_prereqs(config: PgxConfig) -> None:
     """Check prerequisites needed for the pgx_pilot run step."""
-    if not config.snakefile.exists():
-        raise ValueError(
-            f"Snakefile not found: {config.snakefile}\n"
-            "Copy the Snakefile from the pgx_pilot repo and apply local patches "
-            "before running."
-        )
     if config.pgx_repo is None or not config.pgx_repo.exists():
         raise ValueError(
             f"pgx_pilot repo not found: {config.pgx_repo}\n"
@@ -281,6 +277,17 @@ def validate_pgx_run_prereqs(config: PgxConfig) -> None:
             f"Build it with: cd {config.pgx_repo} && docker build -t {config.pgx_image} ."
         )
 
+def install_snakefile(config: PgxConfig) -> None:
+    """Copy the bundled Snakefile to pgx_runs/ if not already present."""
+    dest = config.snakefile
+    if dest.exists():
+        log.info("Snakefile already exists at %s — skipping.", dest)
+        return
+    config.pgx_runs_dir.mkdir(parents=True, exist_ok=True)
+    src = files("impact_tools.beacon.resources").joinpath("Snakefile")
+    dest.write_text(src.read_text())
+    log.info("Installed bundled Snakefile -> %s", dest)
+
 
 # ---------------------------------------------------------------------------
 # Workspace preparation
@@ -289,7 +296,8 @@ def validate_pgx_run_prereqs(config: PgxConfig) -> None:
 def prepare_workspace(config: PgxConfig, record: SampleRecord) -> WorkspaceResult:
     """Create the pgx_pilot workspace for one sample."""
     ws = config.pgx_runs_dir / record.sample_id
-    vcf_src = config.liftover_dir / f"{record.sample_id}.GRCh38.clean.vcf.gz"
+    vcf_name = record.vcf_basename if record.vcf_basename else record.sample_id
+    vcf_src = config.liftover_dir / f"{vcf_name}.GRCh38.clean.vcf.gz"
     tbi_src = Path(str(vcf_src) + ".tbi")
 
     if not vcf_src.exists():
@@ -332,7 +340,8 @@ def prepare_workspace(config: PgxConfig, record: SampleRecord) -> WorkspaceResul
 def run_pgx_pilot(config: PgxConfig, record: SampleRecord) -> PgxRunResult:
     """Run the pgx_pilot Snakemake pipeline for one sample via Docker."""
     ws = config.pgx_runs_dir / record.sample_id
-    vcf_in = config.liftover_dir / f"{record.sample_id}.GRCh38.clean.vcf.gz"
+    vcf_name = record.vcf_basename if record.vcf_basename else record.sample_id
+    vcf_in = config.liftover_dir / f"{vcf_name}.GRCh38.clean.vcf.gz"
     out_all = ws / "results" / f"{record.sample_id}.sites.all.vcf.gz"
     out_pass = ws / "results" / f"{record.sample_id}.sites.pass.vcf.gz"
     log_file = config.base_dir / "logs" / f"{record.sample_id}_pgx.log"
