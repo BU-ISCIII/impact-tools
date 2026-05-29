@@ -29,3 +29,5 @@ where possible.
 - Added Beacon `liftover` command to detect genome build and lift over VCFs from
   GRCh37 to GRCh38 using CrossMap via Docker and `pgx` command to prepare
   per-sample pgx_pilot workspaces and run the pgx_pilot Snakemake pipeline [#3](https://github.com/BU-ISCIII/impact-tools/pull/3)
+- Fixed HPC symlink handling, Docker mount, sample ID mapping and bundled patched Snakefile for `beacon liftover` and `beacon pgx`. [#4](https://github.com/BU-ISCIII/impact-tools/pull/4)
+
