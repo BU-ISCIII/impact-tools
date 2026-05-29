@@ -157,8 +157,9 @@ Sex inference is automatic. Samples whose chrY variant count falls between
 `--sex-ambiguous-min` (default 5 000) and `--sex-ambiguous-max` (default 7 000)
 are flagged and the user is prompted to enter the sex manually.
 
-The `pgx_runs/Snakefile` must exist with the local patches applied before
-running. The `pgx_pilot` Docker image must also be available locally.
+The bundled Snakefile (with local patches applied) is installed automatically
+to `pgx_runs/` on first run. The `pgx_pilot` Docker image must be available
+locally before running.
 
 Run the full pipeline (prepare workspaces + execute pgx_pilot):
 
