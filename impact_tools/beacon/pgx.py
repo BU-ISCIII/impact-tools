@@ -169,7 +169,8 @@ def read_samples_tsv(tsv_path: Path) -> list[SampleRecord]:
             sample_id = fields[0]
             sex: Sex = "M" if fields[1].upper() == "M" else "F"
             country_code = fields[2] if len(fields) >= 3 else "ES"
-            records.append(SampleRecord(sample_id=sample_id, sex=sex, country_code=country_code))
+            vcf_basename = fields[3] if len(fields) >= 4 else ""
+            records.append(SampleRecord(sample_id=sample_id, sex=sex, country_code=country_code, vcf_basename=vcf_basename))
     return records
 
 
@@ -179,11 +180,11 @@ def append_sample_to_tsv(tsv_path: Path, record: SampleRecord) -> None:
         tsv_path.parent.mkdir(parents=True, exist_ok=True)
         tsv_path.write_text(
             "# samples.tsv — IMPaCT cohort sample metadata\n"
-            "# sample_id<TAB>sex<TAB>country_code\n"
+            "# sample_id<TAB>sex<TAB>country_code<TAB>vcf_basename\n"
             "# sex: M or F (inferred from non-ref chrY variant count)\n"
         )
     with tsv_path.open("a") as fh:
-        fh.write(f"{record.sample_id}\t{record.sex}\t{record.country_code}\n")
+        fh.write(f"{record.sample_id}\t{record.sex}\t{record.country_code}\t{record.vcf_basename}\n")
 
 
 # ---------------------------------------------------------------------------

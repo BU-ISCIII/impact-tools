@@ -154,6 +154,7 @@ def validate_liftover_layout(base_dir: Path) -> None:
         missing_text = "\n".join(f"  - {path}" for path in missing)
         raise ValueError(f"Missing required directories:\n{missing_text}")
 
+
 def create_liftover_layout(base_dir: Path) -> None:
     """Create the minimal liftover working directory layout"""
 
@@ -174,6 +175,7 @@ def create_liftover_layout(base_dir: Path) -> None:
         log.info("Created liftover workspace directories:")
         for path in created_dirs:
             log.info("  - %s", path)
+
 
 def check_liftover_inputs(base_dir: Path) -> list[tuple[Path, Build, str, str | None]]:
     """Validate and inspect liftover input VCFs."""
@@ -249,8 +251,6 @@ def validate_resources(config: LiftoverConfig) -> None:
             "https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/technical/reference/GRCh38_reference_genome/GRCh38_full_analysis_set_plus_decoy_hla.fa\n"
             f"  wget -P {config.resolved_fasta.parent} "
             "https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/technical/reference/GRCh38_reference_genome/GRCh38_full_analysis_set_plus_decoy_hla.fa.fai"
-        
-        
         )
 
 

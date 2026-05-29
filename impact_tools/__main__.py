@@ -649,11 +649,11 @@ def pgx_cmd(
         if config.samples_tsv.exists()
         else []
     )
-    existing_ids = {r.sample_id for r in existing}
+    existing_basenames = {r.vcf_basename for r in existing if r.vcf_basename}
 
     new_vcfs = [
         vcf for vcf in lifted_vcfs
-        if beacon_pgx.vcf_to_sample_id(vcf) not in existing_ids
+        if beacon_pgx.vcf_to_sample_id(vcf) not in existing_basenames
     ]
 
     log.info("==========================================")
