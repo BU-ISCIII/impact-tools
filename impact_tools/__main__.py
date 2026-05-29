@@ -404,6 +404,22 @@ def liftover_cmd(
     """
     base_dir = base_dir.resolve()
 
+    if check_only:
+        try:
+            beacon_liftover.validate_liftover_layout(base_dir)
+        except ValueError as exc:
+            raise click.ClickException(
+                f"{exc}\n"
+                "Please create the required directory layout by running:\n"
+                f"  impact-tools beacon liftover --base-dir {base_dir}"
+            ) from exc
+    else:
+        try:
+            beacon_liftover.validate_liftover_layout(base_dir)
+        except ValueError:
+            log.warning("Liftover directories not found. Creating workspace layout...")
+            beacon_liftover.create_liftover_layout(base_dir)
+
     try:
         check_results = beacon_liftover.check_liftover_inputs(base_dir)
     except Exception as exc:  # noqa: BLE001 - CLI boundary converts to clean error
@@ -613,6 +629,7 @@ def pgx_cmd(
     try:
         beacon_pgx.validate_pgx_layout(config)
         if not prepare:
+            beacon_pgx.install_snakefile(config)
             beacon_pgx.validate_pgx_run_prereqs(config)
     except Exception as exc:  # noqa: BLE001
         raise click.ClickException(str(exc)) from exc
@@ -686,6 +703,7 @@ def pgx_cmd(
                 sample_id=inference.sample_id,
                 sex=sex,
                 country_code=country_code,
+                vcf_basename=beacon_pgx.vcf_to_sample_id(vcf),
             ))
 
         for record in new_records:

@@ -141,34 +141,81 @@ def discover_input_vcfs(base_dir: Path) -> list[Path]:
 
 
 def validate_liftover_layout(base_dir: Path) -> None:
-    """Validate that base_dir and its inputs/ subdirectory exist.
+    """Validate that the minimal liftover working directory layout exists."""
+    required = [
+        base_dir, 
+        base_dir / "inputs",
+        base_dir / "liftover" / "resources",
+        base_dir / "logs",
+    ]
 
-    The liftover/ and logs/ directories are created on demand by run_liftover().
-    """
-    required = [base_dir, base_dir / "inputs"]
     missing = [path for path in required if not path.exists()]
     if missing:
         missing_text = "\n".join(f"  - {path}" for path in missing)
         raise ValueError(f"Missing required directories:\n{missing_text}")
 
+def create_liftover_layout(base_dir: Path) -> None:
+    """Create the minimal liftover working directory layout"""
+
+    required_dirs = [
+        base_dir / "inputs",
+        base_dir / "liftover" / "resources",
+        base_dir / "logs",
+    ]
+
+    created_dirs = []
+
+    for path in required_dirs:
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+            created_dirs.append(path)
+
+    if created_dirs:
+        log.info("Created liftover workspace directories:")
+        for path in created_dirs:
+            log.info("  - %s", path)
 
 def check_liftover_inputs(base_dir: Path) -> list[tuple[Path, Build, str, str | None]]:
     """Validate and inspect liftover input VCFs."""
-    validate_liftover_layout(base_dir)
-
     vcfs = discover_input_vcfs(base_dir)
     if not vcfs:
-        raise ValueError(f"No *.vcf.gz files found in {base_dir / 'inputs'}")
+        raise ValueError(
+            f"No *.vcf.gz files found in {base_dir / 'inputs'}\n"
+            "Add input VCF files or symlinks under inputs/ and rerun the command.\n"
+            "Expected layout:\n"
+            "<base-dir>/\n"
+            "├── inputs/       ← place your *.vcf.gz files here\n"
+            "├── liftover/\n"
+            "└── logs/"
+        )
 
     results: list[tuple[Path, Build, str, str | None]] = []
 
     for vcf in vcfs:
         if vcf.is_symlink():
             resolved = vcf.resolve(strict=False)
-            if not resolved.exists():
-                raise ValueError(f"Broken symlink: {vcf} -> {resolved}")
+            try:
+                accessible = resolved.exists()
+            except OSError:
+                accessible = False
+            if not accessible:
+                log.warning(
+                    "  %s: symlink target not accessible (%s) — skipping build detection",
+                    vcf.name, resolved,
+                )
+                results.append((vcf, "unknown", "unknown", None))
+                continue
 
-        build, contig_style, chr1_length = detect_vcf_build(vcf)
+        try:
+            build, contig_style, chr1_length = detect_vcf_build(vcf)
+        except OSError as exc:
+            log.warning(
+                "  %s: Could not read file to detect build: %s — skipping",
+                vcf.name, exc,
+            )
+            results.append((vcf, "unknown", "unknown", None))
+            continue
+
         results.append((vcf, build, contig_style, chr1_length))
 
     return results
@@ -191,7 +238,20 @@ def validate_resources(config: LiftoverConfig) -> None:
     ]
     if missing:
         missing_text = "\n".join(f"  - {p}" for p in missing)
-        raise ValueError(f"Missing required liftover resources:\n{missing_text}")
+        raise ValueError(
+            f"Missing required liftover resources:\n{missing_text}\n"
+            "\nSpecify directory with --chain and --fasta if they are already available elsewhere.\n"
+            "\nor\n"
+            "\nDownload them with:\n"
+            f"  wget -P {config.resolved_chain.parent} "
+            "https://hgdownload.soe.ucsc.edu/goldenPath/hg19/liftOver/hg19ToHg38.over.chain.gz\n"
+            f"  wget -P {config.resolved_fasta.parent} "
+            "https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/technical/reference/GRCh38_reference_genome/GRCh38_full_analysis_set_plus_decoy_hla.fa\n"
+            f"  wget -P {config.resolved_fasta.parent} "
+            "https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/technical/reference/GRCh38_reference_genome/GRCh38_full_analysis_set_plus_decoy_hla.fa.fai"
+        
+        
+        )
 
 
 def validate_docker_available() -> None:
@@ -284,7 +344,12 @@ def _run_sample(
     cmd1 = [
         "docker", "run", "--rm",
         "-v", f"{base}:/data",
-        "-v", f"{hpc}:{hpc}:ro",
+    ]
+
+    if Path(hpc).exists():
+        cmd1 += ["-v", f"{hpc}:{hpc}:ro"]
+
+    cmd1 += [
         config.bcftools_image,
         "bcftools", "annotate",
         "--rename-chrs", "/data/liftover/rename_chrs.txt",
@@ -431,12 +496,8 @@ def _cleanup_intermediates(liftover_dir: Path, sample_ids: list[str]) -> None:
 
 def run_liftover(config: LiftoverConfig) -> LiftoverRunResult:
     """Run the full CrossMap liftover pipeline for all samples in base_dir/inputs."""
-    validate_liftover_layout(config.base_dir)
     validate_resources(config)
     validate_docker_available()
-
-    (config.base_dir / "liftover").mkdir(parents=True, exist_ok=True)
-    (config.base_dir / "logs").mkdir(parents=True, exist_ok=True)
 
     vcfs = discover_input_vcfs(config.base_dir)
     if not vcfs:
