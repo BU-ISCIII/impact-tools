@@ -39,7 +39,6 @@ class LiftoverConfig:
     hpc_mount: str = "/data/ucct/bi"
     bcftools_image: str = BCFTOOLS_IMAGE
     crossmap_image: str = CROSSMAP_IMAGE
-    cleanup: bool = False
     workers: int = 4
 
     @property
@@ -468,8 +467,8 @@ def _run_sample(
     )
 
 
-def _cleanup_intermediates(liftover_dir: Path, sample_ids: list[str]) -> None:
-    """Remove intermediate files generated during liftover."""
+def list_intermediates(liftover_dir: Path, sample_ids: list[str]) -> list[Path]:
+    """Return existing intermediate files for the given sample IDs."""
     suffixes = [
         ".renamed.vcf.gz",
         ".GRCh38.vcf",
@@ -478,20 +477,31 @@ def _cleanup_intermediates(liftover_dir: Path, sample_ids: list[str]) -> None:
         ".GRCh38.sorted.vcf.gz",
         ".GRCh38.sorted.vcf.gz.tbi",
     ]
+    found: list[Path] = []
     for sample_id in sample_ids:
         for suffix in suffixes:
             f = liftover_dir / f"{sample_id}{suffix}"
             if f.exists():
-                try:
-                    f.unlink()
-                    log.debug("Removed %s", f)
-                except PermissionError:
-                    log.warning(
-                        "Could not remove %s (Docker created it as root). "
-                        "Run: sudo rm -f %s",
-                        f, f,
-                    )
-    log.info("Intermediate files cleaned up.")
+                found.append(f)
+    return found
+
+
+def cleanup_intermediates(liftover_dir: Path, sample_ids: list[str]) -> int:
+    """Remove intermediate files generated during liftover."""
+    removed = 0
+    for f in list_intermediates(liftover_dir, sample_ids):
+        try:
+            f.unlink()
+            log.debug("Removed %s", f)
+            removed += 1
+        except PermissionError:
+            log.warning(
+                "Could not remove %s (Docker created it as root). "
+                "Run: sudo rm -f %s",
+                f, f,
+            )
+    log.info("Removed %d intermediate files.", removed)
+    return removed
 
 
 def run_liftover(config: LiftoverConfig) -> LiftoverRunResult:
@@ -544,15 +554,5 @@ def run_liftover(config: LiftoverConfig) -> LiftoverRunResult:
     run_result = LiftoverRunResult(results)
     log.info("==========================================")
     log.info("Total liftover time: %.1fs  (%d samples)", time.monotonic() - t0_total, len(results))
-
-    if config.cleanup:
-        if run_result.failed == 0:
-            _cleanup_intermediates(liftover_dir, [r.sample_id for r in results])
-        else:
-            log.warning(
-                "Cleanup skipped: %d sample(s) failed. "
-                "Intermediates preserved for debugging.",
-                run_result.failed,
-            )
 
     return run_result

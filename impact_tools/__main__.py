@@ -472,6 +472,34 @@ def liftover_cmd(
 
     log.info("==========================================")
 
+    sample_ids = [
+        vcf.name.removesuffix(".vcf.gz").removesuffix(".clean").removesuffix(".GRCh38")
+        for vcf, _, _, _ in check_results
+    ]
+
+    already_lifted = any(
+        (base_dir / "liftover" / f"{sample_id}.GRCh38.clean.vcf.gz").exists()
+        for sample_id in sample_ids
+    )
+
+    if cleanup and already_lifted:
+        intermediates = beacon_liftover.list_intermediates(
+            base_dir / "liftover", sample_ids
+        )
+        if not intermediates:
+            log.info("No intermediate files found for cleanup.")
+            return
+        log.info("Intermediate files found for cleanup: (%d)", len(intermediates))
+        for p in intermediates:
+            log.info("  %s", p.name)
+        if yes or click.confirm("Delete these intermediate files?", default=False):
+            beacon_liftover.cleanup_intermediates(
+                base_dir / "liftover", sample_ids
+            )
+        else:
+            log.info("Cleanup cancelled.")
+        return
+
     if "unknown" in detected_builds:
         log.warning("At least one VCF build could not be detected.")
 
@@ -496,10 +524,7 @@ def liftover_cmd(
         return
 
     if not yes:
-        msg = "Continue with liftover execution?"
-        if cleanup:
-            msg = "Continue with liftover execution? (intermediate files will be removed on success)"
-        if not click.confirm(msg, default=False):
+        if not click.confirm("Continue with liftover execution?", default=False):
             log.info("Cancelled.")
             return
 
@@ -510,7 +535,6 @@ def liftover_cmd(
         hpc_mount=hpc_mount,
         bcftools_image=bcftools_image,
         crossmap_image=crossmap_image,
-        cleanup=cleanup,
         workers=workers,
     )
 
@@ -532,6 +556,17 @@ def liftover_cmd(
             "Check logs in <base-dir>/logs/ for details."
         )
 
+    intermediates = beacon_liftover.list_intermediates(
+        base_dir / "liftover", sample_ids
+    )
+    if intermediates:
+        log.info("Intermediate files generated (%d):", len(intermediates))
+        for p in intermediates:
+            log.info("  %s", p.name)
+        if cleanup or yes or click.confirm("Remove intermediate files?", default=True):
+            beacon_liftover.cleanup_intermediates(
+                base_dir / "liftover", sample_ids
+            )
 
 @beacon.command("pgx")
 @click.option(
