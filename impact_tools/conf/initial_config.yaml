@@ -135,3 +135,30 @@ ega:
 
     # Stop processing the current task after its first failed file.
     fail_fast: true
+
+beacon: 
+  remote:
+    host: 172.20.10.47
+    user: bioinfo
+    port: 22
+
+    # Set this only in your local ~/.config/impact-tools/config.yaml if needed.
+    password: null 
+
+    # Alternative to password-based login.
+    identity_file: null # Example: ~/.ssh/id_rsa
+
+    beacon_dir: /opt/beacon/beacon2-pi-api-isciii
+    input_dir: /impact_data/lega_data/beacon/inputs
+    log_dir: /var/log/local/beacon/apps/ri-tools
+
+  containers:
+    mongo: mongoprod
+    api: beaconprod
+
+  runtime:
+    remote_container_runtime: podman
+
+  ri_tools:
+    variants_command_template: >-
+      echo dataset={dataset_id} vcf={remote_vcf}
