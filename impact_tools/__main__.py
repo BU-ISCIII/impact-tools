@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import logging
-from importlib import resources
+from datetime import datetime
 from pathlib import Path
 
 import click
@@ -13,6 +12,13 @@ from rich.logging import RichHandler
 from rich.traceback import install as install_rich_traceback
 
 from impact_tools import __version__
+from impact_tools.config import (
+    EXTRA_CONFIG_PATH,
+    get_config_value,
+    include_extra_config,
+    load_configuration,
+    remove_extra_config,
+)
 from impact_tools.ega.encrypt import EncryptionConfig, run_encryption
 from impact_tools.ega.slurm import (
     SlurmEncryptionPlanConfig,
@@ -26,16 +32,13 @@ from impact_tools.beacon import pgx as beacon_pgx
 log = logging.getLogger(__name__)
 
 
-def load_configuration(config_file: Path | None = None) -> dict:
-    """Load the default package configuration, optionally overridden by a file."""
-    if config_file is None:
-        with resources.files("impact_tools").joinpath("conf/configuration.json").open(
-            "r",
-            encoding="utf-8",
-        ) as handle:
-            return json.load(handle)
-    with config_file.expanduser().open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+def _configured_path(
+    configuration: dict,
+    path: str,
+) -> Path | None:
+    """Return an expanded Path from configuration when a value is set."""
+    value = get_config_value(configuration, path)
+    return Path(value).expanduser() if value else None
 
 
 def slurm_config_value(slurm_conf: dict, key: str, override, default=None):
@@ -71,6 +74,38 @@ def configure_logging(verbose: bool, log_file: Path | None) -> None:
     logging.basicConfig(level=level, handlers=handlers, force=True)
 
 
+def configure_module_logging(ctx: click.Context, module_name: str) -> Path | None:
+    """Add a module-specific log file unless --log-file was provided."""
+    if ctx.obj["log_file"] is not None:
+        return ctx.obj["log_file"]
+
+    logs_config = get_config_value(ctx.obj["configuration"], "logs", {}) or {}
+    modules_outpath = logs_config.get("modules_outpath", {})
+    log_directory = modules_outpath.get(module_name)
+    if not log_directory:
+        default_outpath = logs_config.get("default_outpath")
+        if not default_outpath:
+            return None
+        log_directory = Path(default_outpath).expanduser() / module_name
+
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    log_file = (
+        Path(log_directory).expanduser()
+        / f"{module_name}_{timestamp}.log"
+    )
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setFormatter(
+        logging.Formatter(
+            "[%(asctime)s] %(name)-28s [%(levelname)-8s] %(message)s"
+        )
+    )
+    logging.getLogger().addHandler(file_handler)
+    ctx.obj["log_file"] = log_file
+    log.debug("Module log: %s", log_file)
+    return log_file
+
+
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 @click.version_option(__version__)
 @click.option("-v", "--verbose", is_flag=True, help="Show debug log messages.")
@@ -79,12 +114,84 @@ def configure_logging(verbose: bool, log_file: Path | None) -> None:
     type=click.Path(path_type=Path, dir_okay=False),
     help="Write a detailed execution log to this file.",
 )
+@click.option(
+    "--config-file",
+    type=click.Path(path_type=Path, dir_okay=False, exists=True),
+    help=(
+        "Additional JSON/YAML configuration for this execution. User defaults "
+        "from ~/.impact_tools/extra_config.json are loaded automatically."
+    ),
+)
 @click.pass_context
-def cli(ctx: click.Context, verbose: bool, log_file: Path | None) -> None:
+def cli(
+    ctx: click.Context,
+    verbose: bool,
+    log_file: Path | None,
+    config_file: Path | None,
+) -> None:
     """Utilities for Go-IMPaCT Beacon and EGA workflows."""
     install_rich_traceback(width=200, word_wrap=True, extra_lines=1)
+    configuration = load_configuration(config_file)
     configure_logging(verbose=verbose, log_file=log_file)
-    ctx.obj = {"verbose": verbose, "log_file": log_file}
+    ctx.obj = {
+        "verbose": verbose,
+        "log_file": log_file,
+        "configuration": configuration,
+    }
+
+
+@cli.command("add-extra-config")
+@click.option(
+    "-f",
+    "--config-file",
+    type=click.Path(path_type=Path, dir_okay=False, exists=True),
+    help="JSON or YAML file to save as persistent user configuration.",
+)
+@click.option(
+    "-n",
+    "--config-name",
+    help="Store the input file under this top-level configuration section.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Replace or merge configuration sections that already exist.",
+)
+@click.option(
+    "--remove-config",
+    is_flag=True,
+    help="Remove --config-name, or the complete file when used with --force.",
+)
+def add_extra_config_cmd(
+    config_file: Path | None,
+    config_name: str | None,
+    force: bool,
+    remove_config: bool,
+) -> None:
+    """Create or update ~/.impact_tools/extra_config.json."""
+    try:
+        if remove_config:
+            if config_file is not None:
+                raise click.UsageError(
+                    "--config-file cannot be used together with --remove-config."
+                )
+            removed = remove_extra_config(config_name, force=force)
+            if not removed:
+                raise click.ClickException(
+                    f"Configuration not found: {config_name or EXTRA_CONFIG_PATH}"
+                )
+            click.echo(f"Removed configuration from {EXTRA_CONFIG_PATH}")
+            return
+        if config_file is None:
+            raise click.UsageError("--config-file is required.")
+        path = include_extra_config(
+            config_file,
+            config_name=config_name,
+            force=force,
+        )
+        click.echo(f"Extra configuration written to {path}")
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 @cli.group()
@@ -97,7 +204,6 @@ def ega() -> None:
     "-i",
     "--input-dir",
     type=click.Path(path_type=Path, file_okay=False, exists=True),
-    required=True,
     help=(
         "Directory containing sample folders or files to encrypt. Also used as "
         "the base directory for relative paths in --input-list."
@@ -113,7 +219,6 @@ def ega() -> None:
     "-k",
     "--recipient-pubkey",
     type=click.Path(path_type=Path, dir_okay=False, exists=True),
-    required=True,
     help="Crypt4GH recipient public key, usually LocalEGA service.key.pub.",
 )
 @click.option(
@@ -164,10 +269,12 @@ def ega() -> None:
     is_flag=True,
     help="Stop at the first failed file instead of continuing with the batch.",
 )
+@click.pass_context
 def encrypt_cmd(
-    input_dir: Path,
+    ctx: click.Context,
+    input_dir: Path | None,
     output_dir: Path | None,
-    recipient_pubkey: Path,
+    recipient_pubkey: Path | None,
     crypt4gh_bin: Path | None,
     input_list: Path | None,
     pattern: str,
@@ -179,6 +286,27 @@ def encrypt_cmd(
     fail_fast: bool,
 ) -> None:
     """Encrypt sequencing files with Crypt4GH and generate metrics."""
+    configure_module_logging(ctx, "ega_encrypt")
+    configuration = ctx.obj["configuration"]
+    input_dir = input_dir or _configured_path(configuration, "ega.encryption.input_dir")
+    output_dir = output_dir or _configured_path(
+        configuration, "ega.encryption.output_dir"
+    )
+    recipient_pubkey = recipient_pubkey or _configured_path(
+        configuration, "ega.encryption.recipient_pubkey"
+    )
+    crypt4gh_bin = crypt4gh_bin or _configured_path(
+        configuration, "ega.encryption.crypt4gh_bin"
+    )
+    if input_dir is None:
+        raise click.UsageError(
+            "--input-dir is required or must be set as ega.encryption.input_dir."
+        )
+    if recipient_pubkey is None:
+        raise click.UsageError(
+            "--recipient-pubkey is required or must be set as "
+            "ega.encryption.recipient_pubkey."
+        )
     config = EncryptionConfig(
         input_dir=input_dir,
         output_dir=output_dir,
@@ -209,7 +337,6 @@ def encrypt_cmd(
     "-i",
     "--input-dir",
     type=click.Path(path_type=Path, file_okay=False, exists=True),
-    required=True,
     help=(
         "Directory containing encrypted files to upload. Also used as the base "
         "directory for relative paths in --input-list."
@@ -221,13 +348,11 @@ def encrypt_cmd(
     type=click.Path(path_type=Path, file_okay=False),
     help="Directory for upload metrics, logs and manifests.",
 )
-@click.option("--host", required=True, help="Inbox SFTP host.")
-@click.option("--port", default=2222, show_default=True, help="Inbox SFTP port.")
-@click.option("-u", "--username", required=True, help="Inbox username.")
+@click.option("--host", help="Inbox SFTP host.")
+@click.option("--port", type=int, help="Inbox SFTP port.")
+@click.option("-u", "--username", help="Inbox username.")
 @click.option(
     "--remote-dir",
-    default="/",
-    show_default=True,
     help="Remote inbox directory where files are uploaded.",
 )
 @click.option(
@@ -267,8 +392,6 @@ def encrypt_cmd(
 @click.option(
     "--host-key-policy",
     type=click.Choice(["auto-add", "reject"]),
-    default="auto-add",
-    show_default=True,
     help="How to handle unknown SFTP host keys.",
 )
 @click.option("--force", is_flag=True, help="Overwrite remote files if they exist.")
@@ -285,30 +408,60 @@ def encrypt_cmd(
 )
 @click.option(
     "--connect-timeout",
-    default=30,
-    show_default=True,
+    type=int,
     help="SFTP connection timeout in seconds.",
 )
+@click.pass_context
 def upload_inbox_cmd(
-    input_dir: Path,
+    ctx: click.Context,
+    input_dir: Path | None,
     output_dir: Path | None,
-    host: str,
-    port: int,
-    username: str,
-    remote_dir: str,
+    host: str | None,
+    port: int | None,
+    username: str | None,
+    remote_dir: str | None,
     remote_layout: str,
     input_list: Path | None,
     pattern: str,
     identity_file: Path | None,
     ask_password: bool,
-    host_key_policy: str,
+    host_key_policy: str | None,
     force: bool,
     dry_run: bool,
     no_checksums: bool,
     fail_fast: bool,
-    connect_timeout: int,
+    connect_timeout: int | None,
 ) -> None:
     """Upload encrypted .c4gh files to a LocalEGA inbox over SFTP."""
+    configure_module_logging(ctx, "ega_upload_inbox")
+    configuration = ctx.obj["configuration"]
+    input_dir = input_dir or _configured_path(configuration, "ega.inbox.input_dir")
+    output_dir = output_dir or _configured_path(configuration, "ega.inbox.output_dir")
+    host = host or get_config_value(configuration, "ega.inbox.host")
+    port = port or int(get_config_value(configuration, "ega.inbox.port", 2222))
+    username = username or get_config_value(configuration, "ega.inbox.username")
+    remote_dir = remote_dir or get_config_value(
+        configuration, "ega.inbox.remote_dir", "/"
+    )
+    identity_file = identity_file or _configured_path(
+        configuration, "ega.inbox.identity_file"
+    )
+    host_key_policy = host_key_policy or get_config_value(
+        configuration, "ega.inbox.host_key_policy", "auto-add"
+    )
+    connect_timeout = connect_timeout or int(
+        get_config_value(configuration, "ega.inbox.connect_timeout", 30)
+    )
+    if input_dir is None:
+        raise click.UsageError(
+            "--input-dir is required or must be set as ega.inbox.input_dir."
+        )
+    if not host:
+        raise click.UsageError("--host is required or must be set as ega.inbox.host.")
+    if not username:
+        raise click.UsageError(
+            "--username is required or must be set as ega.inbox.username."
+        )
     config = InboxUploadConfig(
         input_dir=input_dir,
         output_dir=output_dir,
@@ -411,7 +564,9 @@ def beacon() -> None:
     is_flag=True,
     help="Continue without interactive confirmation.",
 )
+@click.pass_context
 def liftover_cmd(
+    ctx: click.Context,
     base_dir: Path,
     chain: Path | None,
     fasta: Path | None,
@@ -428,6 +583,7 @@ def liftover_cmd(
     The command first validates input VCFs and detects their genome build.
     If all inputs are already GRCh38, liftover is skipped.
     """
+    configure_module_logging(ctx, "beacon_liftover")
     base_dir = base_dir.resolve()
 
     if check_only:
@@ -646,7 +802,9 @@ def liftover_cmd(
     is_flag=True,
     help="Continue without interactive confirmation.",
 )
+@click.pass_context
 def pgx_cmd(
+    ctx: click.Context,
     base_dir: Path,
     country_code: str,
     sex_ambiguous_min: int,
@@ -670,6 +828,7 @@ def pgx_cmd(
     Use --prepare to stop after workspace creation, or --run to skip
     preparation and go straight to execution.
     """
+    configure_module_logging(ctx, "beacon_pgx")
     if prepare and run:
         raise click.UsageError("--prepare and --run are mutually exclusive.")
 
@@ -832,19 +991,18 @@ def pgx_cmd(
             f"pgx pipeline finished with {pipeline_result.failed} failed step(s). "
             "Check logs in <base-dir>/logs/ for details."
         )
+
+
 @ega.command("encrypt-slurm")
 @click.option(
     "--config-file",
     type=click.Path(path_type=Path, dir_okay=False, exists=True),
-    help=(
-        "JSON configuration file. Defaults to impact_tools/conf/configuration.json."
-    ),
+    help="Additional JSON/YAML configuration for this SLURM plan.",
 )
 @click.option(
     "-i",
     "--input-dir",
     type=click.Path(path_type=Path, file_okay=False, exists=True),
-    required=True,
     help=(
         "Directory containing raw files. Also used as the base directory for "
         "relative paths in --input-list."
@@ -865,7 +1023,6 @@ def pgx_cmd(
     "-k",
     "--recipient-pubkey",
     type=click.Path(path_type=Path, dir_okay=False, exists=True),
-    required=True,
     help="Crypt4GH recipient public key, usually LocalEGA service.key.pub.",
 )
 @click.option(
@@ -946,12 +1103,14 @@ def pgx_cmd(
     is_flag=True,
     help="Submit the generated sbatch file with sbatch.",
 )
+@click.pass_context
 def encrypt_slurm_cmd(
+    ctx: click.Context,
     config_file: Path | None,
-    input_dir: Path,
+    input_dir: Path | None,
     output_dir: Path | None,
     plan_dir: Path | None,
-    recipient_pubkey: Path,
+    recipient_pubkey: Path | None,
     crypt4gh_bin: Path | None,
     input_list: Path | None,
     pattern: str,
@@ -973,8 +1132,35 @@ def encrypt_slurm_cmd(
     submit: bool,
 ) -> None:
     """Generate and optionally submit SLURM array jobs for Crypt4GH encryption."""
-    configuration = load_configuration(config_file)
+    configure_module_logging(ctx, "ega_encrypt_slurm")
+    configuration = (
+        load_configuration(config_file)
+        if config_file is not None
+        else ctx.obj["configuration"]
+    )
     slurm_conf = configuration.get("ega", {}).get("slurm_encryption", {})
+    input_dir = input_dir or _configured_path(
+        configuration, "ega.slurm_encryption.input_dir"
+    ) or _configured_path(configuration, "ega.encryption.input_dir")
+    output_dir = output_dir or _configured_path(
+        configuration, "ega.slurm_encryption.output_dir"
+    ) or _configured_path(configuration, "ega.encryption.output_dir")
+    recipient_pubkey = recipient_pubkey or _configured_path(
+        configuration, "ega.slurm_encryption.recipient_pubkey"
+    ) or _configured_path(configuration, "ega.encryption.recipient_pubkey")
+    crypt4gh_bin = crypt4gh_bin or _configured_path(
+        configuration, "ega.slurm_encryption.crypt4gh_bin"
+    ) or _configured_path(configuration, "ega.encryption.crypt4gh_bin")
+    if input_dir is None:
+        raise click.UsageError(
+            "--input-dir is required or must be set in the EGA encryption "
+            "configuration."
+        )
+    if recipient_pubkey is None:
+        raise click.UsageError(
+            "--recipient-pubkey is required or must be set in the EGA "
+            "encryption configuration."
+        )
     configured_chdir = slurm_config_value(slurm_conf, "chdir", chdir)
     if isinstance(configured_chdir, str):
         configured_chdir = Path(configured_chdir)

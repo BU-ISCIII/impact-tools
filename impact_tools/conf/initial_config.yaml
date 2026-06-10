@@ -1,0 +1,137 @@
+# Example user configuration for impact-tools.
+#
+# Copy this file, adapt the required values and install it with:
+#
+#   impact-tools add-extra-config --config-file /path/to/impact-config.yaml
+#
+# The resulting configuration is stored in:
+#   ~/.impact_tools/extra_config.json
+#
+# Explicit command-line arguments always override these values.
+
+logs:
+  # Base directory used for modules without an explicit path below.
+  # Their logs are stored under <default_outpath>/<module>/.
+  # Set to null to disable command-level logs unless a module path is defined.
+  default_outpath: /impact_data/logs/impact-tools
+
+  # Optional destination override for each command.
+  # Remove entries that should use default_outpath instead.
+  modules_outpath:
+    ega_encrypt: /impact_data/logs/impact-tools/ega/encrypt
+    ega_upload_inbox: /impact_data/logs/impact-tools/ega/upload-inbox
+    ega_encrypt_slurm: /impact_data/logs/impact-tools/ega/encrypt-slurm
+    beacon_liftover: /impact_data/logs/impact-tools/beacon/liftover
+    beacon_pgx: /impact_data/logs/impact-tools/beacon/pgx
+
+ega:
+  encryption:
+    # Base directory containing the raw files or sample directories to encrypt.
+    # It can still be overridden with --input-dir.
+    input_dir: /impact_data/raw_data/lega
+
+    # Destination for encrypted files, metrics, manifests and plots.
+    # When null, the command creates encrypted_c4gh under input_dir.
+    output_dir: /impact_data/raw_data/lega/encrypted_c4gh
+
+    # LocalEGA Crypt4GH public key used to encrypt files.
+    # Store only the key path here, never private key contents.
+    recipient_pubkey: /secure/localega/service.key.pub
+
+    # Optional path to the crypt4gh executable.
+    # Leave null to use the first crypt4gh available in PATH.
+    crypt4gh_bin: null
+
+  inbox:
+    # Directory containing the encrypted .c4gh files to upload.
+    input_dir: /impact_data/raw_data/lega/encrypted_c4gh
+
+    # Directory for upload logs, metrics and manifests.
+    # When null, inbox_upload_reports is created under input_dir.
+    output_dir: null
+
+    # Hostname or IP address of the LocalEGA Inbox SFTP service.
+    host: dcontainers00
+
+    # External SFTP port exposed by the Inbox container.
+    port: 2222
+
+    # Federated EGA username used for Inbox authentication.
+    username: user@example.org
+
+    # Destination directory inside the SFTP Inbox.
+    remote_dir: /
+
+    # Optional SSH private key used for SFTP authentication.
+    # Store only its path and protect the key with filesystem permissions.
+    identity_file: ~/.ssh/localega_inbox
+
+    # Unknown host-key handling:
+    #   auto-add: accept and remember a previously unknown host key.
+    #   reject: refuse connections to unknown hosts.
+    host_key_policy: auto-add
+
+    # Maximum number of seconds allowed to establish the SFTP connection.
+    connect_timeout: 30
+
+  slurm_encryption:
+    # Optional SLURM-specific input directory. When null, encryption.input_dir
+    # is used.
+    input_dir: null
+
+    # Optional SLURM-specific encrypted output directory. When null,
+    # encryption.output_dir is used.
+    output_dir: null
+
+    # Optional SLURM-specific Crypt4GH public key. When null,
+    # encryption.recipient_pubkey is used.
+    recipient_pubkey: null
+
+    # Optional SLURM-specific crypt4gh executable. When null,
+    # encryption.crypt4gh_bin or PATH is used.
+    crypt4gh_bin: null
+
+    # Glob used to discover raw files recursively.
+    pattern: "*.fastq.gz"
+
+    # How array tasks are generated:
+    #   sample: group files by their sample directory.
+    #   file: create tasks from individual files.
+    task_layout: sample
+
+    # Number of samples or files processed by each array task.
+    items_per_task: 1
+
+    # Name shown for the job in the SLURM queue.
+    job_name: localega_encrypt
+
+    # HPC partition and optional accounting project.
+    partition: middle_idx
+    account: null
+
+    # Working directory used by the SLURM job. Leave null to omit --chdir.
+    chdir: null
+
+    # CPU and memory resources requested for each array task.
+    ntasks: 1
+    cpus_per_task: 2
+    mem: 8G
+
+    # Maximum runtime for each task, in SLURM HH:MM:SS format.
+    time_limit: "24:00:00"
+
+    # Shell commands executed before impact-tools in every task.
+    # For example, module loading or environment activation commands.
+    setup_commands: []
+
+    # Skip SHA256 calculation when true. This is faster but less auditable.
+    no_checksums: false
+
+    # Generate encryption plots inside every SLURM task.
+    generate_plots: false
+
+    # Replace existing encrypted outputs when true.
+    force: false
+
+    # Stop processing the current task after its first failed file.
+    fail_fast: true

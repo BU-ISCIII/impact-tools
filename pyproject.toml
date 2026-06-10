@@ -10,6 +10,7 @@ requires-python = ">=3.10"
 dependencies = [
     "click>=8.1",
     "paramiko>=3.4",
+    "PyYAML>=6.0",
     "rich>=13.0",
 ]
 
@@ -30,4 +31,4 @@ zip-safe = false
 
 [tool.setuptools.package-data]
 "impact_tools.beacon.resources" = ["Snakefile"]
-impact_tools = ["conf/*.json"]
+impact_tools = ["conf/*.json", "conf/*.yaml"]

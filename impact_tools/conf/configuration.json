@@ -1,6 +1,31 @@
 {
+  "logs": {
+    "default_outpath": null,
+    "modules_outpath": {}
+  },
   "ega": {
+    "encryption": {
+      "input_dir": null,
+      "output_dir": null,
+      "recipient_pubkey": null,
+      "crypt4gh_bin": null
+    },
+    "inbox": {
+      "input_dir": null,
+      "output_dir": null,
+      "host": null,
+      "port": 2222,
+      "username": null,
+      "remote_dir": "/",
+      "identity_file": null,
+      "host_key_policy": "auto-add",
+      "connect_timeout": 30
+    },
     "slurm_encryption": {
+      "input_dir": null,
+      "output_dir": null,
+      "recipient_pubkey": null,
+      "crypt4gh_bin": null,
       "pattern": "*.fastq.gz",
       "task_layout": "sample",
       "items_per_task": 1,

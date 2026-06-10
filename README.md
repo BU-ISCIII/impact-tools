@@ -49,6 +49,46 @@ impact-tools beacon --help
 impact-tools ega --help
 ```
 
+### User Configuration
+
+Persistent machine- or user-specific paths can be stored in
+`~/.impact_tools/extra_config.json`. This keeps values such as log locations,
+Crypt4GH keys and Inbox connection settings out of repeated command lines.
+The commented template
+[`impact_tools/conf/initial_config.yaml`](impact_tools/conf/initial_config.yaml)
+documents every available option.
+
+Create an `impact-config.yaml` file:
+
+```yaml
+logs:
+  default_outpath: /impact_data/logs/impact-tools
+  modules_outpath:
+    ega_encrypt: /impact_data/logs/impact-tools/ega/encrypt
+    ega_upload_inbox: /impact_data/logs/impact-tools/ega/upload-inbox
+
+ega:
+  encryption:
+    recipient_pubkey: /secure/localega/service.key.pub
+    output_dir: /impact_data/raw_data/lega/encrypted_c4gh
+  inbox:
+    host: dcontainers00
+    port: 2222
+    username: user@example.org
+    identity_file: ~/.ssh/localega_inbox
+```
+
+Install it for the current user:
+
+```bash
+impact-tools add-extra-config --config-file impact-config.yaml
+```
+
+The priority is: explicit CLI arguments, an execution-specific
+`--config-file`, `~/.impact_tools/extra_config.json`, then package defaults.
+Do not store passwords or private key contents in this file; store only paths
+to protected key files.
+
 ## Beacon Workstream
 
 The Beacon tooling covers the operational steps needed to prepare genomic data
