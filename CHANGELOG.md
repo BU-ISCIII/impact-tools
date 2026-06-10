@@ -8,6 +8,11 @@ where possible.
 
 ## [Unreleased]
 
+### Credits
+
+- [Alejandro Bernabeu](https://github.com/Aberdur)
+- [Magdalena Matito](https://github.com/magdasmat)
+
 ### Added
 
 - Added SLURM encryption execution support to generate chunk files, task
@@ -15,6 +20,7 @@ where possible.
   large Affiliated EGA encryption batches.
 - Added persistent user configuration through `~/.impact_tools/extra_config.json`
   for logs, EGA encryption, Inbox uploads and SLURM defaults.
+- Added Beacon dataset ingestion workflow through `impact-tools beacon ingest dataset`. [#8](https://github.com/BU-ISCIII/impact-tools/pull/8)
 
 ## [0.1.0] - 2026-05-21
 

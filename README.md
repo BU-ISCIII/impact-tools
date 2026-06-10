@@ -66,6 +66,7 @@ logs:
   modules_outpath:
     ega_encrypt: /impact_data/logs/impact-tools/ega/encrypt
     ega_upload_inbox: /impact_data/logs/impact-tools/ega/upload-inbox
+    beacon_ingest_dataset: /impact_data/logs/impact-tools/beacon/ingest-dataset
 
 ega:
   encryption:
@@ -76,6 +77,28 @@ ega:
     port: 2222
     username: user@example.org
     identity_file: ~/.ssh/localega_inbox
+
+beacon:
+  remote:
+    host: 172.20.10.47
+    user: bioinfo
+    port: 22
+    password: null # Use either password-based authentication or an SSH identity file.
+    identity_file: ~/.ssh/beacon_remote
+    beacon_dir: /opt/beacon/beacon2-pi-api-isciii
+    input_dir: /impact_data/lega_data/beacon/inputs
+    log_dir: /var/log/local/beacon/apps/ri-tools
+
+  containers:
+    mongo: mongoprod
+    api: beaconprod
+
+  runtime:
+    remote_container_runtime: podman
+
+  ri_tools:
+    variants_command_template: >-
+      echo dataset={dataset_id} vcf={remote_vcf}
 ```
 
 Install it for the current user:
@@ -103,6 +126,10 @@ Current focus:
 5. Infer sample sex from non-ref chrY variant counts.
 6. Prepare per-sample pgx_pilot workspaces (symlinks, config, samples.tsv).
 7. Run the pgx_pilot Snakemake pipeline via Docker to produce sites-only VCFs.
+8. Register Beacon datasets end-to-end: generate dataset artifacts locally,
+   upload the per-dataset RI-tools configuration to the Beacon VM, import
+   dataset metadata into MongoDB, update the Beacon deployment YAML files,
+   restart the Beacon API and verify dataset visibility via `/api/datasets`.
 
 ### Workflow Overview
 
@@ -124,7 +151,16 @@ impact-tools beacon pgx
         |  pgx_runs/<sample>/          (workspace per sample)
         |  <sample>.sites.pass.vcf.gz  (Beacon-ready, PASS QC)
         v
-Beacon v2 ingestion pipeline
+impact-tools beacon ingest dataset
+        |
+        |  datasets.csv                (dataset metadata)
+        |  datasets.json               (BFF for mongoimport)
+        |  conf.py                     (per-dataset RI-tools config)
+        |  datasets_conf.yml block     (registered on the Beacon VM)
+        |  datasets_permissions.yml    (registered on the Beacon VM)
+        v
+Beacon v2 ingest variants
+  (dataset visible via /api/datasets, ready for variant ingestion)
 ```
 
 ### Liftover VCFs
@@ -248,6 +284,43 @@ The `--pgx-repo` path can also be set via the `PGX_REPO` environment variable.
 | `pgx_runs/<sample>/results/<sample>.sites.all.vcf.gz` | Sites-only VCF, all variants. |
 | `pgx_runs/<sample>/results/<sample>.sites.pass.vcf.gz` | Sites-only VCF, PASS QC only (Beacon-ready). |
 | `logs/<sample>_pgx.log` | Snakemake stdout/stderr log. |
+
+### Register Beacon Datasets into MongoDB
+
+The `beacon ingest dataset` command registers dataset metadata in the Beacon v2
+deployment. It prepares the required dataset artifacts locally, uploads the
+dataset-specific RI-tools configuration to the Beacon VM, imports the dataset
+metadata into MongoDB, updates the Beacon dataset configuration and permissions
+YAML files, restarts the Beacon API container and verifies that the dataset is
+visible through the `/api/datasets` endpoint.
+
+The command can be run interactively:
+
+```bash
+impact-tools beacon ingest dataset
+```
+
+The user is prompted for the dataset identifier, display name, optional
+description, reference genome build and test/synthetic flags.
+
+The same information can also be provided directly through CLI options:
+
+impact-tools beacon ingest dataset \
+  --dataset-id ISCIII_ES_IMPACT_1 \
+  --name "Go-IMPaCT Spain WGS cohort" \
+  --description "" \
+  --ref-genome GRCh38 \
+  --no-test \
+  --no-synthetic
+
+The command writes dataset-specific working files under <base-dir>/config/,
+<base-dir>/work/ and <base-dir>/inputs/. It also writes an automatic metrics
+JSON file under <base-dir>/logs/.
+
+Remote Beacon deployment settings are currently read from the local
+~/.config/impact-tools/config.yaml file. This configuration must include the
+remote host, user, Beacon deployment paths, container names and runtime needed
+to apply the dataset registration on the Beacon VM.
 
 ## Affiliated EGA Workstream
 
@@ -487,6 +560,9 @@ python3 -m py_compile \
   impact_tools/__main__.py \
   impact_tools/beacon/liftover.py \
   impact_tools/beacon/pgx.py \
+  impact_tools/beacon/ingest.py \
+  impact_tools/beacon/remote.py \
+  impact_tools/beacon/ritools.py \
   impact_tools/ega/encrypt.py \
   impact_tools/ega/slurm.py \
   impact_tools/ega/upload_inbox.py
@@ -498,6 +574,8 @@ Inspect CLI help:
 python3 -m impact_tools --help
 python3 -m impact_tools beacon liftover --help
 python3 -m impact_tools beacon pgx --help
+python3 -m impact_tools beacon ingest --help
+python3 -m impact_tools beacon ingest dataset --help
 python3 -m impact_tools ega encrypt --help
 python3 -m impact_tools ega encrypt-slurm --help
 python3 -m impact_tools ega upload-inbox --help
