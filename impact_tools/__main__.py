@@ -28,6 +28,7 @@ from impact_tools.ega.slurm import (
 from impact_tools.ega.upload_inbox import InboxUploadConfig, run_inbox_upload
 from impact_tools.beacon import liftover as beacon_liftover
 from impact_tools.beacon import pgx as beacon_pgx
+from impact_tools.beacon import ingest as beacon_ingest
 
 log = logging.getLogger(__name__)
 
@@ -731,7 +732,7 @@ def liftover_cmd(
     type=click.Path(path_type=Path, file_okay=False, exists=True),
     default=Path("."),
     show_default="current working directory",
-    help="Base working directory.",
+    help="Base working directory. Defaults to the current directory.",
 )
 @click.option(
     "--country-code",
@@ -992,6 +993,140 @@ def pgx_cmd(
             "Check logs in <base-dir>/logs/ for details."
         )
 
+
+@beacon.group("ingest")
+def beacon_ingest_group() -> None:
+    """Beacon ingestion workflows."""
+
+@beacon_ingest_group.command("dataset")
+@click.option("--dataset-id", required=False, help="Beacon dataset identifier.")
+@click.option("--name", required=False, help="Dataset display name.")
+@click.option(
+    "--description",
+    default=None,
+    show_default=True,
+    help="Dataset description. If omitted, you will be prompted.",
+)
+@click.option(
+    "--ref-genome",
+    "reference_genome",
+    type=click.Choice(["GRCh37", "GRCh38"]),
+    default=None,
+    show_default=True,
+    help="Reference genome used by the dataset. If omitted, you will be prompted.",
+)
+@click.option(
+    "--test/--no-test",
+    default=None,
+    show_default=True,
+    help="Whether this dataset is a test dataset.",
+)
+@click.option(
+    "--synthetic/--no-synthetic",
+    default=None,
+    show_default=True,
+    help="Whether this dataset is synthetic.",
+)
+@click.option(
+    "-b",
+    "--base-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=Path("."),
+    show_default="current working directory",
+    help="Base Beacon operational directory. Defaults to the current directory.",
+)
+@click.option(
+    "--granularity",
+    type=click.Choice(["boolean", "count", "record"]),
+    default="record",
+    show_default=True,
+    help="Default public entry type granularity.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Discover artifacts without writing files.",
+)
+
+@click.pass_context
+def ingest_dataset_cmd(
+    ctx: click.Context,
+    dataset_id: str | None,
+    name: str | None,
+    description: str | None,
+    reference_genome: str | None,
+    test: bool | None,
+    synthetic: bool | None,
+    base_dir: Path,
+    granularity: str,
+    dry_run: bool,
+) -> None:
+    """Prepare Beacon dataset registration artifacts."""
+    configure_module_logging(ctx, "beacon_ingest_dataset")
+
+    if dataset_id is None: 
+        dataset_id = click.prompt("Dataset ID")
+
+    if name is None: 
+        name = click.prompt("Dataset name")
+
+    if description is None:
+        add_description = click.confirm(
+            "Do you want to add any description?",
+            default=False,
+        )
+        if add_description:
+            description = click.prompt("Please write a description")
+        else:
+            description = ""
+
+    if reference_genome is None:
+        reference_genome = click.prompt(
+            "Please, select your dataset genome build", 
+            type=click.Choice(["GRCh37", "GRCh38"]),
+            default="GRCh38",
+            show_choices=True,
+            show_default=True,
+        )
+
+    if test is None:
+        test = click.confirm("Is this a <test> dataset?", default=False)
+
+    if synthetic is None:
+        synthetic = click.confirm("Is this a <synthetic> dataset?", default=False)
+
+    base_dir = base_dir.resolve()
+
+    cfg = beacon_ingest.DatasetIngestConfig(
+        dataset_id=dataset_id,
+        name=name,
+        description=description,
+        reference_genome=reference_genome,
+        is_test=test,
+        is_synthetic=synthetic,
+        base_dir=base_dir,
+        granularity=granularity,
+        dry_run=dry_run,
+    )
+
+    try:
+        result = beacon_ingest.ingest_dataset(cfg)
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(str(exc)) from exc
+
+    log.info("==========================================")
+    log.info("Beacon dataset ingest")
+    log.info("==========================================")
+    log.info("Dataset ID: %s", result.dataset_id)
+    log.info("Base dir:   %s", result.paths.base_dir)
+    log.info("Mode:       %s", "dry-run" if dry_run else "write")
+    log.info("Generated artifacts:")
+    for path in result.generated_files:
+        log.info("  - %s", path)
+
+    if result.metrics_file is not None:
+        log.info("Metrics file:")
+        log.info("  - %s", result.metrics_file)
 
 @ega.command("encrypt-slurm")
 @click.option(
