@@ -67,11 +67,24 @@
       "mongo": "mongoprod",
       "api": "beaconprod"
     },
+    "mongo": {
+      "user": "root",
+      "password": "example",
+      "auth_source": "admin",
+      "database": "beacon",
+      "tls": true,
+      "tls_ca": "/etc/mongo/certs/ca.crt",
+      "tls_cert": "/etc/mongo/certs/server.pem",
+      "tls_allow_invalid": true
+    },
     "runtime": {
       "remote_container_runtime": "podman"
     },
-    "ri_tools": {
-      "variants_command_template": "echo dataset={dataset_id} vcf={remote_vcf}"
+    "ritools": {
+        "python": "/opt/localEGA/tools/micromamba/envs/impact-tools/bin/python",
+        "db_host": "localhost",
+        "tls_ca": "/opt/beacon/beacon2-pi-api-isciii/certs/ca.crt",
+        "tls_cert": "/opt/beacon/beacon2-pi-api-isciii/certs/server.pem"
     }
   }
 }

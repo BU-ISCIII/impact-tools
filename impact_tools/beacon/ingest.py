@@ -5,16 +5,20 @@ from __future__ import annotations
 import csv
 import dataclasses
 import datetime as dt
+import gzip
 import json
 import logging
 import platform
 import re
+import shlex
 import socket
 import sys
 import time
 from pathlib import Path
 from importlib import resources
 from impact_tools.beacon import ritools
+from impact_tools.beacon.registry import BeaconRegistry
+from impact_tools.beacon.remote import exec_remote, sftp_upload
 
 LOGGER = logging.getLogger(__name__)
 
@@ -339,12 +343,12 @@ def upload_dataset_metrics_to_remote(
 ) -> str:
     """Upload dataset ingest metrics to the remote Beacon log directory."""
     from impact_tools.beacon.remote import (
-        load_beacon_deployment_config,
+        build_beacon_deployment_config,
         managed_ssh,
         upload_metrics_file,
     )
 
-    deployment = load_beacon_deployment_config()
+    deployment = build_beacon_deployment_config()
 
     with managed_ssh(deployment.remote) as client:
         return upload_metrics_file(
@@ -383,18 +387,21 @@ def apply_dataset_to_remote(
     operation leaves traces (backups, idempotent inserts) so partial
     failures can be inspected or replayed by re-running this function.
     """
-    from impact_tools.beacon.remote import (
-        load_beacon_deployment_config,
-        managed_ssh,
-        upload_ritools_conf,
+    from impact_tools.beacon.mongo import (
         mongo_import_datasets,
         mongo_count_dataset,
+    )
+
+    from impact_tools.beacon.remote import (
+        build_beacon_deployment_config,
+        managed_ssh,
+        upload_ritools_conf,
         update_yaml_block_remote,
         restart_beacon_api,
         verify_dataset_via_api,
     )
 
-    deployment = load_beacon_deployment_config()
+    deployment = build_beacon_deployment_config()
 
     with managed_ssh(deployment.remote) as client:
         # 1. Upload per-dataset conf.py (used later by `ingest variants`).
@@ -458,6 +465,18 @@ def apply_dataset_to_remote(
                 f"Dataset '{config.dataset_id}' not visible via API after "
                 f"restart. Check beaconprod logs and datasets_conf.yml on "
                 f"the VM."
+            )
+        # 8. Record the registration in the local BeaconRegistry.
+        with BeaconRegistry() as reg:
+            reg.record_dataset_registration(
+                dataset_id=config.dataset_id,
+                name=config.name,
+                description=config.description,
+                reference_genome=config.reference_genome,
+                is_test=config.is_test,
+                is_synthetic=config.is_synthetic,
+                granularity=config.granularity,
+                base_dir=str(config.base_dir),
             )
 
     return ApplyDatasetResult(
@@ -542,3 +561,725 @@ def ingest_dataset(config: DatasetIngestConfig) -> DatasetIngestResult:
 
     return result
 
+
+# ---------------------------------------------------------------------------
+# Remote orchestration: Variant ingestion helpers
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class VariantsIngestConfig:
+    """Configuration for applying Beacon variants to a remote deployment."""
+
+    dataset_id: str
+    vcf: Path
+    reference_genome: str = "GRCh38"
+    base_dir: Path = Path(".")
+    cleanup_old: bool = False
+    skip_filtering_terms: bool = False
+    dry_run: bool = True
+
+
+@dataclasses.dataclass
+class ApplyVariantsResult:
+    """Outcome of applying variants to the remote Beacon deployment."""
+
+    dataset_id: str
+    staging_id: str
+    old_id: str
+    remote_vcf: str
+    vcf_count: int
+    mongo_count: int | None = None
+    api_visible: bool | None = None
+    api_count_valid: bool | None = None
+    deleted_old_variants: int | None = None
+
+
+@dataclasses.dataclass
+class OldVariantBackup:
+    """Existing _old_ variant backup stored in MongoDB."""
+
+    dataset_id: str
+    age_days: int
+    variants: int
+    default_delete: bool
+
+def ensure_vcf_on_vm(
+    client,
+    local_vcf: Path,
+    remote_input_dir: str,
+    dataset_id: str,
+) -> str:
+    """Ensure a local VCF exists on the remote Beacon VM.
+
+    If the remote file is already present and non-empty, it is reused.
+    Otherwise, the local VCF is uploaded through SFTP.
+
+    Returns the remote VCF path.
+    """
+    local_vcf = local_vcf.expanduser().resolve()
+
+    if not local_vcf.is_file():
+        raise FileNotFoundError(f"VCF file not found: {local_vcf}")
+
+    remote_dataset_dir = f"{remote_input_dir.rstrip('/')}/{dataset_id}"
+    remote_vcf = f"{remote_dataset_dir}/{local_vcf.name}"
+
+    mkdir_cmd = f"mkdir -p {shlex.quote(remote_dataset_dir)}"
+    mkdir_result = exec_remote(client, mkdir_cmd)
+
+    if not mkdir_result.ok:
+        raise RuntimeError(
+            f"Could not create remote input directory: {remote_dataset_dir}\n"
+            f"STDERR: {mkdir_result.stderr}"
+        )
+
+    check_cmd = f"test -s {shlex.quote(remote_vcf)}"
+    check_result = exec_remote(client, check_cmd)
+
+    if check_result.ok:
+        LOGGER.info("Remote VCF already exists: %s", remote_vcf)
+        return remote_vcf
+
+    LOGGER.info("Uploading VCF to remote VM: %s -> %s", local_vcf, remote_vcf)
+    sftp_upload(client, local_vcf, remote_vcf)
+
+    verify_result = exec_remote(client, check_cmd)
+    if not verify_result.ok:
+        raise RuntimeError(
+            f"VCF upload verification failed: {remote_vcf}\n"
+            f"STDERR: {verify_result.stderr}"
+        )
+
+    return remote_vcf
+
+
+def run_ritools_remote(
+    client,
+    ritools_cfg,
+    mongo_cfg,
+    dataset_id: str,
+    remote_vcf: str,
+    reference_genome: str,
+) -> None:
+    """Run beacon2-ri-tools-v2 genomicVariations_vcf on the Beacon VM.
+
+    The script is invoked via the dedicated Python interpreter of the
+    impact-tools micromamba environment on the VM. MongoDB connection
+    parameters and TLS certificate paths are passed as environment
+    variables, overriding the package-shipped conf.py defaults.
+    """
+    env_vars = (
+        f"DATABASE_HOST={shlex.quote(ritools_cfg.db_host)} "
+        f"DATABASE_USER={shlex.quote(mongo_cfg.user)} "
+        f"DATABASE_PASSWORD={shlex.quote(mongo_cfg.password)} "
+        f"DATABASE_NAME={shlex.quote(mongo_cfg.database)} "
+        f"DATABASE_AUTH_SOURCE={shlex.quote(mongo_cfg.auth_source)} "
+        f"BEACON_MONGO_TLS_CA={shlex.quote(ritools_cfg.tls_ca)} "
+        f"BEACON_MONGO_TLS_CERT={shlex.quote(ritools_cfg.tls_cert)}"
+    )
+
+    command = (
+        f"{env_vars} "
+        f"{shlex.quote(ritools_cfg.python)} "
+        f"-m genomicVariations_vcf "
+        f"--datasetId {shlex.quote(dataset_id)} "
+        f"--input {shlex.quote(remote_vcf)} "
+        f"--refGenome {shlex.quote(reference_genome)}"
+    )
+
+    LOGGER.info("Running remote ri-tools command: %s", command)
+
+    result = exec_remote(client, command)
+
+    if result.stdout:
+        LOGGER.info("ri-tools stdout:\n%s", result.stdout)
+    if result.stderr:
+        LOGGER.info("ri-tools stderr:\n%s", result.stderr)
+
+    if not result.ok:
+        raise RuntimeError(
+            "Remote ri-tools execution failed.\n"
+            f"Command: {result.command}\n"
+            f"STDOUT: {result.stdout}\n"
+            f"STDERR: {result.stderr}"
+        )
+
+    LOGGER.info("ri-tools completed for staging dataset: %s", dataset_id)
+
+def count_vcf_variants(vcf_path: Path) -> int:
+    """Count variant records in a local VCF/VCF.GZ file.
+
+    Header lines starting with '#' are ignored.
+    """
+    vcf_path = vcf_path.expanduser().resolve()
+
+    if not vcf_path.is_file():
+        raise FileNotFoundError(f"VCF file not found: {vcf_path}")
+
+    opener = gzip.open if vcf_path.suffix == ".gz" else open
+
+    count = 0
+    with opener(vcf_path, "rt", encoding="utf-8") as handle:
+        for line in handle:
+            if line.startswith("#"):
+                continue
+            if line.strip():
+                count += 1
+
+    return count
+
+
+def check_variant_counts(
+    *,
+    mongo_count: int,
+    vcf_count: int,
+    dataset_id: str,
+) -> None:
+    """Verify that MongoDB and VCF variant counts match."""
+    if mongo_count != vcf_count:
+        raise RuntimeError(
+            "Variant count mismatch.\n"
+            f"Dataset ID:   {dataset_id}\n"
+            f"Mongo count:  {mongo_count}\n"
+            f"VCF count:    {vcf_count}"
+        )
+
+    LOGGER.info(
+        "Variant count check passed for %s: mongo_count=%d, vcf_count=%d",
+        dataset_id,
+        mongo_count,
+        vcf_count,
+    )
+
+
+def run_reindex_remote(
+    client,
+    containers_cfg,
+) -> None:
+    """Run Beacon MongoDB reindex inside the Beacon API container."""
+    command = (
+        f"podman exec {shlex.quote(containers_cfg.api)} "
+        f"python -m beacon.connections.mongo.reindex"
+    )
+
+    LOGGER.info("Running Beacon reindex: %s", command)
+
+    result = exec_remote(client, command)
+
+    if result.stdout:
+        LOGGER.info("reindex stdout:\n%s", result.stdout)
+    if result.stderr:
+        LOGGER.info("reindex stderr:\n%s", result.stderr)
+
+    if not result.ok:
+        raise RuntimeError(
+            "Beacon reindex failed.\n"
+            f"Command: {result.command}\n"
+            f"STDOUT: {result.stdout}\n"
+            f"STDERR: {result.stderr}"
+        )
+
+    LOGGER.info("Beacon reindex completed.")
+
+
+def run_filtering_terms_remote(
+    client,
+    containers_cfg,
+) -> None:
+    """Run Beacon filtering terms extraction inside the Beacon API container."""
+    import itertools
+    import sys
+    import threading
+
+    command = (
+        f"podman exec {shlex.quote(containers_cfg.api)} "
+        f"python -m beacon.connections.mongo.extract_filtering_terms "
+    )
+
+    LOGGER.info("Running filtering terms extraction: %s. This may take a few minutes!", command)
+
+    stop_waiting = threading.Event()
+
+    def _waiting_message() -> None:
+        messages = itertools.cycle([
+            "Running filtering terms extraction.  ",
+            "Running filtering terms extraction.. ",
+            "Running filtering terms extraction...",
+        ])
+        while not stop_waiting.is_set():
+            sys.stderr.write("\r" + next(messages))
+            sys.stderr.flush()
+            stop_waiting.wait(1)
+    
+    waiting_thread = threading.Thread(
+        target=_waiting_message, 
+        daemon=True,
+    )
+    waiting_thread.start()
+    
+    try:
+        result = exec_remote(client, command)
+    finally:
+        stop_waiting.set()
+        waiting_thread.join()
+        sys.stderr.write("\r" + " " * 80 + "\r")  # Clear the waiting message
+        sys.stderr.flush()
+
+    if not result.ok:
+        raise RuntimeError(
+            "filtering terms extraction failed.\n"
+            f"Command: {result.command}\n"
+            f"STDERR: {result.stderr}"
+        )
+
+    LOGGER.info("Filtering terms extraction completed successfully.")
+
+
+def list_old_variant_backups(
+    client,
+    mongo_cfg,
+    containers_cfg,
+    dataset_id: str,
+    *,
+    older_than_days: int = 7,
+) -> list[OldVariantBackup]:
+    """List MongoDB genomicVariations backups matching <dataset>_old_<run_id>."""
+    pattern = f"^{re.escape(dataset_id)}_old_[0-9]{{8}}_[0-9]{{6}}$"
+
+    js = f"""
+const db_ = db.getSiblingDB({json.dumps(mongo_cfg.database)});
+const pattern = new RegExp({json.dumps(pattern)});
+
+const ids = db_.genomicVariations
+  .distinct("datasetId", {{datasetId: {{$regex: pattern}}}})
+  .sort();
+
+const rows = ids.map(id => ({{
+  datasetId: id,
+  variants: db_.genomicVariations.countDocuments({{datasetId: id}})
+}}));
+
+print(JSON.stringify(rows));
+"""
+
+    command = (
+        f"podman exec {shlex.quote(containers_cfg.mongo)} "
+        f"mongosh --quiet "
+        f"-u {shlex.quote(mongo_cfg.user)} "
+        f"-p {shlex.quote(mongo_cfg.password)} "
+        f"--authenticationDatabase {shlex.quote(mongo_cfg.auth_source)} "
+    )
+
+    if mongo_cfg.tls:
+        command += (
+            f"--tls "
+            f"--tlsCAFile {shlex.quote(mongo_cfg.tls_ca)} "
+            f"--tlsCertificateKeyFile {shlex.quote(mongo_cfg.tls_cert)} "
+        )
+        if mongo_cfg.tls_allow_invalid:
+            command += "--tlsAllowInvalidCertificates "
+
+    command += f"--eval {shlex.quote(js)}"
+
+    result = exec_remote(client, command)
+
+    if not result.ok:
+        raise RuntimeError(
+            "Could not list old variant backups.\n"
+            f"Command: {result.command}\n"
+            f"STDOUT: {result.stdout}\n"
+            f"STDERR: {result.stderr}"
+        )
+
+    rows = json.loads(result.stdout.strip() or "[]")
+    now = dt.datetime.now()
+
+    backups: list[OldVariantBackup] = []
+
+    for row in rows:
+        backup_id = row["datasetId"]
+        prefix = f"{dataset_id}_old_"
+        timestamp = backup_id[len(prefix):]
+
+        try:
+            created_at = dt.datetime.strptime(timestamp, "%Y%m%d_%H%M%S")
+        except ValueError:
+            continue
+
+        age_days = max((now - created_at).days, 0)
+
+        backups.append(
+            OldVariantBackup(
+                dataset_id=backup_id,
+                age_days=age_days,
+                variants=int(row["variants"]),
+                default_delete=age_days >= older_than_days,
+            )
+        )
+
+    return backups
+
+
+def delete_old_variant_backups(
+    client,
+    mongo_cfg,
+    containers_cfg,
+    backups: list[OldVariantBackup],
+    selected_indices: list[int],
+) -> dict[str, int]:
+    """Delete selected old variant backups from MongoDB.
+
+    selected_indices are 1-based indices from the displayed backups list.
+    """
+    from impact_tools.beacon.mongo import mongo_delete_dataset_variants
+
+    deleted: dict[str, int] = {}
+
+    for index in selected_indices:
+        backup = backups[index - 1]
+
+        deleted_count = mongo_delete_dataset_variants(
+            client,
+            mongo_cfg,
+            containers_cfg,
+            backup.dataset_id,
+        )
+
+        deleted[backup.dataset_id] = deleted_count
+
+        LOGGER.info(
+            "Deleted old variant backup %s (%d variants).",
+            backup.dataset_id,
+            deleted_count,
+        )
+
+    return deleted
+
+
+def _parse_backup_selection(
+    selection: str,
+    max_index: int,
+) -> list[int]:
+    """Parse comma-separated 1-based backup selection like '1,3'."""
+    selected: list[int] = []
+
+    for item in selection.split(","):
+        item = item.strip()
+
+        if not item:
+            continue
+
+        try:
+            index = int(item)
+        except ValueError as exc:
+            raise ValueError(f"Invalid backup selection: {item}") from exc
+
+        if index < 1 or index > max_index:
+            raise ValueError(
+                f"Backup selection out of range: {index}. "
+                f"Valid range is 1-{max_index}."
+            )
+
+        if index not in selected:
+            selected.append(index)
+
+    return selected
+
+
+def offer_old_variant_backups_cleanup(
+    dataset_id: str,
+    *,
+    older_than_days: int = 7,
+) -> dict[str, int]:
+    """Interactively offer cleanup of old Beacon variant backups."""
+    import click
+
+    from impact_tools.beacon.remote import (
+        build_beacon_deployment_config,
+        managed_ssh,
+    )
+
+    if not click.get_text_stream("stdin").isatty():
+        LOGGER.info(
+            "Skipping interactive old-backup cleanup because stdin is not a TTY."
+        )
+        return {}
+
+    deployment = build_beacon_deployment_config()
+
+    with managed_ssh(deployment.remote) as client:
+        backups = list_old_variant_backups(
+            client,
+            deployment.mongo,
+            deployment.containers,
+            dataset_id,
+            older_than_days=older_than_days,
+        )
+
+        if not backups:
+            LOGGER.info("No old variant backups found for %s.", dataset_id)
+            return {}
+
+        click.echo()
+        click.echo(f"Old variant backups found for {dataset_id}:")
+        click.echo()
+
+        default_indices: list[int] = []
+
+        for index, backup in enumerate(backups, start=1):
+            action = "delete" if backup.default_delete else "keep"
+
+            if backup.default_delete:
+                default_indices.append(index)
+
+            click.echo(f"[{index}] {backup.dataset_id}")
+            click.echo(f"    age: {backup.age_days} days")
+            click.echo(f"    variants: {backup.variants}")
+            click.echo(f"    default action: {action}")
+            click.echo()
+
+        selected_indices: list[int] = []
+
+        if default_indices:
+            delete_default = click.confirm(
+                f"Delete backups older than {older_than_days} days?",
+                default=True,
+            )
+
+            if delete_default:
+                default_selection = ",".join(
+                    str(index) for index in default_indices
+                )
+
+                raw_selection = click.prompt(
+                    "Select backups to delete",
+                    default=default_selection,
+                    show_default=True,
+                )
+
+                selected_indices = _parse_backup_selection(
+                    raw_selection,
+                    len(backups),
+                )
+
+            else:
+                delete_any = click.confirm(
+                    "Delete any backup?",
+                    default=False,
+                )
+
+                if delete_any:
+                    raw_selection = click.prompt(
+                        "Select backups to delete",
+                    )
+
+                    selected_indices = _parse_backup_selection(
+                        raw_selection,
+                        len(backups),
+                    )
+
+        else:
+            delete_any = click.confirm(
+                f"No backups are older than {older_than_days} days. "
+                "Delete any backup?",
+                default=False,
+            )
+
+            if delete_any:
+                raw_selection = click.prompt(
+                    "Select backups to delete",
+                )
+
+                selected_indices = _parse_backup_selection(
+                    raw_selection,
+                    len(backups),
+                )
+
+        if not selected_indices:
+            LOGGER.info("No old variant backups selected for deletion.")
+            return {}
+
+        return delete_old_variant_backups(
+            client,
+            deployment.mongo,
+            deployment.containers,
+            backups,
+            selected_indices,
+        )
+
+
+def apply_variants_to_remote(
+    config: VariantsIngestConfig,
+) -> ApplyVariantsResult:
+    """Apply genomic variants to a remote Beacon deployment.
+
+    Safe verify-and-swap workflow:
+
+    1. Build staging_id and old_id.
+    2. Generate staging RI-tools conf.py locally.
+    3. Upload VCF to the VM.
+    4. Upload staging conf.py to the VM.
+    5. Run remote RI-tools command against staging_id.
+    6. If dry_run=True, stop here.
+    7. Count variants in MongoDB and local VCF.
+    8. Verify counts.
+    9. Swap active dataset_id through old_id/staging_id renames.
+    10. Reindex, extract filtering_terms, restart API.
+    11. Verify API visibility and API variant count.
+    12. Optionally cleanup old_id variants.
+    """
+    from impact_tools.beacon.mongo import (
+        mongo_count_variants,
+        mongo_delete_dataset_variants,
+        mongo_rename_dataset_id,
+    )
+    from impact_tools.beacon.remote import (
+        build_beacon_deployment_config,
+        managed_ssh,
+        restart_beacon_api,
+        verify_dataset_via_api,
+        verify_variant_count_via_api,
+    )
+
+    validate_dataset_id(config.dataset_id)
+    validate_reference_genome(config.reference_genome)
+
+    local_vcf = config.vcf.expanduser().resolve()
+    if not local_vcf.is_file():
+        raise FileNotFoundError(f"VCF file not found: {local_vcf}")
+
+    run_id = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    staging_id = f"{config.dataset_id}_staging_{run_id}"
+    old_id = f"{config.dataset_id}_old_{run_id}"
+
+    validate_dataset_id(staging_id)
+    validate_dataset_id(old_id)
+
+    vcf_count = count_vcf_variants(local_vcf)
+
+    deployment = build_beacon_deployment_config()
+
+    with managed_ssh(deployment.remote) as client:
+        remote_vcf = ensure_vcf_on_vm(
+            client,
+            local_vcf,
+            deployment.remote.input_dir,
+            staging_id,
+        )
+
+        run_ritools_remote(
+            client,
+            deployment.ritools,
+            deployment.mongo,
+            staging_id,
+            remote_vcf,
+            config.reference_genome,
+        )
+
+        if config.dry_run:
+            LOGGER.info(
+                "Dry run enabled. Stopping after remote RI-tools command for %s.",
+                staging_id,
+            )
+            return ApplyVariantsResult(
+                dataset_id=config.dataset_id,
+                staging_id=staging_id,
+                old_id=old_id,
+                remote_vcf=remote_vcf,
+                vcf_count=vcf_count,
+            )
+
+        mongo_count = mongo_count_variants(
+            client,
+            deployment.mongo,
+            deployment.containers,
+            staging_id,
+        )
+
+        check_variant_counts(
+            mongo_count=mongo_count,
+            vcf_count=vcf_count,
+            dataset_id=staging_id,
+        )
+
+        old_count = mongo_rename_dataset_id(
+            client,
+            deployment.mongo,
+            deployment.containers,
+            old_dataset_id=config.dataset_id,
+            new_dataset_id=old_id,
+        )
+
+        new_count = mongo_rename_dataset_id(
+            client,
+            deployment.mongo,
+            deployment.containers,
+            old_dataset_id=staging_id,
+            new_dataset_id=config.dataset_id,
+        )
+
+        LOGGER.info(
+            "Variant dataset swap completed: active_to_old=%d staging_to_active=%d",
+            old_count,
+            new_count,
+        )
+
+        run_reindex_remote(
+            client,
+            deployment.containers,
+        )
+
+        if config.skip_filtering_terms:
+            LOGGER.info("Skipping filtering terms extraction (--skip-filtering-terms).")
+        else:
+            run_filtering_terms_remote(
+                client,
+                deployment.containers,
+            )
+
+        restart_beacon_api(client, deployment.remote)
+
+        api_visible = verify_dataset_via_api(
+            client,
+            deployment.remote,
+            config.dataset_id,
+        )
+
+        if not api_visible:
+            raise RuntimeError(
+                f"Dataset '{config.dataset_id}' not visible via API after variant ingest."
+            )
+
+        api_count_valid = verify_variant_count_via_api(
+            client,
+            deployment.remote,
+            config.dataset_id,
+            vcf_count,
+        )
+
+        if not api_count_valid:
+            raise RuntimeError(
+                f"Variant count for dataset '{config.dataset_id}' does not match via API."
+            )
+
+        deleted_old_variants = None
+        if config.cleanup_old:
+            deleted_old_variants = mongo_delete_dataset_variants(
+                client,
+                deployment.mongo,
+                deployment.containers,
+                old_id,
+            )
+
+    return ApplyVariantsResult(
+        dataset_id=config.dataset_id,
+        staging_id=staging_id,
+        old_id=old_id,
+        remote_vcf=remote_vcf,
+        vcf_count=vcf_count,
+        mongo_count=mongo_count,
+        api_visible=api_visible,
+        api_count_valid=api_count_valid,
+        deleted_old_variants=deleted_old_variants,
+    )

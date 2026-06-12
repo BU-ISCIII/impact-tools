@@ -9,7 +9,7 @@ from pathlib import Path, PurePosixPath
 
 LOGGER = logging.getLogger(__name__)
 
-DEFAULT_CONFIG_PATH = Path("~/.config/impact-tools/config.yaml")
+# DEFAULT_CONFIG_PATH = Path("~/.config/impact-tools/config.yaml")
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +53,7 @@ class BeaconRemoteConfig:
 @dataclasses.dataclass
 class BeaconContainersConfig:
     mongo: str = "mongoprod"
-    # ri_tools: str = "ri-tools"
+    api: str = "beaconprod"
 
 
 @dataclasses.dataclass
@@ -74,6 +74,16 @@ class BeaconRuntimeConfig:
 
 
 @dataclasses.dataclass
+class BeaconRitoolsConfig:
+    """Configuration for running beacon2-ri-tools-v2 on the Beacon VM."""
+
+    python: str = "/opt/localEGA/tools/micromamba/envs/impact-tools/bin/python"
+    db_host: str = "localhost"
+    tls_ca: str = "/opt/beacon/beacon2-pi-api-isciii/certs/ca.crt"
+    tls_cert: str = "/opt/beacon/beacon2-pi-api-isciii/certs/server.pem"
+
+
+@dataclasses.dataclass
 class BeaconDeploymentConfig:
     """Full deployment configuration parsed from config.yaml."""
 
@@ -81,6 +91,7 @@ class BeaconDeploymentConfig:
     containers: BeaconContainersConfig
     mongo: BeaconMongoConfig
     runtime: BeaconRuntimeConfig
+    ritools: BeaconRitoolsConfig 
 
 
 # ---------------------------------------------------------------------------
@@ -88,74 +99,100 @@ class BeaconDeploymentConfig:
 # ---------------------------------------------------------------------------
 
 
-def load_beacon_deployment_config(
-    config_path: Path = DEFAULT_CONFIG_PATH,
+def build_beacon_deployment_config(
+    cfg: dict | None = None,
 ) -> BeaconDeploymentConfig:
-    """Load Beacon deployment config from a YAML file."""
-    import yaml  # pyyaml — optional at import time
+    """Build a BeaconDeploymentConfig from the impact-tools config system.
 
-    path = Path(config_path).expanduser()
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Beacon config not found: {path}. "
-            "Create ~/.config/impact-tools/config.yaml with a 'beacon' section."
-        )
+    Reads configuration via impact_tools.config.load_configuration (defaults
+    + ~/.impact_tools/extra_config.json + optional explicit overrides) and
+    constructs the typed dataclasses used by the rest of remote.py.
 
-    with path.open("r", encoding="utf-8") as fh:
-        raw = yaml.safe_load(fh) or {}
+    This replaces the legacy load_beacon_deployment_config() that read a
+    standalone ~/.config/impact-tools/config.yaml.
+    """
+    from impact_tools.config import load_configuration, get_config_value
 
-    beacon = raw.get("beacon", {})
+    if cfg is None:
+        cfg = load_configuration()
 
-    remote_raw = beacon.get("remote", {})
-    if not remote_raw.get("host"):
+    def _g(path: str, default=None):
+        return get_config_value(cfg, f"beacon.{path}", default)
+
+    host = _g("remote.host")
+    if not host:
         raise ValueError(
-            f"beacon.remote.host is required in {path}"
+            "beacon.remote.host is required in the impact-tools configuration."
         )
 
     remote = BeaconRemoteConfig(
-        host=remote_raw["host"],
-        user=remote_raw.get("user", remote_raw.get("username", "bioinfo")),
-        port=int(remote_raw.get("port", 22)),
-        password=remote_raw.get("password"),
-        identity_file=remote_raw.get("identity_file"),
-        beacon_dir=remote_raw.get("beacon_dir", "/opt/beacon/beacon2-pi-api-isciii"),
-        input_dir=remote_raw.get("input_dir", "/impact_data/lega_data/beacon/inputs"),
-        log_dir=remote_raw.get("log_dir", "/var/log/local/beacon/apps/ri-tools"),
-        datasets_conf_dir=remote_raw.get(
-            "datasets_conf_dir",
-            "/opt/beacon/beacon2-pi-api-isciii/beacon/conf/datasets"
+        host=host,
+        user=_g("remote.user", "bioinfo"),
+        port=int(_g("remote.port", 22)),
+        password=_g("remote.password"),
+        identity_file=_g("remote.identity_file"),
+        beacon_dir=_g(
+            "remote.beacon_dir",
+            "/opt/beacon/beacon2-pi-api-isciii",
         ),
-        datasets_permissions_dir=remote_raw.get(
-            "datasets_permissions_dir",
-            "/opt/beacon/beacon2-pi-api-isciii/beacon/permissions/datasets",
+        input_dir=_g(
+            "remote.input_dir",
+            "/impact_data/lega_data/beacon/inputs",
         ),
-        api_url=remote_raw.get(
-            "api_url",
+        log_dir=_g(
+            "remote.log_dir",
+            "/var/log/local/beacon/apps/ri-tools",
+        ),
+                api_url=_g(
+            "remote.api_url",
             "http://beaconaf-isciiiciber.isciiides.es:8443",
         ),
+        datasets_conf_dir=_g(
+            "remote.datasets_conf_dir",
+            "/opt/beacon/beacon2-pi-api-isciii/beacon/conf/datasets",
+        ),
+        datasets_permissions_dir=_g(
+            "remote.datasets_permissions_dir",
+            "/opt/beacon/beacon2-pi-api-isciii/beacon/permissions/datasets",
+        ),
     )
 
-    containers_raw = beacon.get("containers", {})
     containers = BeaconContainersConfig(
-        mongo=containers_raw.get("mongo", "mongoprod"),
-        # ri_tools=containers_raw.get("ri_tools", "ri-tools"),
+        mongo=_g("containers.mongo", "mongoprod"),
     )
 
-    mongo_raw = beacon.get("mongo", {})
     mongo = BeaconMongoConfig(
-        user=mongo_raw.get("user", "root"),
-        password=mongo_raw.get("password", "example"),
-        auth_source=mongo_raw.get("auth_source", "admin"),
-        database=mongo_raw.get("database", "beacon"),
-        tls=mongo_raw.get("tls", True),
-        tls_cert=mongo_raw.get("tls_cert", "/etc/mongo/certs/server.pem"),
-        tls_ca=mongo_raw.get("tls_ca", "/etc/mongo/certs/ca.crt"),
-        tls_allow_invalid=bool(mongo_raw.get("tls_allow_invalid", True)),
+        user=_g("mongo.user", "root"),
+        password=_g("mongo.password", "example"),
+        auth_source=_g("mongo.auth_source", "admin"),
+        database=_g("mongo.database", "beacon"),
+        tls=bool(_g("mongo.tls", True)),
+        tls_cert=_g("mongo.tls_cert", "/etc/mongo/certs/server.pem"),
+        tls_ca=_g("mongo.tls_ca", "/etc/mongo/certs/ca.crt"),
+        tls_allow_invalid=bool(_g("mongo.tls_allow_invalid", True)),
     )
 
-    runtime_raw = beacon.get("runtime", {})
     runtime = BeaconRuntimeConfig(
-        remote_container_runtime=runtime_raw.get("remote_container_runtime", "podman"),
+            remote_container_runtime=_g(
+                "runtime.remote_container_runtime",
+                "podman",
+            ),
+        )
+
+    ritools = BeaconRitoolsConfig(
+        python=_g(
+            "ritools.python",
+            "/opt/localEGA/tools/micromamba/envs/impact-tools/bin/python",
+        ),
+        db_host=_g("ritools.db_host", "localhost"),
+        tls_ca=_g(
+            "ritools.tls_ca",
+            "/opt/beacon/beacon2-pi-api-isciii/certs/ca.crt",
+        ),
+        tls_cert=_g(
+            "ritools.tls_cert",
+            "/opt/beacon/beacon2-pi-api-isciii/certs/server.pem",
+        ),
     )
 
     return BeaconDeploymentConfig(
@@ -163,6 +200,7 @@ def load_beacon_deployment_config(
         containers=containers,
         mongo=mongo,
         runtime=runtime,
+        ritools=ritools,
     )
 
 
@@ -312,144 +350,6 @@ def upload_metrics_file(
     sftp_upload(client, local_metrics, remote_path)
     return remote_path
 
-def mongo_count_dataset(
-    client,
-    mongo_cfg: BeaconMongoConfig,
-    containers_cfg: BeaconContainersConfig,
-    dataset_id: str,
-) -> int:
-    """Count documents in MongoDB.datasets with the given id.
-
-    Returns the number of matching documents (0 if not present, 1 if present).
-    Useful for verifying that an ingest succeeded before declaring the
-    dataset registered.
-    """
-    eval_js = (
-        f'db.getSiblingDB("{mongo_cfg.database}").datasets'
-        f'.countDocuments({{id: "{dataset_id}"}})'
-    )
-
-    command_parts = [
-        f"podman exec {containers_cfg.mongo}",
-        "mongosh",
-        "--quiet",
-        f"-u {mongo_cfg.user}",
-        f"-p {mongo_cfg.password}",
-        f"--authenticationDatabase {mongo_cfg.auth_source}",
-    ]
-
-    if mongo_cfg.tls:
-        command_parts.extend([
-            "--tls",
-            f"--tlsCAFile {mongo_cfg.tls_ca}",
-            f"--tlsCertificateKeyFile {mongo_cfg.tls_cert}",
-        ])
-        if mongo_cfg.tls_allow_invalid:
-            command_parts.append("--tlsAllowInvalidCertificates")
-
-    command_parts.append(f"--eval '{eval_js}'")
-    command = " ".join(command_parts)
-
-    result = exec_remote(client, command)
-
-    if not result.ok:
-        raise RuntimeError(
-            f"mongo_count_dataset failed for {dataset_id}.\n"
-            f"Command: {result.command}\n"
-            f"STDERR: {result.stderr}"
-        )
-
-    output = result.stdout.strip()
-    try:
-        return int(output)
-    except ValueError as exc:
-        raise RuntimeError(
-            f"Unexpected output from mongosh (not an integer): {output!r}"
-        ) from exc
-    
-
-def mongo_import_datasets(
-    client,
-    mongo_cfg: BeaconMongoConfig,
-    containers_cfg: BeaconContainersConfig,
-    local_json: Path,
-    remote_tmp: str = "/tmp/datasets.json",
-) -> int:
-    """Import a datasets.json into MongoDB.<database>.datasets.
-
-    The JSON is uploaded to the VM, copied into the MongoDB container,
-    and ingested with `mongoimport --jsonArray`. Connection uses the URI
-    form (TLS options embedded) because mongoimport does not accept TLS
-    flags as separate arguments.
-
-    Returns the number of documents reported as imported by mongoimport.
-    """
-    from urllib.parse import quote_plus
-
-    # 1. SFTP upload to the VM host filesystem
-    sftp_upload(client, local_json, remote_tmp)
-
-    # 2. Copy from VM host into the Mongo container
-    cp_cmd = (
-        f"podman cp {remote_tmp} "
-        f"{containers_cfg.mongo}:{remote_tmp}"
-    )
-    cp_result = exec_remote(client, cp_cmd)
-    if not cp_result.ok:
-        raise RuntimeError(
-            f"podman cp failed: {cp_result.stderr or cp_result.stdout}"
-        )
-
-    # 3. Build the mongoimport URI with TLS embedded
-    uri_params = [f"authSource={mongo_cfg.auth_source}"]
-    if mongo_cfg.tls:
-        uri_params.extend([
-            "tls=true",
-            f"tlsCAFile={mongo_cfg.tls_ca}",
-            f"tlsCertificateKeyFile={mongo_cfg.tls_cert}",
-        ])
-    uri = (
-        f"mongodb://{quote_plus(mongo_cfg.user)}:{quote_plus(mongo_cfg.password)}"
-        f"@127.0.0.1:27017/{mongo_cfg.database}?{'&'.join(uri_params)}"
-    )
-
-    # 4. Run mongoimport
-    import_parts = [
-        f"podman exec {containers_cfg.mongo}",
-        "mongoimport",
-        "--jsonArray",
-        f'--uri "{uri}"',
-    ]
-    if mongo_cfg.tls and mongo_cfg.tls_allow_invalid:
-        import_parts.append("--tlsInsecure")
-    import_parts.extend([
-        f"--file {remote_tmp}",
-        "--collection datasets",
-    ])
-    import_cmd = " ".join(import_parts)
-
-    result = exec_remote(client, import_cmd)
-
-    if not result.ok:
-        raise RuntimeError(
-            f"mongoimport failed: {result.stderr or result.stdout}"
-        )
-
-    # 5. Parse the mongoimport summary line, e.g.:
-    #    "N document(s) imported successfully. M document(s) failed to import."
-    import re
-    match = re.search(
-        r"(\d+) document\(s\) imported successfully",
-        result.stderr + result.stdout,
-    )
-    if not match:
-        raise RuntimeError(
-            f"Could not parse mongoimport output:\n{result.stdout}\n{result.stderr}"
-        )
-
-    imported = int(match.group(1))
-    return imported
-
 
 def update_yaml_block_remote(
     client,
@@ -567,10 +467,6 @@ def verify_dataset_via_api(
     LOGGER.info("Verifying dataset '%s' via API...", dataset_id)
     result = exec_remote(client, command)
 
-    # grep -c returns:
-    #   0 (success) + stdout="N" → found
-    #   1 (no match) + stdout="0" → not found
-    #   2+ → other error
     if result.returncode not in (0, 1):
         raise RuntimeError(
             f"verify_dataset_via_api failed for {dataset_id}.\n"
@@ -586,3 +482,70 @@ def verify_dataset_via_api(
         LOGGER.warning("Dataset '%s' is NOT visible via API.", dataset_id)
 
     return found
+
+
+def verify_variant_count_via_api(
+    client,
+    remote_cfg: BeaconRemoteConfig,
+    dataset_id: str,
+    expected_count: int,
+) -> bool:
+    """Verify that a dataset exposes the expected number of variants via API.
+
+    Runs a Beacon genomic variants query from the VM and checks whether
+    responseSummary.numTotalResults matches the expected count.
+
+    Returns True if the API count matches, False otherwise.
+    """
+    import json
+
+    command = (
+        f"curl -s '{remote_cfg.api_url}/api/g_variants"
+        f"?datasets={dataset_id}"
+        f"&requestedGranularity=count"
+        f"&limit=0'"
+    )
+
+    LOGGER.info(
+        "Verifying variant count for dataset '%s' via API...",
+        dataset_id,
+    )
+    result = exec_remote(client, command)
+
+    if not result.ok:
+        raise RuntimeError(
+            f"verify_variant_count_via_api failed for {dataset_id}.\n"
+            f"STDERR: {result.stderr}"
+        )
+
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "Could not parse Beacon API response as JSON.\n"
+            f"Dataset ID: {dataset_id}\n"
+            f"Response: {result.stdout[:1000]}"
+        ) from exc
+
+    observed_count = (
+        payload
+        .get("responseSummary", {})
+        .get("numTotalResults")
+    )
+
+    if observed_count != expected_count:
+        LOGGER.warning(
+            "Variant count mismatch via API for %s: observed=%s expected=%s",
+            dataset_id,
+            observed_count,
+            expected_count,
+        )
+        return False
+
+    LOGGER.info(
+        "Variant count verified via API for %s: %d variants",
+        dataset_id,
+        expected_count,
+    )
+
+    return True

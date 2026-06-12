@@ -1512,6 +1512,125 @@ def ingest_dataset_cmd(
         log.info("Metrics file:")
         log.info("  - %s", result.metrics_file)
 
+
+@beacon_ingest_group.command("variants")
+@click.option(
+    "--dataset-id",
+    required=True,
+    help="Beacon dataset identifier (must already exist in MongoDB).",
+)
+@click.option(
+    "--vcf",
+    required=True,
+    type=click.Path(path_type=Path, dir_okay=False, exists=True),
+    help="Aggregated VCF (.vcf.gz) to ingest into the dataset.",
+)
+@click.option(
+    "--ref-genome",
+    "reference_genome",
+    type=click.Choice(["GRCh37", "GRCh38"]),
+    default="GRCh38",
+    show_default=True,
+    help="Reference genome used by the VCF.",
+)
+@click.option(
+    "-b",
+    "--base-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=Path("."),
+    show_default="current working directory",
+    help="Base Beacon operational directory for staging artifacts and logs.",
+)
+@click.option(
+    "--cleanup-old",
+    is_flag=True,
+    help=(
+        "After a successful swap, immediately delete the _old_<run_id> "
+        "variants from MongoDB. Off by default for safer rollback."
+    ),
+)
+@click.option(
+    "--skip-filtering-terms",
+    is_flag=True,
+    help=(
+        "Skip filtering terms extraction (slow). Useful for batched "
+        "ingestions where you run it once at the end."
+    ),
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help=(
+        "Run ri-tools against the staging dataset and STOP before the swap. "
+        "Useful for validating that the VCF ingests cleanly."
+    ),
+)
+@click.pass_context
+def ingest_variants_cmd(
+    ctx: click.Context,
+    dataset_id: str,
+    vcf: Path,
+    reference_genome: str,
+    base_dir: Path,
+    cleanup_old: bool,
+    skip_filtering_terms: bool,
+    dry_run: bool,
+) -> None:
+    """Ingest variants into an existing Beacon dataset (stage→swap→cleanup)."""
+    configure_module_logging(ctx, "beacon_ingest_variants")
+
+    base_dir = base_dir.resolve()
+    vcf = vcf.resolve()
+
+    cfg = beacon_ingest.VariantsIngestConfig(
+        dataset_id=dataset_id,
+        vcf=vcf,
+        reference_genome=reference_genome,
+        base_dir=base_dir,
+        cleanup_old=cleanup_old,
+        skip_filtering_terms=skip_filtering_terms,
+        dry_run=dry_run,
+    )
+
+    try:
+        result = beacon_ingest.apply_variants_to_remote(cfg)
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(str(exc)) from exc
+
+    log.info("==========================================")
+    log.info("Beacon variant ingest")
+    log.info("==========================================")
+    log.info("Dataset ID:           %s", result.dataset_id)
+    log.info("Staging ID (Mongo):   %s", result.staging_id)
+    log.info("Old ID (Mongo):       %s", result.old_id)
+    log.info("Mode:                 %s", "dry-run" if dry_run else "swap")
+    log.info("VCF variants count:   %s", result.vcf_count)
+    if result.mongo_count is not None:
+        log.info("Mongo variants count: %s", result.mongo_count)
+    if result.api_visible is not None:
+        log.info("API visible:          %s", result.api_visible)
+    if result.api_count_valid is not None:
+        log.info("API count valid:      %s", result.api_count_valid)
+    if result.deleted_old_variants is not None:
+        log.info("Old variants purged:  %s", result.deleted_old_variants)
+
+    if not cleanup_old and not dry_run:
+        try:
+            deleted_backups = beacon_ingest.offer_old_variant_backups_cleanup(
+                dataset_id=dataset_id,
+                older_than_days=7,
+            )
+        except click.Abort:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise click.ClickException(str(exc)) from exc
+
+        if deleted_backups:
+            log.info("Old variant backups cleanup summary:")
+            for backup_id, deleted_count in deleted_backups.items():
+                log.info("  %s: %d variants deleted", backup_id, deleted_count)
+
+
 @ega.command("encrypt-slurm")
 @click.option(
     "--config-file",
