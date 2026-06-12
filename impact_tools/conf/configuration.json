@@ -53,6 +53,9 @@
     }
   },
   "beacon": {
+    "execution": {
+      "profile": "local"
+    },
     "remote": {
       "host": "172.20.10.47",
       "user": "bioinfo",

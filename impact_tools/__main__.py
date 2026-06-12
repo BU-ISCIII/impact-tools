@@ -1379,8 +1379,24 @@ def pgx_cmd(
 
 
 @beacon.group("ingest")
-def beacon_ingest_group() -> None:
+@click.option(
+    "--run-profile",
+    type=click.Choice(["local", "ws", "hpc"]),
+    help="Execution environment label recorded in metrics and manifests.",
+)
+@click.pass_context
+def beacon_ingest_group(
+    ctx: click.Context,
+    run_profile: str | None,
+) -> None:
     """Beacon ingestion workflows."""
+    configuration = ctx.obj["configuration"]
+
+    ctx.obj["beacon_ingest_run_profile"] = run_profile or get_config_value(
+        configuration,
+        "beacon.execution.profile",
+        "local",
+    )
 
 @beacon_ingest_group.command("dataset")
 @click.option("--dataset-id", required=False, help="Beacon dataset identifier.")
@@ -1581,6 +1597,7 @@ def ingest_variants_cmd(
 
     base_dir = base_dir.resolve()
     vcf = vcf.resolve()
+    run_profile = ctx.obj["beacon_ingest_run_profile"]
 
     cfg = beacon_ingest.VariantsIngestConfig(
         dataset_id=dataset_id,
@@ -1590,6 +1607,7 @@ def ingest_variants_cmd(
         cleanup_old=cleanup_old,
         skip_filtering_terms=skip_filtering_terms,
         dry_run=dry_run,
+        run_profile=run_profile,
     )
 
     try:
@@ -1613,6 +1631,13 @@ def ingest_variants_cmd(
         log.info("API count valid:      %s", result.api_count_valid)
     if result.deleted_old_variants is not None:
         log.info("Old variants purged:  %s", result.deleted_old_variants)
+    
+    if result.manifest_file is not None:
+        log.info("Manifest file:        %s", result.manifest_file)
+
+    if result.process is not None:
+        log.info("Stage wall seconds:   %.3f", result.process.wall_seconds)
+        log.info("Max RSS MiB:          %.3f", result.process.max_rss_mib)
 
     if not cleanup_old and not dry_run:
         try:

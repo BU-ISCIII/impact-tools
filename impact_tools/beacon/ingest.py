@@ -19,6 +19,12 @@ from importlib import resources
 from impact_tools.beacon import ritools
 from impact_tools.beacon.registry import BeaconRegistry
 from impact_tools.beacon.remote import exec_remote, sftp_upload
+from impact_tools.ega.execution import (
+    ProcessMetrics,
+    collect_execution_environment,
+    finish_process_metrics,
+    start_process_metrics,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -578,6 +584,7 @@ class VariantsIngestConfig:
     cleanup_old: bool = False
     skip_filtering_terms: bool = False
     dry_run: bool = True
+    run_profile: str = "local"
 
 
 @dataclasses.dataclass
@@ -593,6 +600,9 @@ class ApplyVariantsResult:
     api_visible: bool | None = None
     api_count_valid: bool | None = None
     deleted_old_variants: int | None = None
+    process: ProcessMetrics | None = None
+    execution: dict | None = None
+    manifest_file: Path | None = None
 
 
 @dataclasses.dataclass
@@ -603,6 +613,59 @@ class OldVariantBackup:
     age_days: int
     variants: int
     default_delete: bool
+
+
+def write_variant_ingest_manifest(
+    *,
+    config: VariantsIngestConfig,
+    result: ApplyVariantsResult,
+) -> Path:
+    """Write a JSON manifest for one Beacon ingest variants execution."""
+    logs_dir = config.base_dir.resolve() / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    run_token = result.staging_id.replace("/", "_").replace(":", "_")
+    manifest_file = logs_dir / f"beacon_ingest_variants_manifest_{run_token}.json"
+
+    payload = {
+        "workflow": "beacon.ingest.variants",
+        "execution": result.execution,
+        "run": {
+            "dataset_id": result.dataset_id,
+            "staging_id": result.staging_id,
+            "old_id": result.old_id,
+            "remote_vcf": result.remote_vcf,
+            "local_vcf": str(config.vcf.expanduser().resolve()),
+            "reference_genome": config.reference_genome,
+            "base_dir": str(config.base_dir.resolve()),
+            "cleanup_old": config.cleanup_old,
+            "skip_filtering_terms": config.skip_filtering_terms,
+            "dry_run": config.dry_run,
+            "run_profile": config.run_profile,
+        },
+        "summary": {
+            "vcf_count": result.vcf_count,
+            "mongo_count": result.mongo_count,
+            "api_visible": result.api_visible,
+            "api_count_valid": result.api_count_valid,
+            "deleted_old_variants": result.deleted_old_variants,
+            "process": (
+                dataclasses.asdict(result.process)
+                if result.process is not None
+                else None
+            ),
+        },
+    }
+
+    manifest_file.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    LOGGER.info("Beacon ingest manifest written: %s", manifest_file)
+
+    return manifest_file
+
 
 def ensure_vcf_on_vm(
     client,
@@ -1142,6 +1205,7 @@ def apply_variants_to_remote(
         verify_variant_count_via_api,
     )
 
+    process_start = start_process_metrics()
     validate_dataset_id(config.dataset_id)
     validate_reference_genome(config.reference_genome)
 
@@ -1182,13 +1246,26 @@ def apply_variants_to_remote(
                 "Dry run enabled. Stopping after remote RI-tools command for %s.",
                 staging_id,
             )
-            return ApplyVariantsResult(
+            process_metrics = finish_process_metrics(process_start)
+            execution = collect_execution_environment(config.run_profile).as_dict()
+
+            result = ApplyVariantsResult(
                 dataset_id=config.dataset_id,
                 staging_id=staging_id,
                 old_id=old_id,
                 remote_vcf=remote_vcf,
                 vcf_count=vcf_count,
+                process=process_metrics,
+                execution=execution,
             )
+
+            result.manifest_file = write_variant_ingest_manifest(
+                config=config,
+                result=result,
+            )
+
+            return result
+
 
         mongo_count = mongo_count_variants(
             client,
@@ -1272,7 +1349,11 @@ def apply_variants_to_remote(
                 old_id,
             )
 
-    return ApplyVariantsResult(
+
+    process_metrics = finish_process_metrics(process_start)
+    execution = collect_execution_environment(config.run_profile).as_dict()
+
+    result = ApplyVariantsResult(
         dataset_id=config.dataset_id,
         staging_id=staging_id,
         old_id=old_id,
@@ -1282,4 +1363,13 @@ def apply_variants_to_remote(
         api_visible=api_visible,
         api_count_valid=api_count_valid,
         deleted_old_variants=deleted_old_variants,
+        process=process_metrics,
+        execution=execution,
     )
+
+    result.manifest_file = write_variant_ingest_manifest(
+        config=config,
+        result=result,
+    )
+
+    return result
