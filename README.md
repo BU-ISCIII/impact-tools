@@ -159,8 +159,17 @@ impact-tools beacon ingest dataset
         |  datasets_conf.yml block     (registered on the Beacon VM)
         |  datasets_permissions.yml    (registered on the Beacon VM)
         v
-Beacon v2 ingest variants
-  (dataset visible via /api/datasets, ready for variant ingestion)
+Beacon dataset registered (visible via /api/datasets)
+        |
+        v
+impact-tools beacon ingest variants
+        |
+        |  Verify variants in staging
+        |  Promote to active dataset
+        |  Ingestion report
+        v
+Beacon v2 serves variants from dataset
+  (dataset searchable via /api/beacon/v2/)
 ```
 
 ### Liftover VCFs
@@ -228,17 +237,34 @@ Each liftover run writes per sample under `<base-dir>/liftover/`:
 
 ### Prepare and Run pgx_pilot
 
-The command reads lifted VCFs from `liftover/`, infers sample sex by counting
-non-ref variants on chrY, creates one workspace per sample under `pgx_runs/`,
-and runs the pgx_pilot Snakemake pipeline via Docker.
+The command reads lifted VCFs from `liftover/`. Both single-sample and joint
+multi-sample VCFs are supported.
+
+For every lifted VCF, the workflow:
+
+1. Lists all contained sample identifiers with `bcftools query -l`.
+2. Associates each sample with the basename of its source VCF.
+3. Infers sex independently for each sample from non-reference chrY genotypes.
+4. Creates one independent workspace under `pgx_runs/<sample>/`.
+5. Subsets the requested sample from the source VCF during the Snakemake run.
+6. Produces per-sample sites-only VCFs for Beacon ingestion.
 
 Sex inference is automatic. Samples whose chrY variant count falls between
-`--sex-ambiguous-min` (default 5 000) and `--sex-ambiguous-max` (default 7 000)
+`--sex-ambiguous-min` (default 5,000) and `--sex-ambiguous-max` (default 7,000)
 are flagged and the user is prompted to enter the sex manually.
 
-The bundled Snakefile (with local patches applied) is installed automatically
-to `pgx_runs/` on first run. The `pgx_pilot` Docker image must be available
-locally before running.
+Sample metadata is stored in `inputs/samples.tsv` using four columns:
+
+```text
+sample_id<TAB>sex<TAB>country_code<TAB>vcf_basename
+```
+
+The `vcf_basename` field preserves the relationship between a sample workspace
+and the lifted joint VCF from which that sample must be selected.
+
+The bundled Snakefile is installed under `pgx_runs/Snakefile`. If the packaged
+Snakefile changes, the installed copy is refreshed automatically so existing
+working directories do not continue using stale workflow logic.
 
 Run the full pipeline (prepare workspaces + execute pgx_pilot):
 
@@ -278,12 +304,14 @@ The `--pgx-repo` path can also be set via the `PGX_REPO` environment variable.
 
 | File | Content |
 | --- | --- |
-| `inputs/samples.tsv` | Global sample manifest with inferred sex. Created and updated automatically. |
+| `inputs/samples.tsv` | Global sample manifest containing sample ID, inferred sex, country code and source VCF basename. |
+| `pgx_runs/Snakefile` | Installed copy of the bundled PGx workflow, refreshed when the packaged version changes. |
 | `pgx_runs/<sample>/config.yaml` | pgx_pilot config for this sample. |
 | `pgx_runs/<sample>/data/samples.tsv` | Single-row per-sample metadata (sex, country code). |
 | `pgx_runs/<sample>/results/<sample>.sites.all.vcf.gz` | Sites-only VCF, all variants. |
 | `pgx_runs/<sample>/results/<sample>.sites.pass.vcf.gz` | Sites-only VCF, PASS QC only (Beacon-ready). |
 | `logs/<sample>_pgx.log` | Snakemake stdout/stderr log. |
+
 
 ### Register Beacon Datasets into MongoDB
 
@@ -305,6 +333,7 @@ description, reference genome build and test/synthetic flags.
 
 The same information can also be provided directly through CLI options:
 
+```bash
 impact-tools beacon ingest dataset \
   --dataset-id ISCIII_ES_IMPACT_1 \
   --name "Go-IMPaCT Spain WGS cohort" \
@@ -312,15 +341,122 @@ impact-tools beacon ingest dataset \
   --ref-genome GRCh38 \
   --no-test \
   --no-synthetic
+```
 
 The command writes dataset-specific working files under <base-dir>/config/,
 <base-dir>/work/ and <base-dir>/inputs/. It also writes an automatic metrics
 JSON file under <base-dir>/logs/.
 
-Remote Beacon deployment settings are currently read from the local
-~/.config/impact-tools/config.yaml file. This configuration must include the
-remote host, user, Beacon deployment paths, container names and runtime needed
-to apply the dataset registration on the Beacon VM.
+Remote Beacon deployment settings are resolved through the standard
+impact-tools configuration hierarchy: explicit CLI arguments, an
+execution-specific `--config-file`, `~/.impact_tools/extra_config.json`, and
+finally the package defaults.
+
+### Ingest Genomic Variants into Beacon
+
+The `beacon ingest variants` command applies genomic variants to an already
+registered Beacon dataset.
+
+The target dataset must exist in the MongoDB `datasets` collection before the
+variant workflow starts. When an unknown dataset ID is supplied, the command
+stops before uploading any VCF and reports the IDs and names of the datasets
+currently available.
+
+Exactly one input mode must be selected:
+
+* `--vcf` for one `.vcf` or `.vcf.gz` file.
+* `--vcf-dir` for every `.vcf` and `.vcf.gz` file directly contained in one
+  directory.
+
+#### Ingest multiple VCF files
+
+```bash
+impact-tools beacon ingest \
+  --run-profile ws \ # default
+  variants \
+  --dataset-id ISCIII_ES_IMPACT_1 \
+  --vcf-dir /home/user/beacon_work/pgx_ingest \
+  --reference-genome GRCh38 # default
+```
+
+Input files are selected in deterministic filename order. RI-tools is run once
+for every VCF, while processed, inserted and skipped counts are accumulated for
+the complete batch.
+
+#### Ingest one VCF file
+
+```bash
+impact-tools beacon ingest \
+  --run-profile ws \ # default
+  variants \
+  --dataset-id ISCIII_ES_IMPACT_1 \
+  --vcf /home/user/beacon_work/sample.sites.pass.vcf.gz \
+  --reference-genome GRCh38 # default
+```
+
+#### Safe verify-and-swap workflow
+
+For a normal, non-dry-run execution, the command:
+
+1. Confirms that the active dataset is registered in MongoDB.
+2. Creates a unique temporary staging dataset ID.
+3. Uploads and processes each selected VCF with Beacon RI-tools.
+4. Counts the staging variants in MongoDB.
+5. Verifies the count against the total number successfully inserted by
+   RI-tools.
+6. Renames existing active variants to a timestamped backup dataset ID.
+7. Promotes the staging variants to the active dataset ID.
+8. Reindexes the Beacon MongoDB collections.
+9. Extracts filtering terms unless `--skip-filtering-terms` is supplied.
+10. Restarts the Beacon API.
+11. Verifies dataset visibility and variant count through the API.
+12. Optionally removes the newly created backup with `--cleanup-old`.
+
+Older timestamped backups can also be reviewed and removed interactively after
+a successful run.
+
+#### Dry run
+
+```bash
+impact-tools beacon ingest \
+  --run-profile ws \
+  variants \
+  --dataset-id ISCIII_ES_IMPACT_1 \
+  --vcf-dir /home/user/beacon_work/pgx_ingest \
+  --reference-genome GRCh38 \
+  --dry-run
+```
+
+A variant-ingestion dry run still uploads the selected VCF files and executes
+RI-tools using the temporary staging dataset ID. It stops before validating and
+promoting the staging data to the active dataset.
+
+Therefore, this mode is intended to test RI-tools processing and is not a
+read-only MongoDB preview.
+
+#### Optional controls
+
+```text
+--cleanup-old            Delete the backup created during the current swap.
+--skip-filtering-terms   Skip the potentially slow filtering-term extraction.
+--no-report-charts       Generate the HTML report without performance charts.
+--run-profile            Record the execution environment as local, ws or hpc.
+```
+
+#### Generated artifacts
+
+Each run writes its audit artifacts under `<base-dir>/logs/`:
+
+| File                                            | Content                                                                                             |
+| ----------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `beacon_ingest_variants_manifest_<run_id>.json` | Machine-readable inputs, execution environment, counts, validation results and output paths.        |
+| `beacon_ingest_variants_report_<run_id>.html`   | Self-contained execution report with summary cards, validation status, runtime and optional charts. |
+
+
+When multiple input VCFs contain the same genomic variant, the raw sum of VCF
+records can be greater than the number inserted into MongoDB. MongoDB and API
+validation therefore use the accumulated RI-tools inserted count.
+
 
 ## Affiliated EGA Workstream
 
@@ -707,9 +843,11 @@ python3 -m py_compile \
   impact_tools/__main__.py \
   impact_tools/beacon/liftover.py \
   impact_tools/beacon/pgx.py \
+  impact_tools/beacon/mongo.py \
   impact_tools/beacon/ingest.py \
   impact_tools/beacon/remote.py \
   impact_tools/beacon/ritools.py \
+  impact_tools/beacon/html_report.py \
   impact_tools/ega/encrypt.py \
   impact_tools/ega/slurm.py \
   impact_tools/ega/upload_inbox.py
@@ -723,6 +861,7 @@ python3 -m impact_tools beacon liftover --help
 python3 -m impact_tools beacon pgx --help
 python3 -m impact_tools beacon ingest --help
 python3 -m impact_tools beacon ingest dataset --help
+python3 -m impact_tools beacon ingest variants --help
 python3 -m impact_tools ega encrypt --help
 python3 -m impact_tools ega encrypt-slurm --help
 python3 -m impact_tools ega upload-inbox --help

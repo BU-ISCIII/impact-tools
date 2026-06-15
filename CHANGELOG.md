@@ -28,6 +28,7 @@ where possible.
 - Added an end-to-end encryption and Inbox upload wrapper plus self-contained
   HTML dashboards for individual runs and independent or combined WS/HPC
   comparisons of encryption, upload and complete workflows.
+- Added Beacon variants ingestion workflow, metrics reports and some pgx run fixes [#11](https://github.com/BU-ISCIII/impact-tools/pull/11)
 
 ## [0.1.0] - 2026-05-21
 
