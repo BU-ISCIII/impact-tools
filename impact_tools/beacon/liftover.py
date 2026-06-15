@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 import gzip
 import logging
 import re
@@ -224,19 +225,20 @@ def check_liftover_inputs(base_dir: Path) -> list[tuple[Path, Build, str, str | 
 
 def validate_resources(config: LiftoverConfig) -> None:
     """Check that required liftover resources exist and are co-located."""
-    if config.resolved_chain.parent != config.resolved_fasta.parent:
+
+    chain = config.resolved_chain.resolve()
+    fasta = config.resolved_fasta.resolve()
+
+    if chain.parent != fasta.parent:
         raise ValueError(
             "--chain and --fasta must be in the same directory "
             "(the Docker mount strategy maps a single /resources volume). "
-            f"chain: {config.resolved_chain.parent}, "
-            f"fasta: {config.resolved_fasta.parent}"
+            f"chain: {chain.parent}, "
+            f"fasta: {fasta.parent}"
         )
 
-    fai = Path(str(config.resolved_fasta) + ".fai")
-    missing = [
-        p for p in [config.resolved_chain, config.resolved_fasta, fai]
-        if not p.exists()
-    ]
+    missing = [path for path in (chain, fasta) if not path.exists()]
+
     if missing:
         missing_text = "\n".join(f"  - {p}" for p in missing)
         raise ValueError(
@@ -247,10 +249,8 @@ def validate_resources(config: LiftoverConfig) -> None:
             f"  wget -P {config.resolved_chain.parent} "
             "https://hgdownload.soe.ucsc.edu/goldenPath/hg19/liftOver/hg19ToHg38.over.chain.gz\n"
             f"  wget -P {config.resolved_fasta.parent} "
-            "https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/technical/reference/GRCh38_reference_genome/GRCh38_full_analysis_set_plus_decoy_hla.fa\n"
-            f"  wget -P {config.resolved_fasta.parent} "
-            "https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/technical/reference/GRCh38_reference_genome/GRCh38_full_analysis_set_plus_decoy_hla.fa.fai"
-        )
+            "https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/technical/reference/GRCh38_reference_genome/GRCh38_full_analysis_set_plus_decoy_hla.fa"
+           )
 
 
 def validate_docker_available() -> None:
@@ -266,6 +266,64 @@ def validate_docker_available() -> None:
         raise ValueError("Docker executable not found in PATH.") from exc
     except subprocess.CalledProcessError as exc:
         raise ValueError("Docker is installed but returned a non-zero exit code.") from exc
+
+
+def ensure_fasta_index(config: LiftoverConfig) -> Path:
+    """Create or refresh the FASTA .fai index before parallel liftover."""
+    fasta = config.resolved_fasta.resolve()
+    fai = Path(f"{fasta}.fai")
+
+    needs_rebuild = (
+        not fai.exists()
+        or fai.stat().st_mtime < fasta.stat().st_mtime
+    )
+
+    if not needs_rebuild:
+        log.info("FASTA index is up to date: %s", fai)
+        return fai
+
+    if fai.exists():
+        log.info("FASTA index is outdated; rebuilding: %s", fai)
+        fai.unlink()
+    else:
+        log.info("FASTA index not found; creating: %s", fai)
+
+    resources_dir = fasta.parent
+
+    cmd = [
+        "docker", "run", "--rm",
+        "--user", f"{os.getuid()}:{os.getgid()}",
+        "-v", f"{resources_dir}:/resources",
+        config.crossmap_image,
+        "python", "-c",
+        (
+            "import pysam; "
+            f"pysam.faidx('/resources/{fasta.name}')"
+        ),
+    ]
+
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    if proc.returncode != 0:
+        raise ValueError(
+            "Could not create FASTA index.\n"
+            f"Command: {' '.join(cmd)}\n"
+            f"STDOUT: {proc.stdout.strip()}\n"
+            f"STDERR: {proc.stderr.strip()}"
+        )
+
+    if not fai.exists():
+        raise ValueError(
+            f"samtools faidx completed but the index was not created: {fai}"
+        )
+
+    log.info("FASTA index created: %s", fai)
+    return fai
 
 
 def _prepare_auxiliary_files(liftover_dir: Path, fasta_fai: Path) -> tuple[Path, Path]:
@@ -508,13 +566,13 @@ def run_liftover(config: LiftoverConfig) -> LiftoverRunResult:
     """Run the full CrossMap liftover pipeline for all samples in base_dir/inputs."""
     validate_resources(config)
     validate_docker_available()
+    fai = ensure_fasta_index(config)
 
     vcfs = discover_input_vcfs(config.base_dir)
     if not vcfs:
         raise ValueError(f"No *.vcf.gz files found in {config.base_dir / 'inputs'}")
 
     liftover_dir = config.base_dir / "liftover"
-    fai = Path(str(config.resolved_fasta) + ".fai")
     _, contigs_file = _prepare_auxiliary_files(liftover_dir, fai)
     contigs_content = contigs_file.read_text()
 

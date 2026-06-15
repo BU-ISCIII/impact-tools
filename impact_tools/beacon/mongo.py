@@ -1,9 +1,11 @@
-"""MongoDB helpers for Beacon ingest workflows. """
+"""Remote MongoDB operations used by Beacon ingestion workflows."""
 
 from __future__ import annotations
 
+import json
 import logging
 import re
+import shlex
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -17,258 +19,125 @@ from impact_tools.beacon.remote import (
 LOGGER = logging.getLogger(__name__)
 
 
+def _run_mongosh(
+    client,
+    mongo_cfg: BeaconMongoConfig,
+    containers_cfg: BeaconContainersConfig,
+    javascript: str,
+) -> str:
+    """Execute JavaScript with mongosh inside the remote Mongo container."""
+    command_parts = [
+        f"podman exec {shlex.quote(containers_cfg.mongo)}",
+        "mongosh",
+        "--quiet",
+        f"-u {shlex.quote(mongo_cfg.user)}",
+        f"-p {shlex.quote(mongo_cfg.password)}",
+        (
+            "--authenticationDatabase "
+            f"{shlex.quote(mongo_cfg.auth_source)}"
+        ),
+    ]
+
+    if mongo_cfg.tls:
+        command_parts.extend(
+            [
+                "--tls",
+                f"--tlsCAFile {shlex.quote(mongo_cfg.tls_ca)}",
+                (
+                    "--tlsCertificateKeyFile "
+                    f"{shlex.quote(mongo_cfg.tls_cert)}"
+                ),
+            ]
+        )
+
+        if mongo_cfg.tls_allow_invalid:
+            command_parts.append("--tlsAllowInvalidCertificates")
+
+    command_parts.append(
+        f"--eval {shlex.quote(javascript)}"
+    )
+
+    result = exec_remote(
+        client,
+        " ".join(command_parts),
+    )
+
+    if not result.ok:
+        raise RuntimeError(
+            "MongoDB command failed.\n"
+            f"STDOUT: {result.stdout}\n"
+            f"STDERR: {result.stderr}"
+        )
+
+    return result.stdout.strip()
+
+
 def mongo_count_dataset(
     client,
     mongo_cfg: BeaconMongoConfig,
     containers_cfg: BeaconContainersConfig,
     dataset_id: str,
 ) -> int:
-    """Count documents in MongoDB.datasets with the given id.
-
-    Returns the number of matching documents (0 if not present, 1 if present).
-    Useful for verifying that an ingest succeeded before declaring the
-    dataset registered.
-    """
-    eval_js = (
-        f'db.getSiblingDB("{mongo_cfg.database}").datasets'
-        f'.countDocuments({{id: "{dataset_id}"}})'
+    """Count records in MongoDB.datasets with the requested dataset ID."""
+    javascript = (
+        f"db.getSiblingDB({json.dumps(mongo_cfg.database)})"
+        ".datasets"
+        f".countDocuments({{id: {json.dumps(dataset_id)}}})"
     )
 
-    command_parts = [
-        f"podman exec {containers_cfg.mongo}",
-        "mongosh",
-        "--quiet",
-        f"-u {mongo_cfg.user}",
-        f"-p {mongo_cfg.password}",
-        f"--authenticationDatabase {mongo_cfg.auth_source}",
-    ]
+    output = _run_mongosh(
+        client,
+        mongo_cfg,
+        containers_cfg,
+        javascript,
+    )
 
-    if mongo_cfg.tls:
-        command_parts.extend([
-            "--tls",
-            f"--tlsCAFile {mongo_cfg.tls_ca}",
-            f"--tlsCertificateKeyFile {mongo_cfg.tls_cert}",
-        ])
-        if mongo_cfg.tls_allow_invalid:
-            command_parts.append("--tlsAllowInvalidCertificates")
-
-    command_parts.append(f"--eval '{eval_js}'")
-    command = " ".join(command_parts)
-
-    result = exec_remote(client, command)
-
-    if not result.ok:
-        raise RuntimeError(
-            f"mongo_count_dataset failed for {dataset_id}.\n"
-            f"Command: {result.command}\n"
-            f"STDERR: {result.stderr}"
-        )
-
-    output = result.stdout.strip()
     try:
         return int(output)
     except ValueError as exc:
         raise RuntimeError(
-            f"Unexpected output from mongosh (not an integer): {output!r}"
+            "Unexpected output while counting dataset "
+            f"{dataset_id!r}: {output!r}"
         ) from exc
 
 
-def mongo_count_variants(
+def mongo_list_datasets(
     client,
     mongo_cfg: BeaconMongoConfig,
     containers_cfg: BeaconContainersConfig,
-    dataset_id: str,
-) -> int:
-    """Count documents in MongoDB.genomicVariations with the given datasetId.
+) -> list[dict]:
+    """Return the registered dataset IDs and names."""
+    javascript = f"""
+const database = db.getSiblingDB({json.dumps(mongo_cfg.database)});
+const datasets = database.datasets
+    .find({{}}, {{_id: 0, id: 1, name: 1}})
+    .sort({{id: 1}})
+    .toArray();
 
-    Used in the verify-and-swap flow:
-    - After ingesting variants under a staging_id, check the count matches
-      what we expect from the VCF.
-    - After the swap, confirm the count for the active dataset_id is correct.
-    """
-    eval_js = (
-        f'db.getSiblingDB("{mongo_cfg.database}").genomicVariations'
-        f'.countDocuments({{datasetId: "{dataset_id}"}})'
+print(JSON.stringify(datasets));
+"""
+
+    output = _run_mongosh(
+        client,
+        mongo_cfg,
+        containers_cfg,
+        javascript,
     )
-
-    command_parts = [
-        f"podman exec {containers_cfg.mongo}",
-        "mongosh",
-        "--quiet",
-        f"-u {mongo_cfg.user}",
-        f"-p {mongo_cfg.password}",
-        f"--authenticationDatabase {mongo_cfg.auth_source}",
-    ]
-
-    if mongo_cfg.tls:
-        command_parts.extend([
-            "--tls",
-            f"--tlsCAFile {mongo_cfg.tls_ca}",
-            f"--tlsCertificateKeyFile {mongo_cfg.tls_cert}",
-        ])
-        if mongo_cfg.tls_allow_invalid:
-            command_parts.append("--tlsAllowInvalidCertificates")
-
-    command_parts.append(f"--eval '{eval_js}'")
-    command = " ".join(command_parts)
-
-    result = exec_remote(client, command)
-
-    if not result.ok:
-        raise RuntimeError(
-            f"mongo_count_variants failed for {dataset_id}.\n"
-            f"Command: {result.command}\n"
-            f"STDERR: {result.stderr}"
-        )
-
-    output = result.stdout.strip()
-    try:
-        return int(output)
-    except ValueError as exc:
-        raise RuntimeError(
-            f"Unexpected output from mongosh (not an integer): {output!r}"
-        ) from exc
-    
-
-def mongo_rename_dataset_id(
-    client,
-    mongo_cfg: BeaconMongoConfig,
-    containers_cfg: BeaconContainersConfig,
-    *,
-    old_dataset_id: str,
-    new_dataset_id: str,
-) -> int:
-    """Rename datasetId in MongoDB.genomicVariations.
-
-    Used during the verify-and-swap flow:
-    - active dataset_id -> old_id
-    - staging_id -> active dataset_id
-
-    Returns the number of modified documents.
-    """
-    eval_js = (
-        f'db.getSiblingDB("{mongo_cfg.database}").genomicVariations'
-        ".updateMany("
-        f'{{datasetId: "{old_dataset_id}"}}, '
-        f'{{$set: {{datasetId: "{new_dataset_id}"}}}}'
-        ").modifiedCount"
-    )
-
-    command_parts = [
-        f"podman exec {containers_cfg.mongo}",
-        "mongosh",
-        "--quiet",
-        f"-u {mongo_cfg.user}",
-        f"-p {mongo_cfg.password}",
-        f"--authenticationDatabase {mongo_cfg.auth_source}",
-    ]
-
-    if mongo_cfg.tls:
-        command_parts.extend([
-            "--tls",
-            f"--tlsCAFile {mongo_cfg.tls_ca}",
-            f"--tlsCertificateKeyFile {mongo_cfg.tls_cert}",
-        ])
-        if mongo_cfg.tls_allow_invalid:
-            command_parts.append("--tlsAllowInvalidCertificates")
-
-    command_parts.append(f"--eval '{eval_js}'")
-    command = " ".join(command_parts)
-
-    result = exec_remote(client, command)
-
-    if not result.ok:
-        raise RuntimeError(
-            "mongo_rename_dataset_id failed.\n"
-            f"Old dataset ID: {old_dataset_id}\n"
-            f"New dataset ID: {new_dataset_id}\n"
-            f"Command: {result.command}\n"
-            f"STDERR: {result.stderr}"
-        )
-
-    output = result.stdout.strip()
 
     try:
-        modified_count = int(output)
-    except ValueError as exc:
+        datasets = json.loads(output or "[]")
+    except json.JSONDecodeError as exc:
         raise RuntimeError(
-            f"Unexpected output from mongosh (not an integer): {output!r}"
+            "Unexpected output while listing datasets: "
+            f"{output!r}"
         ) from exc
 
-    LOGGER.info(
-        "Renamed MongoDB genomicVariations datasetId: %s -> %s (%d documents)",
-        old_dataset_id,
-        new_dataset_id,
-        modified_count,
-    )
-
-    return modified_count
-
-
-def mongo_delete_dataset_variants(
-    client,
-    mongo_cfg: BeaconMongoConfig,
-    containers_cfg: BeaconContainersConfig,
-    dataset_id: str,
-) -> int:
-    """Delete genomicVariations documents for a datasetId.
-
-    Used as optional cleanup after a successful verify-and-swap flow,
-    typically to remove the old_id backup dataset.
-
-    Returns the number of deleted documents.
-    """
-    eval_js = (
-        f'db.getSiblingDB("{mongo_cfg.database}").genomicVariations'
-        f'.deleteMany({{datasetId: "{dataset_id}"}}).deletedCount'
-    )
-
-    command_parts = [
-        f"podman exec {containers_cfg.mongo}",
-        "mongosh",
-        "--quiet",
-        f"-u {mongo_cfg.user}",
-        f"-p {mongo_cfg.password}",
-        f"--authenticationDatabase {mongo_cfg.auth_source}",
-    ]
-
-    if mongo_cfg.tls:
-        command_parts.extend([
-            "--tls",
-            f"--tlsCAFile {mongo_cfg.tls_ca}",
-            f"--tlsCertificateKeyFile {mongo_cfg.tls_cert}",
-        ])
-        if mongo_cfg.tls_allow_invalid:
-            command_parts.append("--tlsAllowInvalidCertificates")
-
-    command_parts.append(f"--eval '{eval_js}'")
-    command = " ".join(command_parts)
-
-    result = exec_remote(client, command)
-
-    if not result.ok:
+    if not isinstance(datasets, list):
         raise RuntimeError(
-            f"mongo_delete_dataset_variants failed for {dataset_id}.\n"
-            f"Command: {result.command}\n"
-            f"STDERR: {result.stderr}"
+            "Unexpected MongoDB response: expected a list."
         )
 
-    output = result.stdout.strip()
-
-    try:
-        deleted_count = int(output)
-    except ValueError as exc:
-        raise RuntimeError(
-            f"Unexpected output from mongosh (not an integer): {output!r}"
-        ) from exc
-
-    LOGGER.info(
-        "Deleted MongoDB genomicVariations for datasetId %s: %d documents",
-        dataset_id,
-        deleted_count,
-    )
-
-    return deleted_count
+    return datasets
 
 
 def mongo_import_datasets(
@@ -278,74 +147,193 @@ def mongo_import_datasets(
     local_json: Path,
     remote_tmp: str = "/tmp/datasets.json",
 ) -> int:
-    """Import a datasets.json into MongoDB.<database>.datasets.
+    """Import datasets.json into MongoDB.datasets."""
+    local_json = local_json.expanduser().resolve()
 
-    The JSON is uploaded to the VM, copied into the MongoDB container,
-    and ingested with `mongoimport --jsonArray`. Connection uses the URI
-    form (TLS options embedded) because mongoimport does not accept TLS
-    flags as separate arguments.
-
-    Returns the number of documents reported as imported by mongoimport.
-    """
-    # 1. SFTP upload to the VM host filesystem
-    sftp_upload(client, local_json, remote_tmp)
-
-    # 2. Copy from VM host into the Mongo container
-    cp_cmd = (
-        f"podman cp {remote_tmp} "
-        f"{containers_cfg.mongo}:{remote_tmp}"
-    )
-    cp_result = exec_remote(client, cp_cmd)
-    if not cp_result.ok:
-        raise RuntimeError(
-            f"podman cp failed: {cp_result.stderr or cp_result.stdout}"
+    if not local_json.is_file():
+        raise FileNotFoundError(
+            f"Dataset JSON file not found: {local_json}"
         )
 
-    # 3. Build the mongoimport URI with TLS embedded
-    uri_params = [f"authSource={mongo_cfg.auth_source}"]
-    if mongo_cfg.tls:
-        uri_params.extend([
-            "tls=true",
-            f"tlsCAFile={mongo_cfg.tls_ca}",
-            f"tlsCertificateKeyFile={mongo_cfg.tls_cert}",
-        ])
-    uri = (
-        f"mongodb://{quote_plus(mongo_cfg.user)}:{quote_plus(mongo_cfg.password)}"
-        f"@127.0.0.1:27017/{mongo_cfg.database}?{'&'.join(uri_params)}"
+    sftp_upload(
+        client,
+        local_json,
+        remote_tmp,
     )
 
-    # 4. Run mongoimport
-    import_parts = [
-        f"podman exec {containers_cfg.mongo}",
+    copy_command = (
+        f"podman cp {shlex.quote(remote_tmp)} "
+        f"{shlex.quote(containers_cfg.mongo)}:"
+        f"{shlex.quote(remote_tmp)}"
+    )
+
+    copy_result = exec_remote(
+        client,
+        copy_command,
+    )
+
+    if not copy_result.ok:
+        raise RuntimeError(
+            "Could not copy datasets JSON into Mongo container.\n"
+            f"STDOUT: {copy_result.stdout}\n"
+            f"STDERR: {copy_result.stderr}"
+        )
+
+    uri_parameters = [
+        f"authSource={quote_plus(mongo_cfg.auth_source)}",
+    ]
+
+    if mongo_cfg.tls:
+        uri_parameters.extend(
+            [
+                "tls=true",
+                f"tlsCAFile={quote_plus(mongo_cfg.tls_ca)}",
+                (
+                    "tlsCertificateKeyFile="
+                    f"{quote_plus(mongo_cfg.tls_cert)}"
+                ),
+            ]
+        )
+
+    mongo_uri = (
+        f"mongodb://{quote_plus(mongo_cfg.user)}:"
+        f"{quote_plus(mongo_cfg.password)}"
+        f"@127.0.0.1:27017/"
+        f"{quote_plus(mongo_cfg.database)}"
+        f"?{'&'.join(uri_parameters)}"
+    )
+
+    command_parts = [
+        f"podman exec {shlex.quote(containers_cfg.mongo)}",
         "mongoimport",
         "--jsonArray",
-        f'--uri "{uri}"',
-    ]
-    if mongo_cfg.tls and mongo_cfg.tls_allow_invalid:
-        import_parts.append("--tlsInsecure")
-    import_parts.extend([
-        f"--file {remote_tmp}",
+        f"--uri {shlex.quote(mongo_uri)}",
+        f"--file {shlex.quote(remote_tmp)}",
         "--collection datasets",
-    ])
-    import_cmd = " ".join(import_parts)
+    ]
 
-    result = exec_remote(client, import_cmd)
+    if mongo_cfg.tls and mongo_cfg.tls_allow_invalid:
+        command_parts.append("--tlsInsecure")
+
+    result = exec_remote(
+        client,
+        " ".join(command_parts),
+    )
 
     if not result.ok:
         raise RuntimeError(
-            f"mongoimport failed: {result.stderr or result.stdout}"
+            "mongoimport failed.\n"
+            f"STDOUT: {result.stdout}\n"
+            f"STDERR: {result.stderr}"
         )
 
-    # 5. Parse the mongoimport summary line, e.g.:
-    #    "N document(s) imported successfully. M document(s) failed to import."
     match = re.search(
         r"(\d+) document\(s\) imported successfully",
         result.stderr + result.stdout,
     )
+
     if not match:
         raise RuntimeError(
-            f"Could not parse mongoimport output:\n{result.stdout}\n{result.stderr}"
+            "Could not parse mongoimport output.\n"
+            f"STDOUT: {result.stdout}\n"
+            f"STDERR: {result.stderr}"
         )
 
-    imported = int(match.group(1))
-    return imported
+    return int(match.group(1))
+
+
+def mongo_count_variants(
+    client,
+    mongo_cfg: BeaconMongoConfig,
+    containers_cfg: BeaconContainersConfig,
+    dataset_id: str,
+) -> int:
+    """Count genomic variants assigned to a dataset ID."""
+    javascript = (
+        f"db.getSiblingDB({json.dumps(mongo_cfg.database)})"
+        ".genomicVariations"
+        f".countDocuments({{datasetId: {json.dumps(dataset_id)}}})"
+    )
+
+    output = _run_mongosh(
+        client,
+        mongo_cfg,
+        containers_cfg,
+        javascript,
+    )
+
+    try:
+        return int(output)
+    except ValueError as exc:
+        raise RuntimeError(
+            "Unexpected output while counting variants for "
+            f"{dataset_id!r}: {output!r}"
+        ) from exc
+
+
+def mongo_rename_dataset_id(
+    client,
+    mongo_cfg: BeaconMongoConfig,
+    containers_cfg: BeaconContainersConfig,
+    *,
+    old_dataset_id: str,
+    new_dataset_id: str,
+) -> int:
+    """Replace datasetId in all matching genomic variation documents."""
+    javascript = f"""
+const database = db.getSiblingDB({json.dumps(mongo_cfg.database)});
+const result = database.genomicVariations.updateMany(
+    {{datasetId: {json.dumps(old_dataset_id)}}},
+    {{$set: {{datasetId: {json.dumps(new_dataset_id)}}}}}
+);
+
+print(result.modifiedCount);
+"""
+
+    output = _run_mongosh(
+        client,
+        mongo_cfg,
+        containers_cfg,
+        javascript,
+    )
+
+    try:
+        return int(output)
+    except ValueError as exc:
+        raise RuntimeError(
+            "Unexpected output while renaming datasetId "
+            f"{old_dataset_id!r} to {new_dataset_id!r}: "
+            f"{output!r}"
+        ) from exc
+
+
+def mongo_delete_dataset_variants(
+    client,
+    mongo_cfg: BeaconMongoConfig,
+    containers_cfg: BeaconContainersConfig,
+    dataset_id: str,
+) -> int:
+    """Delete genomic variation documents assigned to a dataset ID."""
+    javascript = f"""
+const database = db.getSiblingDB({json.dumps(mongo_cfg.database)});
+const result = database.genomicVariations.deleteMany(
+    {{datasetId: {json.dumps(dataset_id)}}}
+);
+
+print(result.deletedCount);
+"""
+
+    output = _run_mongosh(
+        client,
+        mongo_cfg,
+        containers_cfg,
+        javascript,
+    )
+
+    try:
+        return int(output)
+    except ValueError as exc:
+        raise RuntimeError(
+            "Unexpected output while deleting variants for "
+            f"{dataset_id!r}: {output!r}"
+        ) from exc

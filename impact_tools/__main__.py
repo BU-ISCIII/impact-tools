@@ -1219,6 +1219,16 @@ def pgx_cmd(
 
     base_dir = base_dir.resolve()
 
+    configuration = ctx.obj["configuration"]
+
+    pgx_repo = pgx_repo or _configured_path(
+        configuration,
+        "beacon.pgx.repo",
+    )
+
+    if pgx_repo is not None:
+        pgx_repo = pgx_repo.resolve()
+
     config = beacon_pgx.PgxConfig(
         base_dir=base_dir,
         country_code=country_code,
@@ -1242,98 +1252,131 @@ def pgx_cmd(
     # ----------------------------------------------------------------
     # Discover lifted VCFs; compare against existing samples.tsv
     # ----------------------------------------------------------------
-    lifted_vcfs = beacon_pgx.discover_lifted_vcfs(base_dir)
-    if not lifted_vcfs:
-        raise click.ClickException(
-            f"No *.GRCh38.clean.vcf.gz files found in {base_dir / 'liftover'}. "
-            "Run `impact-tools beacon liftover` first."
-        )
+
+    try:
+        discovered_sources = beacon_pgx.discover_lifted_samples(config)
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
 
     existing = (
         beacon_pgx.read_samples_tsv(config.samples_tsv)
         if config.samples_tsv.exists()
         else []
     )
-    existing_basenames = {r.vcf_basename for r in existing if r.vcf_basename}
 
-    new_vcfs = [
-        vcf for vcf in lifted_vcfs
-        if beacon_pgx.vcf_to_sample_id(vcf) not in existing_basenames
+    existing_sample_ids = {
+        record.sample_id
+        for record in existing
+    }
+
+    new_sources = [
+        source
+        for source in discovered_sources
+        if source.sample_id not in existing_sample_ids
     ]
+
+    lifted_vcf_count = len({
+        source.vcf_basename
+        for source in discovered_sources
+    })
 
     log.info("==========================================")
     log.info("Beacon pgx")
     log.info("==========================================")
-    log.info("Base directory:      %s", base_dir)
-    log.info("Lifted VCFs found:   %d", len(lifted_vcfs))
-    log.info("Already in samples.tsv: %d  |  new: %d", len(existing), len(new_vcfs))
+    log.info("Base directory:          %s", base_dir)
+    log.info("Lifted VCFs found:       %d", lifted_vcf_count)
+    log.info("Samples discovered:      %d", len(discovered_sources))
+    log.info("Already in samples.tsv:  %d", len(existing))
+    log.info("New samples:             %d", len(new_sources))
     log.info("==========================================")
 
     # ----------------------------------------------------------------
     # Infer sex for new samples in parallel; prompt for ambiguous cases
     # sequentially; write TSV once after all records are resolved
     # ----------------------------------------------------------------
-    new_records: list[beacon_pgx.SampleRecord] = []
-    if new_vcfs:
-        log.info(
-            "Counting non-ref chrY variants for %d new sample(s) (workers=%d)...",
-            len(new_vcfs), workers,
-        )
-        inferences = beacon_pgx.infer_sex_batch(config, [v.name for v in new_vcfs])
 
-        for vcf, inference in zip(new_vcfs, inferences):
+    new_records: list[beacon_pgx.SampleRecord] = []
+
+    if new_sources:
+        log.info(
+            "Counting non-ref chrY variants for %d new sample(s) "
+            "(workers=%d)...",
+            len(new_sources),
+            workers,
+        )
+
+        inferences = beacon_pgx.infer_sex_batch(
+            config,
+            new_sources,
+        )
+
+        for source, inference in zip(
+            new_sources,
+            inferences,
+            strict=True,
+        ):
             if inference is None:
-                log.warning("[%s] chrY count failed — skipping", vcf.name)
+                log.warning(
+                    "[%s] %s: chrY count failed — skipping",
+                    source.vcf_basename,
+                    source.sample_id,
+                )
                 continue
 
             sex = inference.sex
+
             if sex is None:
                 log.warning(
-                    "[%s] %s: %d chrY variants — ambiguous zone (%d–%d), manual input required",
-                    vcf.name, inference.sample_id, inference.n_chry,
-                    sex_ambiguous_min, sex_ambiguous_max,
+                    "[%s] %s: %d chrY variants — ambiguous zone "
+                    "(%d–%d), manual input required",
+                    source.vcf_basename,
+                    source.sample_id,
+                    inference.n_chry,
+                    sex_ambiguous_min,
+                    sex_ambiguous_max,
                 )
+
                 raw = click.prompt(
-                    f"  Sex for {inference.sample_id} (M/F)",
-                    type=click.Choice(["M", "F"], case_sensitive=False),
+                    f"  Sex for {source.sample_id} (M/F)",
+                    type=click.Choice(
+                        ["M", "F"],
+                        case_sensitive=False,
+                    ),
                 ).upper()
+
                 sex = "M" if raw == "M" else "F"
+
             else:
                 log.info(
                     "[%s] %s: %d chrY -> %s",
-                    vcf.name, inference.sample_id, inference.n_chry, sex,
+                    source.vcf_basename,
+                    source.sample_id,
+                    inference.n_chry,
+                    sex,
                 )
 
-            new_records.append(beacon_pgx.SampleRecord(
-                sample_id=inference.sample_id,
+            record = beacon_pgx.SampleRecord(
+                sample_id=source.sample_id,
                 sex=sex,
                 country_code=country_code,
-                vcf_basename=beacon_pgx.vcf_to_sample_id(vcf),
-            ))
+                vcf_basename=source.vcf_basename,
+            )
 
-        for record in new_records:
-            beacon_pgx.append_sample_to_tsv(config.samples_tsv, record)
-            log.info("[%s] Added to samples.tsv", record.sample_id)
+            new_records.append(record)
+
+            beacon_pgx.append_sample_to_tsv(
+                config.samples_tsv,
+                record,
+            )
+
+            log.info(
+                "[%s] Added to samples.tsv "
+                "(source VCF: %s)",
+                record.sample_id,
+                record.vcf_basename,
+            )
 
     all_records = existing + new_records
-
-    if not all_records:
-        raise click.ClickException("No samples to process.")
-
-    log.info("==========================================")
-    log.info("Samples to process (%d):", len(all_records))
-    for r in all_records:
-        log.info("  %s  sex=%s  country=%s", r.sample_id, r.sex, r.country_code)
-    log.info("==========================================")
-
-    if not yes:
-        proceed = click.confirm("Continue?", default=False)
-        if not proceed:
-            log.info("Cancelled.")
-            return
-
-    (base_dir / "logs").mkdir(parents=True, exist_ok=True)
-    config.pgx_runs_dir.mkdir(parents=True, exist_ok=True)
 
     # ----------------------------------------------------------------
     # Prepare workspaces (parallel)
@@ -1464,10 +1507,10 @@ def ingest_dataset_cmd(
     """Prepare Beacon dataset registration artifacts."""
     configure_module_logging(ctx, "beacon_ingest_dataset")
 
-    if dataset_id is None: 
+    if dataset_id is None:
         dataset_id = click.prompt("Dataset ID")
 
-    if name is None: 
+    if name is None:
         name = click.prompt("Dataset name")
 
     if description is None:
@@ -1482,7 +1525,7 @@ def ingest_dataset_cmd(
 
     if reference_genome is None:
         reference_genome = click.prompt(
-            "Please, select your dataset genome build", 
+            "Please, select your dataset genome build",
             type=click.Choice(["GRCh37", "GRCh38"]),
             default="GRCh38",
             show_choices=True,
@@ -1537,9 +1580,23 @@ def ingest_dataset_cmd(
 )
 @click.option(
     "--vcf",
-    required=True,
-    type=click.Path(path_type=Path, dir_okay=False, exists=True),
-    help="Aggregated VCF (.vcf.gz) to ingest into the dataset.",
+    type=click.Path(
+        path_type=Path,
+        exists=True,
+        dir_okay=False,
+    ),
+    required=False,
+    help="Single VCF or VCF.GZ file to ingest.",
+)
+@click.option(
+    "--vcf-dir",
+    type=click.Path(
+        path_type=Path,
+        exists=True,
+        file_okay=False,
+    ),
+    required=False,
+    help="Directory containing VCF or VCF.GZ files for the same dataset.",
 )
 @click.option(
     "--ref-genome",
@@ -1574,6 +1631,11 @@ def ingest_dataset_cmd(
     ),
 )
 @click.option(
+    "--no-report-charts",
+    is_flag=True,
+    help="Generate the HTML report without performance charts.",
+)
+@click.option(
     "--dry-run",
     is_flag=True,
     help=(
@@ -1585,29 +1647,38 @@ def ingest_dataset_cmd(
 def ingest_variants_cmd(
     ctx: click.Context,
     dataset_id: str,
-    vcf: Path,
+    vcf: Path | None,
+    vcf_dir: Path | None,
     reference_genome: str,
     base_dir: Path,
     cleanup_old: bool,
     skip_filtering_terms: bool,
+    no_report_charts: bool,
     dry_run: bool,
 ) -> None:
     """Ingest variants into an existing Beacon dataset (stage→swap→cleanup)."""
     configure_module_logging(ctx, "beacon_ingest_variants")
 
     base_dir = base_dir.resolve()
-    vcf = vcf.resolve()
+
+    if (vcf is None) == (vcf_dir is None):
+        raise click.UsageError(
+            "Provide exactly one of --vcf or --vcf-dir."
+        )
+
     run_profile = ctx.obj["beacon_ingest_run_profile"]
 
     cfg = beacon_ingest.VariantsIngestConfig(
         dataset_id=dataset_id,
         vcf=vcf,
+        vcf_dir=vcf_dir,
         reference_genome=reference_genome,
         base_dir=base_dir,
         cleanup_old=cleanup_old,
         skip_filtering_terms=skip_filtering_terms,
         dry_run=dry_run,
         run_profile=run_profile,
+        generate_report_charts=not no_report_charts,
     )
 
     try:
@@ -1631,9 +1702,12 @@ def ingest_variants_cmd(
         log.info("API count valid:      %s", result.api_count_valid)
     if result.deleted_old_variants is not None:
         log.info("Old variants purged:  %s", result.deleted_old_variants)
-    
+
     if result.manifest_file is not None:
         log.info("Manifest file:        %s", result.manifest_file)
+
+    if result.report_file is not None:
+        log.info("HTML report:          %s", result.report_file)
 
     if result.process is not None:
         log.info("Stage wall seconds:   %.3f", result.process.wall_seconds)

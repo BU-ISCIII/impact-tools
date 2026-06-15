@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import shlex
 import shutil
 import subprocess
 import time
@@ -36,6 +37,8 @@ def _fmt_size(path: Path) -> str:
 
 _CONFIG_YAML_TEMPLATE = """\
 input_vcf: "data/{sample_id}.vcf.gz"
+sample_id: "{sample_id}"
+sample_id_file: "data/sample_id.txt"
 genome_build: "GRCh38"
 country_code: "{country_code}"
 sample_info: "data/samples.tsv"
@@ -66,6 +69,14 @@ class SampleRecord:
     sex: Sex
     country_code: str
     vcf_basename: str = ""
+
+
+@dataclasses.dataclass(frozen=True)
+class SampleSource:
+    """A sample contained in a lifted single- or multi-sample VCF."""
+
+    sample_id: str
+    vcf_basename: str
 
 
 @dataclasses.dataclass
@@ -149,10 +160,105 @@ def discover_lifted_vcfs(base_dir: Path) -> list[Path]:
     return sorted((base_dir / "liftover").glob("*.GRCh38.clean.vcf.gz"))
 
 
-def vcf_to_sample_id(vcf: Path) -> str:
-    """Derive the sample identifier from a lifted VCF filename."""
-    name = vcf.name
-    return name.removesuffix(".GRCh38.clean.vcf.gz") if name.endswith(".GRCh38.clean.vcf.gz") else vcf.stem
+def _docker_data_path(config: PgxConfig, path: Path) -> str:
+    """Translate a path below base_dir to its /data path inside Docker."""
+    relative = path.resolve().relative_to(config.base_dir.resolve())
+    return f"/data/{relative.as_posix()}"
+
+
+def list_vcf_samples(config: PgxConfig, vcf: Path) -> list[str]:
+    """Return every sample declared in a VCF header."""
+    cmd = [
+        "docker", "run", "--rm",
+        "-v", f"{config.base_dir.resolve()}:/data:ro",
+        config.bcftools_image,
+        "bcftools", "query", "-l",
+        _docker_data_path(config, vcf),
+    ]
+
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    if proc.returncode != 0:
+        raise ValueError(
+            f"Could not read samples from {vcf}\n"
+            f"STDERR: {proc.stderr.strip()}"
+        )
+
+    samples = [
+        line.strip()
+        for line in proc.stdout.splitlines()
+        if line.strip()
+    ]
+
+    if not samples:
+        raise ValueError(f"No samples found in VCF: {vcf}")
+
+    if len(samples) != len(set(samples)):
+        raise ValueError(f"Duplicated sample names inside VCF: {vcf}")
+
+    return samples
+
+
+def discover_lifted_samples(config: PgxConfig) -> list[SampleSource]:
+    """Expand lifted VCF files into one SampleSource per contained sample."""
+    vcfs = discover_lifted_vcfs(config.base_dir)
+
+    if not vcfs:
+        raise ValueError(
+            f"No *.GRCh38.clean.vcf.gz files found in {config.liftover_dir}"
+        )
+
+    sources: list[SampleSource] = []
+    seen: dict[str, Path] = {}
+
+    for vcf in vcfs:
+        samples = list_vcf_samples(config, vcf)
+
+        log.info(
+            "%s: %d sample(s)",
+            vcf.name,
+            len(samples),
+        )
+
+        for sample_id in samples:
+            if (
+                not sample_id
+                or "/" in sample_id
+                or "\\" in sample_id
+                or sample_id in {".", ".."}
+            ):
+                raise ValueError(
+                    f"Unsafe sample identifier {sample_id!r} in {vcf}"
+                )
+
+            previous = seen.get(sample_id)
+            if previous is not None:
+                raise ValueError(
+                    f"Sample {sample_id!r} occurs in more than one VCF:\n"
+                    f"  - {previous}\n"
+                    f"  - {vcf}"
+                )
+
+            seen[sample_id] = vcf
+            sources.append(
+                SampleSource(
+                    sample_id=sample_id,
+                    vcf_basename=vcf.name,
+                )
+            )
+
+    log.info(
+        "Discovered %d sample(s) across %d lifted VCF file(s).",
+        len(sources),
+        len(vcfs),
+    )
+
+    return sources
 
 
 def read_samples_tsv(tsv_path: Path) -> list[SampleRecord]:
@@ -191,58 +297,106 @@ def append_sample_to_tsv(tsv_path: Path, record: SampleRecord) -> None:
 # Sex inference
 # ---------------------------------------------------------------------------
 
-def count_chry_variants(config: PgxConfig, vcf_basename: str) -> SexInferenceResult | None:
-    """Count non-ref chrY variants in a single-sample VCF using bcftools via Docker.
+def count_chry_variants(
+    config: PgxConfig,
+    source: SampleSource,
+) -> SexInferenceResult | None:
+    """Count non-reference chrY genotypes for one selected sample."""
+    vcf = config.liftover_dir / source.vcf_basename
+    docker_vcf = _docker_data_path(config, vcf)
 
-    The sample ID is read from the VCF header so it matches what pgx_pilot will use.
-    Returns None if the Docker call fails.
-    """
-    base = str(config.base_dir)
-    inner = (
-        f"VCF=/data/liftover/{vcf_basename}\n"
-        "sample=$(bcftools query -l \"$VCF\" | head -1)\n"
-        "n=$(bcftools query -r chrY -f '[%GT\\n]' \"$VCF\" 2>/dev/null"
-        " | grep -cvE '^(0[/|]0|\\.[/|]\\.|\\.)(\\t|$)' || true)\n"
-        "printf '%s\\t%s\\n' \"$sample\" \"$n\"\n"
-    )
+    script = r"""
+VCF="$1"
+SAMPLE="$2"
+
+n=$(
+    bcftools query \
+        -s "$SAMPLE" \
+        -r chrY \
+        -f '[%GT\n]' \
+        "$VCF" 2>/dev/null |
+    grep -cvE '^(0[/|]0|\.[/|]\.|\.)(\t|$)' || true
+)
+
+printf '%s\n' "$n"
+"""
+
     cmd = [
         "docker", "run", "--rm",
-        "-v", f"{base}:/data",
+        "-v", f"{config.base_dir.resolve()}:/data:ro",
         config.bcftools_image,
-        "bash", "-c", inner,
+        "bash", "-c",
+        script,
+        "_",
+        docker_vcf,
+        source.sample_id,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
     if proc.returncode != 0 or not proc.stdout.strip():
-        log.error("count_chry_variants failed for %s: %s", vcf_basename, proc.stderr.strip())
+        log.error(
+            "chrY count failed for %s in %s: %s",
+            source.sample_id,
+            source.vcf_basename,
+            proc.stderr.strip(),
+        )
         return None
 
-    parts = proc.stdout.strip().split("\t")
-    if len(parts) != 2:
-        log.error("Unexpected output from chrY count: %r", proc.stdout.strip())
-        return None
-
-    sample_id, n_str = parts
     try:
-        n = int(n_str)
+        n_chry = int(proc.stdout.strip())
     except ValueError:
-        log.error("Non-integer chrY count for %s: %r", vcf_basename, n_str)
+        log.error(
+            "Non-integer chrY count for %s: %r",
+            source.sample_id,
+            proc.stdout.strip(),
+        )
         return None
 
     return SexInferenceResult(
-        sample_id=sample_id,
-        vcf_basename=vcf_basename,
-        n_chry=n,
-        sex=infer_sex(n, config),
+        sample_id=source.sample_id,
+        vcf_basename=source.vcf_basename,
+        n_chry=n_chry,
+        sex=infer_sex(n_chry, config),
     )
 
 
-def infer_sex(n_chry: int, config: PgxConfig) -> Sex | None:
-    """Return M, F, or None if the count falls in the ambiguous zone."""
-    if n_chry > config.sex_ambiguous_max:
-        return "M"
-    if n_chry < config.sex_ambiguous_min:
-        return "F"
-    return None
+def infer_sex_batch(
+    config: PgxConfig,
+    sources: list[SampleSource],
+) -> list[SexInferenceResult | None]:
+    """Infer sex independently for every sample in every lifted VCF."""
+    if config.workers <= 1 or len(sources) <= 1:
+        return [count_chry_variants(config, source) for source in sources]
+
+    ordered: dict[int, SexInferenceResult | None] = {}
+
+    with ThreadPoolExecutor(max_workers=config.workers) as pool:
+        future_to_idx = {
+            pool.submit(count_chry_variants, config, source): i
+            for i, source in enumerate(sources)
+        }
+
+        for future in as_completed(future_to_idx):
+            i = future_to_idx[future]
+            source = sources[i]
+
+            try:
+                ordered[i] = future.result()
+            except Exception as exc:
+                log.error(
+                    "Sex inference error for %s: %s",
+                    source.sample_id,
+                    exc,
+                )
+                ordered[i] = None
+
+    return [ordered[i] for i in range(len(sources))]
 
 
 # ---------------------------------------------------------------------------
@@ -279,60 +433,140 @@ def validate_pgx_run_prereqs(config: PgxConfig) -> None:
         )
 
 def install_snakefile(config: PgxConfig) -> None:
-    """Copy the bundled Snakefile to pgx_runs/ if not already present."""
+    """Install or update the bundled Snakefile under pgx_runs/."""
     dest = config.snakefile
+
+    config.pgx_runs_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    src = files("impact_tools.beacon.resources").joinpath(
+        "Snakefile"
+    )
+    bundled_content = src.read_text()
+
     if dest.exists():
-        log.info("Snakefile already exists at %s — skipping.", dest)
-        return
-    config.pgx_runs_dir.mkdir(parents=True, exist_ok=True)
-    src = files("impact_tools.beacon.resources").joinpath("Snakefile")
-    dest.write_text(src.read_text())
-    log.info("Installed bundled Snakefile -> %s", dest)
+        installed_content = dest.read_text()
+
+        if installed_content == bundled_content:
+            log.info(
+                "Snakefile is already up to date at %s.",
+                dest,
+            )
+            return
+
+        log.info(
+            "Updating installed Snakefile: %s",
+            dest,
+        )
+
+    dest.write_text(
+        bundled_content,
+        encoding="utf-8",
+    )
+
+    log.info(
+        "Installed bundled Snakefile -> %s",
+        dest,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Workspace preparation
 # ---------------------------------------------------------------------------
 
-def prepare_workspace(config: PgxConfig, record: SampleRecord) -> WorkspaceResult:
+def prepare_workspace(
+    config: PgxConfig,
+    record: SampleRecord,
+) -> WorkspaceResult:
     """Create the pgx_pilot workspace for one sample."""
     ws = config.pgx_runs_dir / record.sample_id
-    vcf_name = record.vcf_basename if record.vcf_basename else record.sample_id
-    vcf_src = config.liftover_dir / f"{vcf_name}.GRCh38.clean.vcf.gz"
-    tbi_src = Path(str(vcf_src) + ".tbi")
 
-    if not vcf_src.exists():
-        log.error("[%s] Missing lifted VCF: %s", record.sample_id, vcf_src)
-        return WorkspaceResult(record.sample_id, ws, "error")
-    if not tbi_src.exists():
-        log.error("[%s] Missing .tbi index: %s", record.sample_id, tbi_src)
+    if not record.vcf_basename:
+        log.error(
+            "[%s] Source VCF basename is missing",
+            record.sample_id,
+        )
         return WorkspaceResult(record.sample_id, ws, "error")
 
-    (ws / "data").mkdir(parents=True, exist_ok=True)
-    (ws / "results").mkdir(parents=True, exist_ok=True)
+    vcf_src = (config.liftover_dir / record.vcf_basename).resolve()
+    tbi_src = Path(f"{vcf_src}.tbi")
 
-    for link, target in [
-        (ws / "data" / f"{record.sample_id}.vcf.gz", vcf_src),
-        (ws / "data" / f"{record.sample_id}.vcf.gz.tbi", tbi_src),
-    ]:
-        if link.is_symlink():
+    if not vcf_src.is_file():
+        log.error(
+            "[%s] Missing lifted VCF: %s",
+            record.sample_id,
+            vcf_src,
+        )
+        return WorkspaceResult(record.sample_id, ws, "error")
+
+    if not tbi_src.is_file():
+        log.error(
+            "[%s] Missing .tbi index: %s",
+            record.sample_id,
+            tbi_src,
+        )
+        return WorkspaceResult(record.sample_id, ws, "error")
+
+    data_dir = ws / "data"
+    results_dir = ws / "results"
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    links = [
+        (
+            data_dir / f"{record.sample_id}.vcf.gz",
+            vcf_src,
+        ),
+        (
+            data_dir / f"{record.sample_id}.vcf.gz.tbi",
+            tbi_src,
+        ),
+    ]
+
+    for link, target in links:
+        if link.exists() or link.is_symlink():
             link.unlink()
+
         link.symlink_to(target)
 
-    (ws / "data" / "samples.tsv").write_text(
-        f"{record.sample_id}\t{record.sex}\t{record.country_code}\n"
+    # Used by bcftools view -S to select this sample from a joint VCF.
+    (data_dir / "sample_id.txt").write_text(
+        f"{record.sample_id}\n",
+        encoding="utf-8",
+    )
+
+    # Metadata consumed by pgx_pilot.
+    (data_dir / "samples.tsv").write_text(
+        f"{record.sample_id}\t"
+        f"{record.sex}\t"
+        f"{record.country_code}\n",
+        encoding="utf-8",
     )
 
     (ws / "config.yaml").write_text(
         _CONFIG_YAML_TEMPLATE.format(
             sample_id=record.sample_id,
             country_code=record.country_code,
-        )
+        ),
+        encoding="utf-8",
     )
 
-    log.info("[%s] Workspace ready -> %s", record.sample_id, ws)
-    return WorkspaceResult(record.sample_id, ws, "ok")
+    log.info(
+        "[%s] Workspace ready -> %s "
+        "(source VCF: %s)",
+        record.sample_id,
+        ws,
+        record.vcf_basename,
+    )
 
+    return WorkspaceResult(
+        record.sample_id,
+        ws,
+        "ok",
+    )
 
 # ---------------------------------------------------------------------------
 # pgx_pilot execution

@@ -50,14 +50,31 @@ rule download_reference_source:
 
 # --- Pipeline Rules ---
 rule select_regions:
-    input: unpack(get_selection_inputs)
-    output: "results/temp/01_selected.vcf.gz"
-    params: 
-        bed=config.get("regions_bed", ""), 
-        bed_path=lambda w: "resources/selection_targets.bed" if config.get("regions_bed", "").startswith(("http", "ftp")) else config.get("regions_bed", "")
+    input:
+        vcf=lambda w: config["input_vcf"],
+        samples=lambda w: config["sample_id_file"],
+    output:
+        "results/temp/01_selected.vcf.gz"
+    params:
+        bed=config.get("regions_bed", ""),
+        bed_path=lambda w: (
+            "resources/selection_targets.bed"
+            if config.get("regions_bed", "").startswith(("http", "ftp"))
+            else config.get("regions_bed", "")
+        )
     shell:
         """
-        bcftools view -R {params.bed_path} {input.vcf} | bcftools view -e 'ALT="*"' -O z -o {output}
+        bcftools view \
+            -I \
+            -S {input.samples} \
+            -R {params.bed_path} \
+            -Ou \
+            {input.vcf} \
+        | bcftools view \
+            -e 'ALT="*"' \
+            -Oz \
+            -o {output}
+
         tabix -p vcf {output}
         """
 

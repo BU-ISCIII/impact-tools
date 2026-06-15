@@ -363,7 +363,7 @@ def upload_dataset_metrics_to_remote(
             deployment.remote,
             config.dataset_id,
         )
-    
+
 
 # ---------------------------------------------------------------------------
 # Remote orchestration: apply a prepared dataset to the running Beacon
@@ -578,24 +578,31 @@ class VariantsIngestConfig:
     """Configuration for applying Beacon variants to a remote deployment."""
 
     dataset_id: str
-    vcf: Path
     reference_genome: str = "GRCh38"
     base_dir: Path = Path(".")
+    vcf: Path | None = None
+    vcf_dir: Path | None = None
     cleanup_old: bool = False
     skip_filtering_terms: bool = False
     dry_run: bool = True
     run_profile: str = "local"
+    generate_report_charts: bool = True
 
 
 @dataclasses.dataclass
 class ApplyVariantsResult:
     """Outcome of applying variants to the remote Beacon deployment."""
 
+
     dataset_id: str
     staging_id: str
     old_id: str
-    remote_vcf: str
+    local_vcfs: list[str]
+    remote_vcfs: list[str]
     vcf_count: int
+    processed_count: int
+    inserted_count: int
+    skipped_count: int
     mongo_count: int | None = None
     api_visible: bool | None = None
     api_count_valid: bool | None = None
@@ -603,6 +610,17 @@ class ApplyVariantsResult:
     process: ProcessMetrics | None = None
     execution: dict | None = None
     manifest_file: Path | None = None
+    report_file: Path | None = None
+
+
+@dataclasses.dataclass
+class RiToolsRunResult:
+    """Variant counts reported by one RI-tools VCF execution."""
+
+    remote_vcf: str
+    processed: int
+    inserted: int
+    skipped: int
 
 
 @dataclasses.dataclass
@@ -615,27 +633,70 @@ class OldVariantBackup:
     default_delete: bool
 
 
-def write_variant_ingest_manifest(
+def resolve_variant_inputs(config: VariantsIngestConfig) -> list[Path]:
+    """Resolve and validate the VCF files selected for variant ingestion."""
+    if (config.vcf is None) == (config.vcf_dir is None):
+        raise ValueError("Provide exactly one of vcf or vcf_dir.")
+
+    if config.vcf is not None:
+        vcf_file = config.vcf.expanduser().resolve()
+
+        if not vcf_file.is_file():
+            raise FileNotFoundError(f"VCF file not found: {vcf_file}")
+
+        if not (
+            vcf_file.name.endswith(".vcf")
+            or vcf_file.name.endswith(".vcf.gz")
+        ):
+            raise ValueError(f"Unsupported VCF file: {vcf_file}")
+
+        return [vcf_file]
+
+    vcf_dir = config.vcf_dir.expanduser().resolve()
+
+    if not vcf_dir.is_dir():
+        raise NotADirectoryError(f"VCF directory not found: {vcf_dir}")
+
+    vcf_files = sorted(
+        path
+        for path in vcf_dir.iterdir()
+        if path.is_file()
+        and (
+            path.name.endswith(".vcf")
+            or path.name.endswith(".vcf.gz")
+        )
+    )
+
+    if not vcf_files:
+        raise ValueError(
+            f"No .vcf or .vcf.gz files found in directory: {vcf_dir}"
+        )
+
+    return vcf_files
+
+
+def build_variant_ingest_payload(
     *,
     config: VariantsIngestConfig,
     result: ApplyVariantsResult,
-) -> Path:
-    """Write a JSON manifest for one Beacon ingest variants execution."""
-    logs_dir = config.base_dir.resolve() / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-
-    run_token = result.staging_id.replace("/", "_").replace(":", "_")
-    manifest_file = logs_dir / f"beacon_ingest_variants_manifest_{run_token}.json"
-
-    payload = {
+) -> dict:
+    """Build the shared payload for Beacon variant ingest artifacts."""
+    return {
         "workflow": "beacon.ingest.variants",
         "execution": result.execution,
         "run": {
             "dataset_id": result.dataset_id,
             "staging_id": result.staging_id,
             "old_id": result.old_id,
-            "remote_vcf": result.remote_vcf,
-            "local_vcf": str(config.vcf.expanduser().resolve()),
+            "input_mode": "directory" if config.vcf_dir is not None else "file",
+            "vcf_dir": (
+                str(config.vcf_dir.expanduser().resolve())
+                if config.vcf_dir is not None
+                else None
+            ),
+            "local_vcfs": result.local_vcfs,
+            "remote_vcfs": result.remote_vcfs,
+            "vcf_files": len(result.local_vcfs),
             "reference_genome": config.reference_genome,
             "base_dir": str(config.base_dir.resolve()),
             "cleanup_old": config.cleanup_old,
@@ -645,6 +706,9 @@ def write_variant_ingest_manifest(
         },
         "summary": {
             "vcf_count": result.vcf_count,
+            "processed_count": result.processed_count,
+            "inserted_count": result.inserted_count,
+            "skipped_count": result.skipped_count,
             "mongo_count": result.mongo_count,
             "api_visible": result.api_visible,
             "api_count_valid": result.api_count_valid,
@@ -655,7 +719,45 @@ def write_variant_ingest_manifest(
                 else None
             ),
         },
+        "manifest_file": str(result.manifest_file) if result.manifest_file else None,
+        "report_file": str(result.report_file) if result.report_file else None,
     }
+
+
+def build_variant_ingest_artifact_paths(
+    *,
+    config: VariantsIngestConfig,
+    result: ApplyVariantsResult,
+) -> tuple[Path, Path]:
+    """Build standard artifact paths for one Beacon variant ingest execution."""
+    logs_dir = config.base_dir.resolve() / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    run_token = result.staging_id.replace("/", "_").replace(":", "_")
+
+    manifest_file = logs_dir / f"beacon_ingest_variants_manifest_{run_token}.json"
+    report_file = logs_dir / f"beacon_ingest_variants_report_{run_token}.html"
+
+    return manifest_file, report_file
+
+
+def write_variant_ingest_manifest(
+    *,
+    config: VariantsIngestConfig,
+    result: ApplyVariantsResult,
+) -> Path:
+    """Write a JSON manifest for one Beacon ingest variants execution."""
+    manifest_file, _ = build_variant_ingest_artifact_paths(
+        config=config,
+        result=result,
+    )
+
+    result.manifest_file = manifest_file
+
+    payload = build_variant_ingest_payload(
+        config=config,
+        result=result,
+    )
 
     manifest_file.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False),
@@ -665,6 +767,61 @@ def write_variant_ingest_manifest(
     LOGGER.info("Beacon ingest manifest written: %s", manifest_file)
 
     return manifest_file
+
+
+def write_variant_ingest_html_report(
+    *,
+    config: VariantsIngestConfig,
+    result: ApplyVariantsResult,
+) -> Path:
+    """Write an HTML report for one Beacon variant ingest execution."""
+    from impact_tools.beacon.html_report import write_variant_ingest_report
+
+    _, report_file = build_variant_ingest_artifact_paths(
+        config=config,
+        result=result,
+    )
+
+    result.report_file = report_file
+
+    payload = build_variant_ingest_payload(
+        config=config,
+        result=result,
+    )
+
+    write_variant_ingest_report(
+        report_file,
+        payload,
+        include_charts=config.generate_report_charts,
+    )
+
+    LOGGER.info("Beacon ingest HTML report written: %s", report_file)
+
+    return report_file
+
+
+def write_variant_ingest_artifacts(
+    *,
+    config: VariantsIngestConfig,
+    result: ApplyVariantsResult,
+) -> None:
+    """Assign artifact paths to `result` and write manifest + HTML report.
+
+    This ensures the manifest JSON contains a non-null `report_file` entry
+    and both artifacts reference each other.
+    """
+    manifest_file, report_file = build_variant_ingest_artifact_paths(
+        config=config,
+        result=result,
+    )
+
+    result.manifest_file = manifest_file
+    result.report_file = report_file
+
+    # Writers use `result.manifest_file` / `result.report_file` when
+    # building payloads, so ensure both are set before calling them.
+    write_variant_ingest_manifest(config=config, result=result)
+    write_variant_ingest_html_report(config=config, result=result)
 
 
 def ensure_vcf_on_vm(
@@ -724,7 +881,7 @@ def run_ritools_remote(
     dataset_id: str,
     remote_vcf: str,
     reference_genome: str,
-) -> None:
+) -> RiToolsRunResult:
     """Run beacon2-ri-tools-v2 genomicVariations_vcf on the Beacon VM.
 
     The script is invoked via the dedicated Python interpreter of the
@@ -769,6 +926,32 @@ def run_ritools_remote(
         )
 
     LOGGER.info("ri-tools completed for staging dataset: %s", dataset_id)
+
+    inserted_match = re.search(
+    r"Successfully inserted\s+(\d+)\s+records into beacon",
+    result.stdout,
+    )
+    processed_match = re.search(
+        r"A total of\s+(\d+)\s+variants were processed",
+        result.stdout,
+    )
+    skipped_match = re.search(
+        r"A total of\s+(\d+)\s+variants were skipped",
+        result.stdout,
+    )
+
+    if not inserted_match or not processed_match or not skipped_match:
+        raise RuntimeError(
+            "Could not parse RI-tools variant counts.\n"
+            f"STDOUT: {result.stdout}"
+        )
+
+    return RiToolsRunResult(
+        remote_vcf=remote_vcf,
+        inserted=int(inserted_match.group(1)),
+        processed=int(processed_match.group(1)),
+        skipped=int(skipped_match.group(1)),
+    )
 
 def count_vcf_variants(vcf_path: Path) -> int:
     """Count variant records in a local VCF/VCF.GZ file.
@@ -874,13 +1057,13 @@ def run_filtering_terms_remote(
             sys.stderr.write("\r" + next(messages))
             sys.stderr.flush()
             stop_waiting.wait(1)
-    
+
     waiting_thread = threading.Thread(
-        target=_waiting_message, 
+        target=_waiting_message,
         daemon=True,
     )
     waiting_thread.start()
-    
+
     try:
         result = exec_remote(client, command)
     finally:
@@ -1193,6 +1376,8 @@ def apply_variants_to_remote(
     12. Optionally cleanup old_id variants.
     """
     from impact_tools.beacon.mongo import (
+        mongo_list_datasets,
+        mongo_count_dataset,
         mongo_count_variants,
         mongo_delete_dataset_variants,
         mongo_rename_dataset_id,
@@ -1209,9 +1394,26 @@ def apply_variants_to_remote(
     validate_dataset_id(config.dataset_id)
     validate_reference_genome(config.reference_genome)
 
-    local_vcf = config.vcf.expanduser().resolve()
-    if not local_vcf.is_file():
-        raise FileNotFoundError(f"VCF file not found: {local_vcf}")
+    vcf_files = resolve_variant_inputs(config)
+
+    LOGGER.info("VCF files selected for ingestion: %d", len(vcf_files))
+    for vcf_file in vcf_files:
+        LOGGER.info("  - %s", vcf_file)
+
+    vcf_counts = {
+        vcf_file: count_vcf_variants(vcf_file)
+        for vcf_file in vcf_files
+    }
+    vcf_count = sum(vcf_counts.values())
+
+    LOGGER.info(
+        "Total VCF variants selected: %d across %d file(s).",
+        vcf_count,
+        len(vcf_files),
+    )
+
+    for vcf_file, count in vcf_counts.items():
+        LOGGER.info("  %s: %d variants", vcf_file.name, count)
 
     run_id = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     staging_id = f"{config.dataset_id}_staging_{run_id}"
@@ -1220,26 +1422,111 @@ def apply_variants_to_remote(
     validate_dataset_id(staging_id)
     validate_dataset_id(old_id)
 
-    vcf_count = count_vcf_variants(local_vcf)
-
     deployment = build_beacon_deployment_config()
 
     with managed_ssh(deployment.remote) as client:
-        remote_vcf = ensure_vcf_on_vm(
+
+        datasets = mongo_list_datasets(
             client,
-            local_vcf,
-            deployment.remote.input_dir,
-            staging_id,
+            deployment.mongo,
+            deployment.containers,
         )
 
-        run_ritools_remote(
-            client,
-            deployment.ritools,
-            deployment.mongo,
-            staging_id,
-            remote_vcf,
-            config.reference_genome,
+        available_dataset_ids = {
+            dataset["id"]
+            for dataset in datasets
+            if dataset.get("id")
+        }
+
+        if config.dataset_id not in available_dataset_ids:
+            available_lines = []
+
+            for dataset in datasets:
+                dataset_id = dataset.get("id")
+
+                if not dataset_id:
+                    continue
+
+                dataset_name = dataset.get("name")
+
+                if dataset_name:
+                    available_lines.append(
+                        f"  - {dataset_id} | {dataset_name}"
+                    )
+                else:
+                    available_lines.append(
+                        f"  - {dataset_id}"
+                    )
+
+            available_text = (
+                "\n".join(available_lines)
+                if available_lines
+                else "  (no registered datasets)"
+            )
+
+            raise RuntimeError(
+                f"Dataset '{config.dataset_id}' is not registered in MongoDB.\n"
+                "Available datasets:\n"
+                f"{available_text}\n"
+                "Cannot apply variants to a non-existent dataset. "
+                "Run `impact-tools beacon ingest dataset` before ingesting variants."
+            )
+
+        LOGGER.info(
+            "Dataset registration validated in MongoDB: %s",
+            config.dataset_id,
         )
+
+        remote_vcfs: list[str] = []
+        ritools_results: list[RiToolsRunResult] = []
+
+        for index, local_vcf in enumerate(vcf_files, start=1):
+            LOGGER.info(
+                "Processing VCF %d/%d: %s",
+                index,
+                len(vcf_files),
+                local_vcf.name,
+            )
+
+            remote_vcf = ensure_vcf_on_vm(
+                client,
+                local_vcf,
+                deployment.remote.input_dir,
+                staging_id,
+            )
+            remote_vcfs.append(remote_vcf)
+
+            ritools_result = run_ritools_remote(
+                client,
+                deployment.ritools,
+                deployment.mongo,
+                staging_id,
+                remote_vcf,
+                config.reference_genome,
+            )
+
+            ritools_results.append(ritools_result)
+
+        expected_mongo_count = sum(
+            run.inserted for run in ritools_results
+        )
+
+        processed_count = sum(
+            run.processed for run in ritools_results
+        )
+
+        skipped_count = sum(
+            run.skipped for run in ritools_results
+        )
+
+        LOGGER.info(
+            "RI-tools batch summary: processed=%d inserted=%d skipped=%d",
+            processed_count,
+            expected_mongo_count,
+            skipped_count,
+        )
+
+
 
         if config.dry_run:
             LOGGER.info(
@@ -1253,13 +1540,17 @@ def apply_variants_to_remote(
                 dataset_id=config.dataset_id,
                 staging_id=staging_id,
                 old_id=old_id,
-                remote_vcf=remote_vcf,
+                local_vcfs=[str(path) for path in vcf_files],
+                remote_vcfs=remote_vcfs,
                 vcf_count=vcf_count,
+                processed_count=processed_count,
+                inserted_count=expected_mongo_count,
+                skipped_count=skipped_count,
                 process=process_metrics,
                 execution=execution,
             )
 
-            result.manifest_file = write_variant_ingest_manifest(
+            write_variant_ingest_artifacts(
                 config=config,
                 result=result,
             )
@@ -1276,7 +1567,7 @@ def apply_variants_to_remote(
 
         check_variant_counts(
             mongo_count=mongo_count,
-            vcf_count=vcf_count,
+            vcf_count=expected_mongo_count,
             dataset_id=staging_id,
         )
 
@@ -1332,7 +1623,7 @@ def apply_variants_to_remote(
             client,
             deployment.remote,
             config.dataset_id,
-            vcf_count,
+            expected_mongo_count,
         )
 
         if not api_count_valid:
@@ -1357,8 +1648,12 @@ def apply_variants_to_remote(
         dataset_id=config.dataset_id,
         staging_id=staging_id,
         old_id=old_id,
-        remote_vcf=remote_vcf,
+        local_vcfs=[str(path) for path in vcf_files],
+        remote_vcfs=remote_vcfs,
         vcf_count=vcf_count,
+        processed_count=processed_count,
+        inserted_count=expected_mongo_count,
+        skipped_count=skipped_count,
         mongo_count=mongo_count,
         api_visible=api_visible,
         api_count_valid=api_count_valid,
@@ -1367,7 +1662,7 @@ def apply_variants_to_remote(
         execution=execution,
     )
 
-    result.manifest_file = write_variant_ingest_manifest(
+    write_variant_ingest_artifacts(
         config=config,
         result=result,
     )

@@ -1,0 +1,96 @@
+{% macro header(title, badge) -%}
+<header>
+  <div>
+    <div class="eyebrow">Go-IMPaCT / Beacon</div>
+    <h1>{{ title }}</h1>
+  </div>
+  <div class="badge">{{ badge }}</div>
+</header>
+{%- endmacro %}
+
+{% macro cards(items) -%}
+<section class="cards">
+{% for item in items %}
+  <article class="card">
+    <div class="card-label">{{ item.label }}</div>
+    <div class="card-value">{{ item.value }}</div>
+    <div class="card-note">{{ item.note }}</div>
+  </article>
+{% endfor %}
+</section>
+{%- endmacro %}
+
+{% macro charts(title, items) -%}
+{% if items %}
+<section class="panel">
+  <h2>{{ title }}</h2>
+  <div class="chart-grid">
+  {% for chart in items %}
+    <div class="chart">
+      <div class="chart-title">
+        {{ chart.title }} <span class="card-note">({{ chart.unit }})</span>
+      </div>
+      {% for row in chart.rows %}
+      <div class="bar-row">
+        <div class="bar-label" title="{{ row.label }}">{{ row.label }}</div>
+        <div class="bar-track">
+          <div class="bar" style="width:{{ row.width }}%;background:{{ row.color }}"></div>
+        </div>
+        <div class="bar-value">{{ row.display }}</div>
+      </div>
+      {% endfor %}
+    </div>
+  {% endfor %}
+  </div>
+</section>
+{% endif %}
+{%- endmacro %}
+
+{% macro details(title, items) -%}
+<section class="panel">
+  <h2>{{ title }}</h2>
+  <dl class="details">
+  {% for item in items %}
+    <div class="detail">
+      <dt>{{ item.label }}</dt>
+      <dd>{{ item.value }}</dd>
+    </div>
+  {% endfor %}
+  </dl>
+</section>
+{%- endmacro %}
+
+{% macro table(title, headers, rows) -%}
+{% if rows %}
+<section class="panel">
+  <h2>{{ title }}</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+        {% for header in headers %}
+          <th>{{ header }}</th>
+        {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+      {% for row in rows %}
+        <tr>
+        {% for cell in row %}
+          <td{% if cell.css_class %} class="{{ cell.css_class }}"{% endif %}
+              {% if cell.title %} title="{{ cell.title }}"{% endif %}>
+            {% if cell.muted %}
+            <span class="card-note">NA</span>
+            {% else %}
+            {{ cell.value }}
+            {% endif %}
+          </td>
+        {% endfor %}
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+{%- endmacro %}
