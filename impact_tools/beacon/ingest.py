@@ -17,6 +17,8 @@ import time
 from pathlib import Path
 from importlib import resources
 from impact_tools.beacon import ritools
+from impact_tools.beacon.html_report import write_variant_ingest_report
+from impact_tools.beacon.html_report import write_dataset_ingest_report
 from impact_tools.beacon.registry import BeaconRegistry
 from impact_tools.beacon.remote import exec_remote, sftp_upload
 from impact_tools.ega.execution import (
@@ -81,6 +83,7 @@ class DatasetIngestResult:
     paths: BeaconIngestPaths
     generated_files: list[Path]
     metrics_file: Path | None = None
+    report_file: Path | None = None
 
 
 def validate_dataset_id(dataset_id: str) -> None:
@@ -342,6 +345,42 @@ def write_dataset_ingest_metrics(
     return metrics_file
 
 
+def write_dataset_ingest_html_report(
+    *,
+    metrics_file: Path,
+) -> Path:
+    """Generate an HTML report from a dataset ingest metrics JSON."""
+    payload = json.loads(
+        metrics_file.read_text(encoding="utf-8")
+    )
+
+    report_name = (
+        metrics_file.name.removesuffix(".metrics.json")
+        + ".report.html"
+    )
+    report_file = metrics_file.with_name(report_name)
+
+    payload["metrics_file"] = str(metrics_file)
+    payload["report_file"] = str(report_file)
+
+    write_dataset_ingest_report(
+        report_file,
+        payload,
+    )
+
+    # Keep the machine-readable report aware of both artifacts.
+    metrics_file.write_text(
+        json.dumps(
+            payload,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    return report_file
+
+
 def upload_dataset_metrics_to_remote(
     *,
     config: DatasetIngestConfig,
@@ -501,7 +540,7 @@ def ingest_dataset(config: DatasetIngestConfig) -> DatasetIngestResult:
     2. apply_dataset_to_remote(config, paths): apply them to the running
        Beacon deployment (skipped if config.dry_run is True).
 
-    A metrics JSON file is always written under <base-dir>/logs/.
+    A metrics JSON file and an HTML report is always written under <base-dir>/logs/.
     """
     started_at = _utc_now_iso()
     started_perf = time.perf_counter()
@@ -511,6 +550,7 @@ def ingest_dataset(config: DatasetIngestConfig) -> DatasetIngestResult:
     status = "success"
     error_message: str | None = None
     metrics_file: Path | None = None
+    report_file: Path | None = None
 
     try:
         result = prepare_dataset_artifacts(config)
@@ -542,6 +582,20 @@ def ingest_dataset(config: DatasetIngestConfig) -> DatasetIngestResult:
 
             if result is not None:
                 result.metrics_file = metrics_file
+            try:
+                report_file = write_dataset_ingest_html_report(
+                    metrics_file=metrics_file,
+                )
+                LOGGER.info("HTML report written: %s", report_file)
+
+                if result is not None:
+                    result.report_file = report_file
+
+            except Exception as report_exc:  # noqa: BLE001
+                LOGGER.warning(
+                    "Could not write dataset ingest HTML report: %s",
+                    report_exc,
+                )
 
             if not config.dry_run and metrics_file is not None:
                 try:
@@ -775,7 +829,6 @@ def write_variant_ingest_html_report(
     result: ApplyVariantsResult,
 ) -> Path:
     """Write an HTML report for one Beacon variant ingest execution."""
-    from impact_tools.beacon.html_report import write_variant_ingest_report
 
     _, report_file = build_variant_ingest_artifact_paths(
         config=config,

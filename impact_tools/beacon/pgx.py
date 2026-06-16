@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import datetime as dt
+import json
+import platform
+import socket
+import sys
 import dataclasses
 import logging
 import shlex
@@ -9,6 +14,7 @@ import shutil
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from impact_tools.beacon.html_report import write_pgx_report
 from pathlib import Path
 from typing import Literal
 from importlib.resources import files
@@ -121,6 +127,8 @@ class WorkspaceResult:
     sample_id: str
     workspace: Path
     status: str  # "ok", "warn", "error"
+    duration_seconds: float | None = None
+    error: str | None = None
 
 
 @dataclasses.dataclass
@@ -129,27 +137,341 @@ class PgxRunResult:
     output_all: Path | None
     output_pass: Path | None
     status: str  # "ok", "warn", "error"
+    duration_seconds: float | None = None
+    return_code: int | None = None
+    error: str | None = None
 
 
 @dataclasses.dataclass
 class PgxPipelineResult:
     prepare_results: list[WorkspaceResult]
     run_results: list[PgxRunResult]
+    metrics_file: Path | None = None
+    report_file: Path | None = None
 
     @property
     def failed(self) -> int:
         return sum(
-            1 for r in [*self.prepare_results, *self.run_results]
-            if r.status == "error"
+            1
+            for result in [*self.prepare_results, *self.run_results]
+            if result.status == "error"
         )
 
     @property
     def warned(self) -> int:
         return sum(
-            1 for r in [*self.prepare_results, *self.run_results]
-            if r.status == "warn"
+            1
+            for result in [*self.prepare_results, *self.run_results]
+            if result.status == "warn"
         )
 
+    @property
+    def succeeded(self) -> int:
+        return sum(
+            1
+            for result in [*self.prepare_results, *self.run_results]
+            if result.status == "ok"
+        )
+
+
+def _pgx_file_metrics(path: Path | None) -> dict | None:
+    """Return existence and size metrics for one PGx output file."""
+    if path is None:
+        return None
+
+    exists = path.exists()
+
+    return {
+        "path": str(path),
+        "exists": exists,
+        "size_bytes": path.stat().st_size if exists else None,
+    }
+
+
+def write_pgx_metrics(
+    *,
+    config: PgxConfig,
+    discovered_sources: list[SampleSource],
+    existing_records: list[SampleRecord],
+    new_records: list[SampleRecord],
+    inferences: list[SexInferenceResult | None],
+    result: PgxPipelineResult | None,
+    prepare_only: bool,
+    run_only: bool,
+    started_at: str,
+    ended_at: str,
+    duration_seconds: float,
+    status: str,
+    error: str | None = None,
+) -> Path:
+    """Write a JSON metrics report for one Beacon PGx execution."""
+    logs_dir = config.base_dir.resolve() / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    metrics_file = logs_dir / f"beacon_pgx_{timestamp}.metrics.json"
+
+    all_records = [*existing_records, *new_records]
+
+    source_by_sample = {
+        source.sample_id: source
+        for source in discovered_sources
+    }
+    record_by_sample = {
+        record.sample_id: record
+        for record in all_records
+    }
+    inference_by_sample = {
+        inference.sample_id: inference
+        for inference in inferences
+        if inference is not None
+    }
+
+    prepare_results = (
+        result.prepare_results
+        if result is not None
+        else []
+    )
+    run_results = (
+        result.run_results
+        if result is not None
+        else []
+    )
+
+    prepare_by_sample = {
+        item.sample_id: item
+        for item in prepare_results
+    }
+    run_by_sample = {
+        item.sample_id: item
+        for item in run_results
+    }
+
+    sample_ids = [
+        source.sample_id
+        for source in discovered_sources
+    ]
+
+    for record in all_records:
+        if record.sample_id not in sample_ids:
+            sample_ids.append(record.sample_id)
+
+    existing_sample_ids = {
+        record.sample_id
+        for record in existing_records
+    }
+
+    samples = []
+
+    for sample_id in sample_ids:
+        source = source_by_sample.get(sample_id)
+        record = record_by_sample.get(sample_id)
+        inference = inference_by_sample.get(sample_id)
+        workspace = prepare_by_sample.get(sample_id)
+        pgx_run = run_by_sample.get(sample_id)
+
+        if sample_id in existing_sample_ids:
+            sex_resolution = "existing"
+        elif inference is None:
+            sex_resolution = "failed"
+        elif inference.sex is None and record is not None:
+            sex_resolution = "manual"
+        else:
+            sex_resolution = "automatic"
+
+        samples.append(
+            {
+                "sample_id": sample_id,
+                "vcf_basename": (
+                    source.vcf_basename
+                    if source is not None
+                    else (
+                        record.vcf_basename
+                        if record is not None
+                        else None
+                    )
+                ),
+                "sex": record.sex if record is not None else None,
+                "country_code": (
+                    record.country_code
+                    if record is not None
+                    else None
+                ),
+                "sex_inference": {
+                    "status": sex_resolution,
+                    "n_chry": (
+                        inference.n_chry
+                        if inference is not None
+                        else None
+                    ),
+                    "inferred_sex": (
+                        inference.sex
+                        if inference is not None
+                        else None
+                    ),
+                },
+                "workspace": (
+                    {
+                        "status": workspace.status,
+                        "path": str(workspace.workspace),
+                        "duration_seconds": (
+                            round(workspace.duration_seconds, 3)
+                            if workspace.duration_seconds is not None
+                            else None
+                        ),
+                        "error": workspace.error,
+                    }
+                    if workspace is not None
+                    else None
+                ),
+                "pgx_run": (
+                    {
+                        "status": pgx_run.status,
+                        "duration_seconds": (
+                            round(pgx_run.duration_seconds, 3)
+                            if pgx_run.duration_seconds is not None
+                            else None
+                        ),
+                        "return_code": pgx_run.return_code,
+                        "error": pgx_run.error,
+                        "output_all": _pgx_file_metrics(
+                            pgx_run.output_all
+                        ),
+                        "output_pass": _pgx_file_metrics(
+                            pgx_run.output_pass
+                        ),
+                    }
+                    if pgx_run is not None
+                    else None
+                ),
+            }
+        )
+
+    if prepare_only:
+        mode = "prepare"
+    elif run_only:
+        mode = "run"
+    else:
+        mode = "full"
+
+    report = {
+        "workflow": "beacon.pgx",
+        "status": status,
+        "error": error,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "duration_seconds": round(duration_seconds, 3),
+        "command": " ".join(sys.argv),
+        "config": {
+            "base_dir": str(config.base_dir.resolve()),
+            "country_code": config.country_code,
+            "sex_ambiguous_min": config.sex_ambiguous_min,
+            "sex_ambiguous_max": config.sex_ambiguous_max,
+            "bcftools_image": config.bcftools_image,
+            "pgx_image": config.pgx_image,
+            "pgx_repo": (
+                str(config.pgx_repo)
+                if config.pgx_repo is not None
+                else None
+            ),
+            "snakemake_jobs": config.snakemake_jobs,
+            "workers": config.workers,
+            "mode": mode,
+        },
+        "environment": {
+            "hostname": socket.gethostname(),
+            "platform": platform.platform(),
+            "python": sys.version.split()[0],
+            "cwd": str(Path.cwd()),
+        },
+        "summary": {
+            "lifted_vcfs": len(
+                {
+                    source.vcf_basename
+                    for source in discovered_sources
+                }
+            ),
+            "samples_discovered": len(discovered_sources),
+            "existing_samples": len(existing_records),
+            "new_samples": len(new_records),
+            "sex_inference_attempted": len(inferences),
+            "sex_inference_failed": sum(
+                inference is None
+                for inference in inferences
+            ),
+            "sex_ambiguous": sum(
+                inference is not None
+                and inference.sex is None
+                for inference in inferences
+            ),
+            "prepare_steps": len(prepare_results),
+            "run_steps": len(run_results),
+            "succeeded": (
+                result.succeeded
+                if result is not None
+                else 0
+            ),
+            "warned": (
+                result.warned
+                if result is not None
+                else 0
+            ),
+            "failed": (
+                result.failed
+                if result is not None
+                else 0
+            ),
+        },
+        "samples": samples,
+        "metrics_file": str(metrics_file),
+        "report_file": None,
+    }
+
+    metrics_file.write_text(
+        json.dumps(
+            report,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    return metrics_file
+
+
+def write_pgx_html_report(
+    *,
+    metrics_file: Path,
+) -> Path:
+    """Generate an HTML report from a PGx metrics JSON."""
+    payload = json.loads(
+        metrics_file.read_text(encoding="utf-8")
+    )
+
+    report_name = (
+        metrics_file.name.removesuffix(".metrics.json")
+        + ".report.html"
+    )
+    report_file = metrics_file.with_name(report_name)
+
+    payload["metrics_file"] = str(metrics_file)
+    payload["report_file"] = str(report_file)
+
+    write_pgx_report(
+        report_file,
+        payload,
+    )
+
+    metrics_file.write_text(
+        json.dumps(
+            payload,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    return report_file
 
 # ---------------------------------------------------------------------------
 # Discovery and samples.tsv I/O
@@ -366,6 +688,20 @@ printf '%s\n' "$n"
     )
 
 
+def infer_sex(
+    n_chry: int,
+    config: PgxConfig,
+) -> Sex | None:
+    """Infer sex from the number of non-reference chrY genotypes."""
+    if n_chry > config.sex_ambiguous_max:
+        return "M"
+
+    if n_chry < config.sex_ambiguous_min:
+        return "F"
+
+    return None
+
+
 def infer_sex_batch(
     config: PgxConfig,
     sources: list[SampleSource],
@@ -482,13 +818,20 @@ def prepare_workspace(
 ) -> WorkspaceResult:
     """Create the pgx_pilot workspace for one sample."""
     ws = config.pgx_runs_dir / record.sample_id
+    started = time.monotonic()
 
     if not record.vcf_basename:
         log.error(
             "[%s] Source VCF basename is missing",
             record.sample_id,
         )
-        return WorkspaceResult(record.sample_id, ws, "error")
+        return WorkspaceResult(
+            sample_id=record.sample_id,
+            workspace=ws,
+            status="error",
+            duration_seconds=time.monotonic() - started,
+            error="Source VCF basename is missing.",
+        )
 
     vcf_src = (config.liftover_dir / record.vcf_basename).resolve()
     tbi_src = Path(f"{vcf_src}.tbi")
@@ -499,7 +842,13 @@ def prepare_workspace(
             record.sample_id,
             vcf_src,
         )
-        return WorkspaceResult(record.sample_id, ws, "error")
+        return WorkspaceResult(
+            sample_id=record.sample_id,
+            workspace=ws,
+            status="error",
+            duration_seconds=time.monotonic() - started,
+            error=f"Missing lifted VCF: {vcf_src}",
+        )
 
     if not tbi_src.is_file():
         log.error(
@@ -507,7 +856,13 @@ def prepare_workspace(
             record.sample_id,
             tbi_src,
         )
-        return WorkspaceResult(record.sample_id, ws, "error")
+        return WorkspaceResult(
+            sample_id=record.sample_id,
+            workspace=ws,
+            status="error",
+            duration_seconds=time.monotonic() - started,
+            error=f"Missing VCF index: {tbi_src}",
+        )
 
     data_dir = ws / "data"
     results_dir = ws / "results"
@@ -563,9 +918,10 @@ def prepare_workspace(
     )
 
     return WorkspaceResult(
-        record.sample_id,
-        ws,
-        "ok",
+        sample_id=record.sample_id,
+        workspace=ws,
+        status="ok",
+        duration_seconds=time.monotonic() - started,
     )
 
 # ---------------------------------------------------------------------------
@@ -575,15 +931,25 @@ def prepare_workspace(
 def run_pgx_pilot(config: PgxConfig, record: SampleRecord) -> PgxRunResult:
     """Run the pgx_pilot Snakemake pipeline for one sample via Docker."""
     ws = config.pgx_runs_dir / record.sample_id
-    vcf_name = record.vcf_basename if record.vcf_basename else record.sample_id
-    vcf_in = config.liftover_dir / f"{vcf_name}.GRCh38.clean.vcf.gz"
+    vcf_in = (
+        config.liftover_dir / record.vcf_basename
+        if record.vcf_basename
+        else config.liftover_dir
+        / f"{record.sample_id}.GRCh38.clean.vcf.gz"
+    )
     out_all = ws / "results" / f"{record.sample_id}.sites.all.vcf.gz"
     out_pass = ws / "results" / f"{record.sample_id}.sites.pass.vcf.gz"
     log_file = config.base_dir / "logs" / f"{record.sample_id}_pgx.log"
 
     if not ws.exists() or not (ws / "config.yaml").exists():
         log.error("[%s] Workspace missing — run prepare step first", record.sample_id)
-        return PgxRunResult(record.sample_id, None, None, "error")
+        return PgxRunResult(
+            sample_id=record.sample_id,
+            output_all=None,
+            output_pass=None,
+            status="error",
+            error="Workspace or config.yaml is missing.",
+        )
 
     for path in [ws / "results", ws / ".snakemake"]:
         if path.exists():
@@ -626,7 +992,15 @@ def run_pgx_pilot(config: PgxConfig, record: SampleRecord) -> PgxRunResult:
             "[%s] pgx_pilot failed (rc=%d, %.1fs) — check %s",
             record.sample_id, proc.returncode, elapsed, log_file,
         )
-        return PgxRunResult(record.sample_id, None, None, "error")
+        return PgxRunResult(
+            sample_id=record.sample_id,
+            output_all=None,
+            output_pass=None,
+            status="error",
+            duration_seconds=elapsed,
+            return_code=proc.returncode,
+            error=f"pgx_pilot failed. Check log: {log_file}",
+        )
 
     if not out_pass.exists():
         log.warning(
@@ -634,7 +1008,13 @@ def run_pgx_pilot(config: PgxConfig, record: SampleRecord) -> PgxRunResult:
             record.sample_id, out_pass.name, elapsed, log_file,
         )
         return PgxRunResult(
-            record.sample_id, out_all if out_all.exists() else None, None, "warn"
+            sample_id=record.sample_id,
+            output_all=out_all if out_all.exists() else None,
+            output_pass=None,
+            status="warn",
+            duration_seconds=elapsed,
+            return_code=proc.returncode,
+            error=f"Expected output not found: {out_pass}",
         )
 
     log.info(
@@ -644,10 +1024,12 @@ def run_pgx_pilot(config: PgxConfig, record: SampleRecord) -> PgxRunResult:
         _fmt_size(out_pass),
     )
     return PgxRunResult(
-        record.sample_id,
-        out_all if out_all.exists() else None,
-        out_pass,
-        "ok",
+        sample_id=record.sample_id,
+        output_all=out_all if out_all.exists() else None,
+        output_pass=out_pass,
+        status="ok",
+        duration_seconds=elapsed,
+        return_code=proc.returncode,
     )
 
 
@@ -656,61 +1038,85 @@ def run_pgx_pilot(config: PgxConfig, record: SampleRecord) -> PgxRunResult:
 # ---------------------------------------------------------------------------
 
 def _parallel(fn, config: PgxConfig, items: list, error_factory) -> list:
-    """Run fn(config, item) for each item, in parallel when config.workers > 1."""
-    if config.workers <= 1 or len(items) <= 1:
-        return [fn(config, item) for item in items]
-
+    """Run one function per item while preserving input order."""
     ordered: dict[int, object] = {}
-    with ThreadPoolExecutor(max_workers=config.workers) as pool:
-        future_to_idx = {pool.submit(fn, config, item): i for i, item in enumerate(items)}
-        for future in as_completed(future_to_idx):
-            i = future_to_idx[future]
+
+    if config.workers <= 1 or len(items) <= 1:
+        for index, item in enumerate(items):
             try:
-                ordered[i] = future.result()
+                ordered[index] = fn(config, item)
             except Exception as exc:
-                log.error("Unexpected error processing item %d: %s", i, exc)
-                ordered[i] = error_factory(items[i])
-    return [ordered[i] for i in range(len(items))]
+                log.error(
+                    "Unexpected error processing item %d: %s",
+                    index,
+                    exc,
+                )
+                ordered[index] = error_factory(item)
 
+        return [ordered[index] for index in range(len(items))]
 
-def infer_sex_batch(
-    config: PgxConfig, vcf_basenames: list[str]
-) -> list[SexInferenceResult | None]:
-    """Run count_chry_variants in parallel; results are in the same order as input."""
-    if config.workers <= 1 or len(vcf_basenames) <= 1:
-        return [count_chry_variants(config, b) for b in vcf_basenames]
-
-    ordered: dict[int, SexInferenceResult | None] = {}
     with ThreadPoolExecutor(max_workers=config.workers) as pool:
         future_to_idx = {
-            pool.submit(count_chry_variants, config, b): i
-            for i, b in enumerate(vcf_basenames)
+            pool.submit(fn, config, item): index
+            for index, item in enumerate(items)
         }
+
         for future in as_completed(future_to_idx):
-            i = future_to_idx[future]
+            index = future_to_idx[future]
+
             try:
-                ordered[i] = future.result()
+                ordered[index] = future.result()
             except Exception as exc:
-                log.error("Sex inference error for %s: %s", vcf_basenames[i], exc)
-                ordered[i] = None
-    return [ordered[i] for i in range(len(vcf_basenames))]
+                log.error(
+                    "Unexpected error processing item %d: %s",
+                    index,
+                    exc,
+                )
+                ordered[index] = error_factory(items[index])
+
+    return [ordered[index] for index in range(len(items))]
 
 
 def prepare_workspaces(
-    config: PgxConfig, records: list[SampleRecord]
+    config: PgxConfig,
+    records: list[SampleRecord],
 ) -> list[WorkspaceResult]:
     """Prepare workspaces in parallel; results are in the same order as records."""
-    def _err(r: SampleRecord) -> WorkspaceResult:
-        return WorkspaceResult(r.sample_id, config.pgx_runs_dir / r.sample_id, "error")
 
-    return _parallel(prepare_workspace, config, records, _err)  # type: ignore[arg-type]
+    def _err(record: SampleRecord) -> WorkspaceResult:
+        return WorkspaceResult(
+            sample_id=record.sample_id,
+            workspace=config.pgx_runs_dir / record.sample_id,
+            status="error",
+            error="Unexpected workspace preparation error.",
+        )
+
+    return _parallel(
+        prepare_workspace,
+        config,
+        records,
+        _err,
+    )
 
 
 def run_pgx_pilots(
-    config: PgxConfig, records: list[SampleRecord]
+    config: PgxConfig,
+    records: list[SampleRecord],
 ) -> list[PgxRunResult]:
     """Run pgx_pilot in parallel; results are in the same order as records."""
-    def _err(r: SampleRecord) -> PgxRunResult:
-        return PgxRunResult(r.sample_id, None, None, "error")
 
-    return _parallel(run_pgx_pilot, config, records, _err)  # type: ignore[arg-type]
+    def _err(record: SampleRecord) -> PgxRunResult:
+        return PgxRunResult(
+            sample_id=record.sample_id,
+            output_all=None,
+            output_pass=None,
+            status="error",
+            error="Unexpected pgx_pilot execution error.",
+        )
+
+    return _parallel(
+        run_pgx_pilot,
+        config,
+        records,
+        _err,
+    )

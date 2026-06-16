@@ -9,9 +9,15 @@ import logging
 import re
 import subprocess
 import time
+import datetime as dt
+import json
+import platform
+import socket
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Literal
+from impact_tools.beacon.html_report import write_liftover_report
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +43,6 @@ class LiftoverConfig:
     base_dir: Path
     chain: Path | None = None
     fasta: Path | None = None
-    hpc_mount: str = "/data/ucct/bi"
     bcftools_image: str = BCFTOOLS_IMAGE
     crossmap_image: str = CROSSMAP_IMAGE
     workers: int = 4
@@ -62,11 +67,16 @@ class SampleLiftoverResult:
     output_vcf: Path | None
     status: str  # "ok", "warn", "error"
     n_variants: int | None = None
+    duration_seconds: float | None = None
+    failed_step: str | None = None
+    error: str | None = None
 
 
 @dataclasses.dataclass
 class LiftoverRunResult:
     results: list[SampleLiftoverResult]
+    metrics_file: Path | None = None
+    report_file: Path | None = None
 
     @property
     def failed(self) -> int:
@@ -75,6 +85,168 @@ class LiftoverRunResult:
     @property
     def warned(self) -> int:
         return sum(1 for r in self.results if r.status == "warn")
+
+    @property
+    def succeeded(self) -> int:
+        return sum(1 for r in self.results if r.status == "ok")
+
+
+def _liftover_file_metrics(path: Path | None) -> dict | None:
+    """Return existence and size metrics for one liftover file."""
+    if path is None:
+        return None
+
+    exists = path.exists()
+
+    return {
+        "path": str(path),
+        "exists": exists,
+        "size_bytes": path.stat().st_size if exists else None,
+    }
+
+
+def write_liftover_metrics(
+    *,
+    config: LiftoverConfig,
+    result: LiftoverRunResult | None,
+    started_at: str,
+    ended_at: str,
+    duration_seconds: float,
+    status: str,
+    error: str | None = None,
+) -> Path:
+    """Write a JSON metrics report for one Beacon liftover execution."""
+    logs_dir = config.base_dir.resolve() / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    metrics_file = logs_dir / (
+        f"beacon_liftover_{timestamp}.metrics.json"
+    )
+
+    sample_results = result.results if result is not None else []
+
+    samples = []
+
+    for sample in sample_results:
+        output_index = (
+            Path(f"{sample.output_vcf}.tbi")
+            if sample.output_vcf is not None
+            else None
+        )
+
+        samples.append(
+            {
+                "sample_id": sample.sample_id,
+                "status": sample.status,
+                "n_variants": sample.n_variants,
+                "duration_seconds": (
+                    round(sample.duration_seconds, 3)
+                    if sample.duration_seconds is not None
+                    else None
+                ),
+                "failed_step": sample.failed_step,
+                "error": sample.error,
+                "input_vcf": _liftover_file_metrics(
+                    sample.input_vcf
+                ),
+                "output_vcf": _liftover_file_metrics(
+                    sample.output_vcf
+                ),
+                "output_index": _liftover_file_metrics(
+                    output_index
+                ),
+            }
+        )
+
+    report = {
+        "workflow": "beacon.liftover",
+        "status": status,
+        "error": error,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "duration_seconds": round(duration_seconds, 3),
+        "command": " ".join(sys.argv),
+        "config": {
+            "base_dir": str(config.base_dir.resolve()),
+            "chain": str(config.resolved_chain),
+            "fasta": str(config.resolved_fasta),
+            "bcftools_image": config.bcftools_image,
+            "crossmap_image": config.crossmap_image,
+            "workers": config.workers,
+        },
+        "environment": {
+            "hostname": socket.gethostname(),
+            "platform": platform.platform(),
+            "python": sys.version.split()[0],
+            "cwd": str(Path.cwd()),
+        },
+        "summary": {
+            "samples": len(sample_results),
+            "succeeded": (
+                result.succeeded if result is not None else 0
+            ),
+            "warned": (
+                result.warned if result is not None else 0
+            ),
+            "failed": (
+                result.failed if result is not None else 0
+            ),
+            "variants": sum(
+                sample.n_variants or 0
+                for sample in sample_results
+            ),
+        },
+        "samples": samples,
+        "metrics_file": str(metrics_file),
+        "report_file": None,
+    }
+
+    metrics_file.write_text(
+        json.dumps(
+            report,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    return metrics_file
+
+
+def write_liftover_html_report(
+    *,
+    metrics_file: Path,
+) -> Path:
+    """Generate an HTML report from a liftover metrics JSON."""
+    payload = json.loads(
+        metrics_file.read_text(encoding="utf-8")
+    )
+
+    report_name = (
+        metrics_file.name.removesuffix(".metrics.json")
+        + ".report.html"
+    )
+    report_file = metrics_file.with_name(report_name)
+
+    payload["metrics_file"] = str(metrics_file)
+    payload["report_file"] = str(report_file)
+
+    write_liftover_report(
+        report_file,
+        payload,
+    )
+
+    metrics_file.write_text(
+        json.dumps(
+            payload,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    return report_file
 
 
 def _fmt_size(path: Path) -> str:
@@ -380,7 +552,6 @@ def _run_sample(
 ) -> SampleLiftoverResult:
     """Run the 6-step liftover pipeline for one sample."""
     base = str(config.base_dir)
-    hpc = config.hpc_mount
     resources = str(config.resolved_chain.parent)
 
     liftover_dir = config.base_dir / "liftover"
@@ -395,27 +566,44 @@ def _run_sample(
     log.info("[%s] Input:  %s  (%s)", sample_id, in_vcf.name, _fmt_size(in_vcf))
     t0_sample = time.monotonic()
 
+    def failed_result(
+        step: str,
+        message: str,
+    ) -> SampleLiftoverResult:
+        """Build a failed result while preserving elapsed runtime."""
+        elapsed = time.monotonic() - t0_sample
+
+        return SampleLiftoverResult(
+            sample_id=sample_id,
+            input_vcf=in_vcf,
+            output_vcf=None,
+            status="error",
+            duration_seconds=elapsed,
+            failed_step=step,
+            error=message,
+        )
+
     # Step 1: rename contigs Ensembl -> UCSC (1 -> chr1)
     log.info("[%s] Step 1: rename contigs", sample_id)
     t1 = time.monotonic()
+
     cmd1 = [
         "docker", "run", "--rm",
         "-v", f"{base}:/data",
-    ]
-
-    if Path(hpc).exists():
-        cmd1 += ["-v", f"{hpc}:{hpc}:ro"]
-
-    cmd1 += [
         config.bcftools_image,
         "bcftools", "annotate",
         "--rename-chrs", "/data/liftover/rename_chrs.txt",
-        "-Oz", "-o", f"/data/liftover/{sample_id}.renamed.vcf.gz",
+        "-Oz",
+        "-o", f"/data/liftover/{sample_id}.renamed.vcf.gz",
         f"/data/inputs/{sample_id}.vcf.gz",
     ]
+
     if not _run_cmd(cmd1, lift_log, mode="w"):
         log.error("[%s] Step 1 failed — check %s", sample_id, lift_log)
-        return SampleLiftoverResult(sample_id, in_vcf, None, "error")
+        return failed_result(
+            "rename_contigs",
+            f"Step 1 failed. Check log: {lift_log}",
+        )
     log.info("[%s] Step 1 done  (%.1fs)", sample_id, time.monotonic() - t1)
 
     # Step 2: CrossMap liftover GRCh37 -> GRCh38
@@ -434,7 +622,10 @@ def _run_sample(
     ]
     if not _run_cmd(cmd2, lift_log):
         log.error("[%s] Step 2 failed — check %s", sample_id, lift_log)
-        return SampleLiftoverResult(sample_id, in_vcf, None, "error")
+        return failed_result(
+            "crossmap",
+            f"Step 2 failed. Check log: {lift_log}",
+        )
     log.info("[%s] Step 2 done  (%.1fs)", sample_id, time.monotonic() - t2)
 
     for line in lift_log.read_text(errors="replace").splitlines():
@@ -463,7 +654,10 @@ def _run_sample(
     ]
     if not _run_cmd(cmd4, lift_log):
         log.error("[%s] Step 4 failed — check %s", sample_id, lift_log)
-        return SampleLiftoverResult(sample_id, in_vcf, None, "error")
+        return failed_result(
+            "sort_and_index",
+            f"Step 4 failed. Check log: {lift_log}",
+        )
     log.info("[%s] Step 4 done  (%.1fs)", sample_id, time.monotonic() - t4)
 
     # Step 5: clean obsolete INFO tags
@@ -483,7 +677,10 @@ def _run_sample(
     ]
     if not _run_cmd(cmd5, lift_log):
         log.error("[%s] Step 5 failed — check %s", sample_id, lift_log)
-        return SampleLiftoverResult(sample_id, in_vcf, None, "error")
+        return failed_result(
+            "clean_info",
+            f"Step 5 failed. Check log: {lift_log}",
+        )
     log.info("[%s] Step 5 done  (%.1fs)", sample_id, time.monotonic() - t5)
 
     # Step 6: validate output
@@ -521,7 +718,12 @@ def _run_sample(
         log.info("[%s] Finished with status=%s  [total: %.1fs]", sample_id, status, elapsed)
 
     return SampleLiftoverResult(
-        sample_id, in_vcf, clean if clean.exists() else None, status, n_variants
+        sample_id=sample_id,
+        input_vcf=in_vcf,
+        output_vcf=clean if clean.exists() else None,
+        status=status,
+        n_variants=n_variants,
+        duration_seconds=elapsed,
     )
 
 
@@ -563,54 +765,205 @@ def cleanup_intermediates(liftover_dir: Path, sample_ids: list[str]) -> int:
 
 
 def run_liftover(config: LiftoverConfig) -> LiftoverRunResult:
-    """Run the full CrossMap liftover pipeline for all samples in base_dir/inputs."""
-    validate_resources(config)
-    validate_docker_available()
-    fai = ensure_fasta_index(config)
+    """Run the full CrossMap liftover pipeline for all input VCFs.
 
-    vcfs = discover_input_vcfs(config.base_dir)
-    if not vcfs:
-        raise ValueError(f"No *.vcf.gz files found in {config.base_dir / 'inputs'}")
+    A metrics JSON file is always written under <base-dir>/logs/,
+    including executions that fail before processing any samples.
+    """
+    started_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    started_perf = time.perf_counter()
 
-    liftover_dir = config.base_dir / "liftover"
-    _, contigs_file = _prepare_auxiliary_files(liftover_dir, fai)
-    contigs_content = contigs_file.read_text()
-
-    sample_ids = [
-        (vcf.name[:-7] if vcf.name.endswith(".vcf.gz") else vcf.stem)
-        for vcf in vcfs
-    ]
-
-    log.info("Queuing %d sample(s)  (workers=%d)", len(sample_ids), config.workers)
-    t0_total = time.monotonic()
+    run_result: LiftoverRunResult | None = None
+    status = "success"
+    error_message: str | None = None
 
     ordered: dict[int, SampleLiftoverResult] = {}
+    sample_ids: list[str] = []
 
-    if config.workers <= 1 or len(sample_ids) == 1:
-        for i, sid in enumerate(sample_ids):
-            log.info("==========================================")
-            log.info("Processing %s", sid)
-            log.info("==========================================")
-            ordered[i] = _run_sample(config, sid, contigs_content)
-    else:
-        with ThreadPoolExecutor(max_workers=config.workers) as pool:
-            future_to_idx = {
-                pool.submit(_run_sample, config, sid, contigs_content): i
-                for i, sid in enumerate(sample_ids)
-            }
-            for future in as_completed(future_to_idx):
-                i = future_to_idx[future]
-                sid = sample_ids[i]
+    try:
+        validate_resources(config)
+        validate_docker_available()
+        fai = ensure_fasta_index(config)
+
+        vcfs = discover_input_vcfs(config.base_dir)
+        if not vcfs:
+            raise ValueError(
+                f"No *.vcf.gz files found in "
+                f"{config.base_dir / 'inputs'}"
+            )
+
+        liftover_dir = config.base_dir / "liftover"
+        _, contigs_file = _prepare_auxiliary_files(
+            liftover_dir,
+            fai,
+        )
+        contigs_content = contigs_file.read_text()
+
+        sample_ids = [
+            (
+                vcf.name[:-7]
+                if vcf.name.endswith(".vcf.gz")
+                else vcf.stem
+            )
+            for vcf in vcfs
+        ]
+
+        log.info(
+            "Queuing %d sample(s)  (workers=%d)",
+            len(sample_ids),
+            config.workers,
+        )
+        t0_total = time.monotonic()
+
+        if config.workers <= 1 or len(sample_ids) == 1:
+            for index, sample_id in enumerate(sample_ids):
+                log.info("==========================================")
+                log.info("Processing %s", sample_id)
+                log.info("==========================================")
+
                 try:
-                    ordered[i] = future.result()
+                    ordered[index] = _run_sample(
+                        config,
+                        sample_id,
+                        contigs_content,
+                    )
                 except Exception as exc:
-                    log.error("[%s] Unexpected error: %s", sid, exc)
-                    in_vcf = config.base_dir / "inputs" / f"{sid}.vcf.gz"
-                    ordered[i] = SampleLiftoverResult(sid, in_vcf, None, "error")
+                    log.error(
+                        "[%s] Unexpected error: %s",
+                        sample_id,
+                        exc,
+                    )
+                    input_vcf = (
+                        config.base_dir
+                        / "inputs"
+                        / f"{sample_id}.vcf.gz"
+                    )
+                    ordered[index] = SampleLiftoverResult(
+                        sample_id=sample_id,
+                        input_vcf=input_vcf,
+                        output_vcf=None,
+                        status="error",
+                        failed_step="unexpected",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
 
-    results = [ordered[i] for i in range(len(sample_ids))]
-    run_result = LiftoverRunResult(results)
-    log.info("==========================================")
-    log.info("Total liftover time: %.1fs  (%d samples)", time.monotonic() - t0_total, len(results))
+        else:
+            with ThreadPoolExecutor(
+                max_workers=config.workers
+            ) as pool:
+                future_to_idx = {
+                    pool.submit(
+                        _run_sample,
+                        config,
+                        sample_id,
+                        contigs_content,
+                    ): index
+                    for index, sample_id in enumerate(sample_ids)
+                }
+
+                for future in as_completed(future_to_idx):
+                    index = future_to_idx[future]
+                    sample_id = sample_ids[index]
+
+                    try:
+                        ordered[index] = future.result()
+                    except Exception as exc:
+                        log.error(
+                            "[%s] Unexpected error: %s",
+                            sample_id,
+                            exc,
+                        )
+                        input_vcf = (
+                            config.base_dir
+                            / "inputs"
+                            / f"{sample_id}.vcf.gz"
+                        )
+                        ordered[index] = SampleLiftoverResult(
+                            sample_id=sample_id,
+                            input_vcf=input_vcf,
+                            output_vcf=None,
+                            status="error",
+                            failed_step="unexpected",
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
+
+        results = [
+            ordered[index]
+            for index in range(len(sample_ids))
+        ]
+        run_result = LiftoverRunResult(results=results)
+
+        if run_result.failed:
+            status = "failed"
+
+        log.info("==========================================")
+        log.info(
+            "Total liftover time: %.1fs  (%d samples)",
+            time.monotonic() - t0_total,
+            len(results),
+        )
+
+    except Exception as exc:
+        status = "failed"
+        error_message = f"{type(exc).__name__}: {exc}"
+
+        if run_result is None and ordered:
+            partial_results = [
+                ordered[index]
+                for index in sorted(ordered)
+            ]
+            run_result = LiftoverRunResult(
+                results=partial_results
+            )
+
+        raise
+
+    finally:
+        ended_at = dt.datetime.now(dt.timezone.utc).isoformat()
+        duration_seconds = time.perf_counter() - started_perf
+
+        try:
+            metrics_file = write_liftover_metrics(
+                config=config,
+                result=run_result,
+                started_at=started_at,
+                ended_at=ended_at,
+                duration_seconds=duration_seconds,
+                status=status,
+                error=error_message,
+            )
+            log.info(
+                "Liftover metrics written: %s",
+                metrics_file,
+            )
+
+            try:
+                report_file = write_liftover_html_report(
+                    metrics_file=metrics_file,
+                )
+                log.info(
+                    "Liftover HTML report written: %s",
+                    report_file,
+                )
+
+                if run_result is not None:
+                    run_result.report_file = report_file
+
+            except Exception as report_exc:  # noqa: BLE001
+                log.warning(
+                    "Could not write liftover HTML report: %s",
+                    report_exc,
+                )
+
+        except Exception as metrics_exc:  # noqa: BLE001
+            log.warning(
+                "Could not write liftover metrics: %s",
+                metrics_exc,
+            )
+
+    if run_result is None:
+        raise RuntimeError(
+            "Liftover finished without producing a result."
+        )
 
     return run_result

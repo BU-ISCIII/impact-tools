@@ -13,7 +13,7 @@ dependencies = [
     "PyYAML>=6.0",
     "rich>=13.0",
     "Jinja2>=3.1",
-    "beacon2-ri-tools-v2 @ git+https://github.com/BU-ISCIII/beacon2-ri-tools-v2@main",
+    "beacon2-ri-tools-v2 @ git+https://github.com/magdasmat/beacon2-ri-tools-v2@main",
 ]
 
 [project.optional-dependencies]

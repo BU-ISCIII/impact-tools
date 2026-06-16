@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -908,12 +909,6 @@ def beacon() -> None:
     ),
 )
 @click.option(
-    "--hpc-mount",
-    default="/data/ucct/bi",
-    show_default=True,
-    help="HPC mount point passed as a read-only Docker volume to resolve input symlinks.",
-)
-@click.option(
     "--bcftools-image",
     default=beacon_liftover.BCFTOOLS_IMAGE,
     show_default=True,
@@ -955,7 +950,6 @@ def liftover_cmd(
     base_dir: Path,
     chain: Path | None,
     fasta: Path | None,
-    hpc_mount: str,
     bcftools_image: str,
     crossmap_image: str,
     cleanup: bool,
@@ -1073,7 +1067,6 @@ def liftover_cmd(
         base_dir=base_dir,
         chain=chain,
         fasta=fasta,
-        hpc_mount=hpc_mount,
         bcftools_image=bcftools_image,
         crossmap_image=crossmap_image,
         workers=workers,
@@ -1213,12 +1206,31 @@ def pgx_cmd(
     Use --prepare to stop after workspace creation, or --run to skip
     preparation and go straight to execution.
     """
+
     configure_module_logging(ctx, "beacon_pgx")
+
     if prepare and run:
-        raise click.UsageError("--prepare and --run are mutually exclusive.")
+        raise click.UsageError(
+            "--prepare and --run are mutually exclusive."
+        )
+
+    started_at = datetime.now().astimezone().isoformat()
+    started_perf = time.perf_counter()
+
+    status = "success"
+    error_message: str | None = None
+
+    discovered_sources: list[beacon_pgx.SampleSource] = []
+    existing: list[beacon_pgx.SampleRecord] = []
+    new_records: list[beacon_pgx.SampleRecord] = []
+    inferences: list[
+        beacon_pgx.SexInferenceResult | None
+    ] = []
+    prepare_results: list[beacon_pgx.WorkspaceResult] = []
+    run_results: list[beacon_pgx.PgxRunResult] = []
+    pipeline_result: beacon_pgx.PgxPipelineResult | None = None
 
     base_dir = base_dir.resolve()
-
     configuration = ctx.obj["configuration"]
 
     pgx_repo = pgx_repo or _configured_path(
@@ -1243,183 +1255,273 @@ def pgx_cmd(
 
     try:
         beacon_pgx.validate_pgx_layout(config)
+
         if not prepare:
             beacon_pgx.install_snakefile(config)
             beacon_pgx.validate_pgx_run_prereqs(config)
-    except Exception as exc:  # noqa: BLE001
-        raise click.ClickException(str(exc)) from exc
 
-    # ----------------------------------------------------------------
-    # Discover lifted VCFs; compare against existing samples.tsv
-    # ----------------------------------------------------------------
+        # ------------------------------------------------------------
+        # Discover lifted VCFs and existing sample metadata
+        # ------------------------------------------------------------
 
-    try:
-        discovered_sources = beacon_pgx.discover_lifted_samples(config)
-    except Exception as exc:
-        raise click.ClickException(str(exc)) from exc
+        discovered_sources = beacon_pgx.discover_lifted_samples(
+            config
+        )
 
-    existing = (
-        beacon_pgx.read_samples_tsv(config.samples_tsv)
-        if config.samples_tsv.exists()
-        else []
-    )
+        existing = (
+            beacon_pgx.read_samples_tsv(config.samples_tsv)
+            if config.samples_tsv.exists()
+            else []
+        )
 
-    existing_sample_ids = {
-        record.sample_id
-        for record in existing
-    }
+        existing_sample_ids = {
+            record.sample_id
+            for record in existing
+        }
 
-    new_sources = [
-        source
-        for source in discovered_sources
-        if source.sample_id not in existing_sample_ids
-    ]
+        new_sources = [
+            source
+            for source in discovered_sources
+            if source.sample_id not in existing_sample_ids
+        ]
 
-    lifted_vcf_count = len({
-        source.vcf_basename
-        for source in discovered_sources
-    })
+        lifted_vcf_count = len(
+            {
+                source.vcf_basename
+                for source in discovered_sources
+            }
+        )
 
-    log.info("==========================================")
-    log.info("Beacon pgx")
-    log.info("==========================================")
-    log.info("Base directory:          %s", base_dir)
-    log.info("Lifted VCFs found:       %d", lifted_vcf_count)
-    log.info("Samples discovered:      %d", len(discovered_sources))
-    log.info("Already in samples.tsv:  %d", len(existing))
-    log.info("New samples:             %d", len(new_sources))
-    log.info("==========================================")
-
-    # ----------------------------------------------------------------
-    # Infer sex for new samples in parallel; prompt for ambiguous cases
-    # sequentially; write TSV once after all records are resolved
-    # ----------------------------------------------------------------
-
-    new_records: list[beacon_pgx.SampleRecord] = []
-
-    if new_sources:
+        log.info("==========================================")
+        log.info("Beacon pgx")
+        log.info("==========================================")
+        log.info("Base directory:          %s", base_dir)
+        log.info("Lifted VCFs found:       %d", lifted_vcf_count)
         log.info(
-            "Counting non-ref chrY variants for %d new sample(s) "
-            "(workers=%d)...",
-            len(new_sources),
-            workers,
+            "Samples discovered:      %d",
+            len(discovered_sources),
         )
-
-        inferences = beacon_pgx.infer_sex_batch(
-            config,
-            new_sources,
+        log.info(
+            "Already in samples.tsv:  %d",
+            len(existing),
         )
+        log.info("New samples:             %d", len(new_sources))
+        log.info("==========================================")
 
-        for source, inference in zip(
-            new_sources,
-            inferences,
-            strict=True,
-        ):
-            if inference is None:
-                log.warning(
-                    "[%s] %s: chrY count failed — skipping",
-                    source.vcf_basename,
-                    source.sample_id,
-                )
-                continue
+        # ------------------------------------------------------------
+        # Infer sex for newly discovered samples
+        # ------------------------------------------------------------
 
-            sex = inference.sex
-
-            if sex is None:
-                log.warning(
-                    "[%s] %s: %d chrY variants — ambiguous zone "
-                    "(%d–%d), manual input required",
-                    source.vcf_basename,
-                    source.sample_id,
-                    inference.n_chry,
-                    sex_ambiguous_min,
-                    sex_ambiguous_max,
-                )
-
-                raw = click.prompt(
-                    f"  Sex for {source.sample_id} (M/F)",
-                    type=click.Choice(
-                        ["M", "F"],
-                        case_sensitive=False,
-                    ),
-                ).upper()
-
-                sex = "M" if raw == "M" else "F"
-
-            else:
-                log.info(
-                    "[%s] %s: %d chrY -> %s",
-                    source.vcf_basename,
-                    source.sample_id,
-                    inference.n_chry,
-                    sex,
-                )
-
-            record = beacon_pgx.SampleRecord(
-                sample_id=source.sample_id,
-                sex=sex,
-                country_code=country_code,
-                vcf_basename=source.vcf_basename,
+        if new_sources:
+            log.info(
+                "Counting non-ref chrY variants for %d new sample(s) "
+                "(workers=%d)...",
+                len(new_sources),
+                workers,
             )
 
-            new_records.append(record)
+            inferences = beacon_pgx.infer_sex_batch(
+                config,
+                new_sources,
+            )
 
-            beacon_pgx.append_sample_to_tsv(
-                config.samples_tsv,
-                record,
+            for source, inference in zip(
+                new_sources,
+                inferences,
+                strict=True,
+            ):
+                if inference is None:
+                    log.warning(
+                        "[%s] %s: chrY count failed — skipping",
+                        source.vcf_basename,
+                        source.sample_id,
+                    )
+                    continue
+
+                sex = inference.sex
+
+                if sex is None:
+                    log.warning(
+                        "[%s] %s: %d chrY variants — ambiguous "
+                        "zone (%d–%d), manual input required",
+                        source.vcf_basename,
+                        source.sample_id,
+                        inference.n_chry,
+                        sex_ambiguous_min,
+                        sex_ambiguous_max,
+                    )
+
+                    raw = click.prompt(
+                        f"  Sex for {source.sample_id} (M/F)",
+                        type=click.Choice(
+                            ["M", "F"],
+                            case_sensitive=False,
+                        ),
+                    ).upper()
+
+                    sex = "M" if raw == "M" else "F"
+
+                else:
+                    log.info(
+                        "[%s] %s: %d chrY -> %s",
+                        source.vcf_basename,
+                        source.sample_id,
+                        inference.n_chry,
+                        sex,
+                    )
+
+                record = beacon_pgx.SampleRecord(
+                    sample_id=source.sample_id,
+                    sex=sex,
+                    country_code=country_code,
+                    vcf_basename=source.vcf_basename,
+                )
+
+                new_records.append(record)
+
+                beacon_pgx.append_sample_to_tsv(
+                    config.samples_tsv,
+                    record,
+                )
+
+                log.info(
+                    "[%s] Added to samples.tsv "
+                    "(source VCF: %s)",
+                    record.sample_id,
+                    record.vcf_basename,
+                )
+
+        all_records = existing + new_records
+
+        # ------------------------------------------------------------
+        # Prepare workspaces
+        # ------------------------------------------------------------
+
+        if not run:
+            log.info("==========================================")
+            log.info(
+                "Preparing workspaces  (workers=%d)",
+                workers,
+            )
+            log.info("==========================================")
+
+            prepare_results = beacon_pgx.prepare_workspaces(
+                config,
+                all_records,
+            )
+
+        # ------------------------------------------------------------
+        # Run pgx_pilot
+        # ------------------------------------------------------------
+
+        if not prepare:
+            log.info("==========================================")
+            log.info(
+                "Running pgx_pilot  (workers=%d)",
+                workers,
+            )
+            log.info("==========================================")
+
+            run_results = beacon_pgx.run_pgx_pilots(
+                config,
+                all_records,
+            )
+
+        pipeline_result = beacon_pgx.PgxPipelineResult(
+            prepare_results=prepare_results,
+            run_results=run_results,
+        )
+
+        total = len(prepare_results) + len(run_results)
+
+        log.info("==========================================")
+        log.info("pgx summary")
+        log.info("==========================================")
+        log.info(
+            "  Steps OK:       %d",
+            pipeline_result.succeeded,
+        )
+        log.info(
+            "  Steps warnings: %d",
+            pipeline_result.warned,
+        )
+        log.info(
+            "  Steps failed:   %d",
+            pipeline_result.failed,
+        )
+
+        if pipeline_result.failed > 0:
+            raise click.ClickException(
+                "pgx pipeline finished with "
+                f"{pipeline_result.failed} failed step(s). "
+                "Check logs in <base-dir>/logs/ for details."
+            )
+
+    except Exception as exc:
+        status = "failed"
+        error_message = f"{type(exc).__name__}: {exc}"
+
+        if isinstance(
+            exc,
+            (click.ClickException, click.UsageError),
+        ):
+            raise
+
+        raise click.ClickException(str(exc)) from exc
+
+    finally:
+        ended_at = datetime.now().astimezone().isoformat()
+        duration_seconds = time.perf_counter() - started_perf
+
+        try:
+            metrics_file = beacon_pgx.write_pgx_metrics(
+                config=config,
+                discovered_sources=discovered_sources,
+                existing_records=existing,
+                new_records=new_records,
+                inferences=inferences,
+                result=pipeline_result,
+                prepare_only=prepare,
+                run_only=run,
+                started_at=started_at,
+                ended_at=ended_at,
+                duration_seconds=duration_seconds,
+                status=status,
+                error=error_message,
             )
 
             log.info(
-                "[%s] Added to samples.tsv "
-                "(source VCF: %s)",
-                record.sample_id,
-                record.vcf_basename,
+                "PGx metrics written: %s",
+                metrics_file,
             )
 
-    all_records = existing + new_records
+            if pipeline_result is not None:
+                pipeline_result.metrics_file = metrics_file
 
-    # ----------------------------------------------------------------
-    # Prepare workspaces (parallel)
-    # ----------------------------------------------------------------
-    prepare_results: list[beacon_pgx.WorkspaceResult] = []
-    if not run:
-        log.info("==========================================")
-        log.info("Preparing workspaces  (workers=%d)", workers)
-        log.info("==========================================")
-        prepare_results = beacon_pgx.prepare_workspaces(config, all_records)
+            try:
+                report_file = beacon_pgx.write_pgx_html_report(
+                    metrics_file=metrics_file,
+                )
 
-    # ----------------------------------------------------------------
-    # Run pgx_pilot (parallel)
-    # ----------------------------------------------------------------
-    run_results: list[beacon_pgx.PgxRunResult] = []
-    if not prepare:
-        log.info("==========================================")
-        log.info("Running pgx_pilot  (workers=%d)", workers)
-        log.info("==========================================")
-        run_results = beacon_pgx.run_pgx_pilots(config, all_records)
+                log.info(
+                    "PGx HTML report written: %s",
+                    report_file,
+                )
 
-    pipeline_result = beacon_pgx.PgxPipelineResult(
-        prepare_results=prepare_results,
-        run_results=run_results,
-    )
+                if pipeline_result is not None:
+                    pipeline_result.report_file = report_file
 
-    total = len(prepare_results) + len(run_results)
-    log.info("==========================================")
-    log.info("pgx summary")
-    log.info("==========================================")
-    log.info(
-        "  Steps OK:       %d",
-        total - pipeline_result.failed - pipeline_result.warned,
-    )
-    log.info("  Steps warnings: %d", pipeline_result.warned)
-    log.info("  Steps failed:   %d", pipeline_result.failed)
+            except Exception as report_exc:  # noqa: BLE001
+                log.warning(
+                    "Could not write PGx HTML report: %s",
+                    report_exc,
+                )
 
-    if pipeline_result.failed > 0:
-        raise click.ClickException(
-            f"pgx pipeline finished with {pipeline_result.failed} failed step(s). "
-            "Check logs in <base-dir>/logs/ for details."
-        )
-
+        except Exception as metrics_exc:  # noqa: BLE001
+            log.warning(
+                "Could not write PGx metrics: %s",
+                metrics_exc,
+            )
 
 @beacon.group("ingest")
 @click.option(

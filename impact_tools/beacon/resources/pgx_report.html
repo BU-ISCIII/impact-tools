@@ -1,0 +1,30 @@
+{% extends "base_report.html" %}
+{% from "report_components.html" import header, cards, charts, details, table %}
+
+{% block content %}
+{{ header(report_title, badge) }}
+
+{{ cards(summary_cards) }}
+
+{{ charts("Beacon PGx performance", performance_charts) }}
+
+{{ details("Run details", run_details) }}
+
+{{ details("Execution environment", environment) }}
+
+{{ table("Sample results", sample_headers, sample_rows) }}
+
+<section class="panel">
+  <h2>Machine-readable artifacts</h2>
+
+  {% if artifacts %}
+    {% for artifact in artifacts %}
+    <div class="artifact">
+      <strong>{{ artifact.label }}:</strong> {{ artifact.path }}
+    </div>
+    {% endfor %}
+  {% else %}
+    <div class="card-note">No additional artifacts were generated.</div>
+  {% endif %}
+</section>
+{% endblock %}
