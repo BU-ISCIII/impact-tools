@@ -13,9 +13,12 @@ from rich.logging import RichHandler
 from rich.traceback import install as install_rich_traceback
 
 from impact_tools import __version__
+
 from impact_tools.beacon import ingest as beacon_ingest
 from impact_tools.beacon import liftover as beacon_liftover
 from impact_tools.beacon import pgx as beacon_pgx
+from impact_tools.beacon.config import build_beacon_deployment_config
+
 from impact_tools.config import (
     EXTRA_CONFIG_PATH,
     get_config_value,
@@ -1655,7 +1658,18 @@ def ingest_dataset_cmd(
     )
 
     try:
-        result = beacon_ingest.ingest_dataset(cfg)
+        deployment = (
+            None
+            if dry_run
+            else build_beacon_deployment_config(
+                ctx.obj["configuration"],
+            )
+        )
+
+        result = beacon_ingest.ingest_dataset(
+            cfg,
+            deployment=deployment,
+        )
     except Exception as exc:  # noqa: BLE001
         raise click.ClickException(str(exc)) from exc
 
@@ -1784,7 +1798,14 @@ def ingest_variants_cmd(
     )
 
     try:
-        result = beacon_ingest.apply_variants_to_remote(cfg)
+        deployment = build_beacon_deployment_config(
+            ctx.obj["configuration"],
+        )
+
+        result = beacon_ingest.apply_variants_to_remote(
+            cfg,
+            deployment,
+        )
     except Exception as exc:  # noqa: BLE001
         raise click.ClickException(str(exc)) from exc
 
@@ -1819,6 +1840,7 @@ def ingest_variants_cmd(
         try:
             deleted_backups = beacon_ingest.offer_old_variant_backups_cleanup(
                 dataset_id=dataset_id,
+                deployment=deployment,
                 older_than_days=7,
             )
         except click.Abort:

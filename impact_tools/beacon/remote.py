@@ -1,4 +1,4 @@
-"""SSH/SFTP helpers and config loading for Beacon remote VM operations."""
+"""SSH/SFTP helpers for Beacon remote VM operations."""
 
 from __future__ import annotations
 
@@ -7,202 +7,11 @@ import logging
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
+from impact_tools.beacon.config import BeaconRemoteConfig
+
 LOGGER = logging.getLogger(__name__)
 
 # DEFAULT_CONFIG_PATH = Path("~/.config/impact-tools/config.yaml")
-
-
-# ---------------------------------------------------------------------------
-# Config dataclasses (mapped from config.yaml beacon.* keys)
-# ---------------------------------------------------------------------------
-
-
-@dataclasses.dataclass
-class BeaconRemoteConfig:
-    host: str
-    user: str
-    port: int = 22
-    password: str | None = None
-    identity_file: str | None = None
-    beacon_dir: str = "/opt/beacon/beacon2-pi-api-isciii"
-    input_dir: str = "/impact_data/lega_data/beacon/inputs"
-    log_dir: str = "/var/log/local/beacon/apps/ri-tools"
-    api_url: str = "http://beaconaf-isciiiciber.isciiides.es:8443"
-    
-    datasets_conf_dir: str = "/opt/beacon/beacon2-pi-api-isciii/beacon/conf/datasets"
-    datasets_permissions_dir: str = "/opt/beacon/beacon2-pi-api-isciii/beacon/permissions/datasets"
-
-    @property
-    def ri_tools_conf_base(self) -> str:
-        """Base directory for per-dataset RI-tools conf.py on the VM.
-
-        Derives from input_dir: /path/to/beacon/inputs → /path/to/beacon/config/
-        """
-        return str(PurePosixPath(self.input_dir).parent / "config")
-
-    @property
-    def datasets_conf_yml(self) -> str:
-        """Absolute path to the global datasets_conf.yml on the VM."""
-        return f"{self.datasets_conf_dir}/datasets_conf.yml"
-
-    @property
-    def datasets_permissions_yml(self) -> str:
-        """Absolute path to the global datasets_permissions.yml on the VM."""
-        return f"{self.datasets_permissions_dir}/datasets_permissions.yml"
-
-@dataclasses.dataclass
-class BeaconContainersConfig:
-    mongo: str = "mongoprod"
-    api: str = "beaconprod"
-
-
-@dataclasses.dataclass
-class BeaconMongoConfig:
-    user: str = "root"
-    password: str = "example"
-    auth_source: str = "admin"
-    database: str = "beacon"
-    tls: bool = True
-    tls_cert: str = "/etc/mongo/certs/server.pem"
-    tls_ca: str = "/etc/mongo/certs/ca.crt"
-    tls_allow_invalid: bool = True
-
-
-@dataclasses.dataclass
-class BeaconRuntimeConfig:
-    remote_container_runtime: str = "podman"
-
-
-@dataclasses.dataclass
-class BeaconRitoolsConfig:
-    """Configuration for running beacon2-ri-tools-v2 on the Beacon VM."""
-
-    python: str = "/opt/localEGA/tools/micromamba/envs/impact-tools/bin/python"
-    db_host: str = "localhost"
-    tls_ca: str = "/opt/beacon/beacon2-pi-api-isciii/certs/ca.crt"
-    tls_cert: str = "/opt/beacon/beacon2-pi-api-isciii/certs/server.pem"
-
-
-@dataclasses.dataclass
-class BeaconDeploymentConfig:
-    """Full deployment configuration parsed from config.yaml."""
-
-    remote: BeaconRemoteConfig
-    containers: BeaconContainersConfig
-    mongo: BeaconMongoConfig
-    runtime: BeaconRuntimeConfig
-    ritools: BeaconRitoolsConfig 
-
-
-# ---------------------------------------------------------------------------
-# Config loading
-# ---------------------------------------------------------------------------
-
-
-def build_beacon_deployment_config(
-    cfg: dict | None = None,
-) -> BeaconDeploymentConfig:
-    """Build a BeaconDeploymentConfig from the impact-tools config system.
-
-    Reads configuration via impact_tools.config.load_configuration (defaults
-    + ~/.impact_tools/extra_config.json + optional explicit overrides) and
-    constructs the typed dataclasses used by the rest of remote.py.
-
-    This replaces the legacy load_beacon_deployment_config() that read a
-    standalone ~/.config/impact-tools/config.yaml.
-    """
-    from impact_tools.config import load_configuration, get_config_value
-
-    if cfg is None:
-        cfg = load_configuration()
-
-    def _g(path: str, default=None):
-        return get_config_value(cfg, f"beacon.{path}", default)
-
-    host = _g("remote.host")
-    if not host:
-        raise ValueError(
-            "beacon.remote.host is required in the impact-tools configuration."
-        )
-
-    remote = BeaconRemoteConfig(
-        host=host,
-        user=_g("remote.user", "bioinfo"),
-        port=int(_g("remote.port", 22)),
-        password=_g("remote.password"),
-        identity_file=_g("remote.identity_file"),
-        beacon_dir=_g(
-            "remote.beacon_dir",
-            "/opt/beacon/beacon2-pi-api-isciii",
-        ),
-        input_dir=_g(
-            "remote.input_dir",
-            "/impact_data/lega_data/beacon/inputs",
-        ),
-        log_dir=_g(
-            "remote.log_dir",
-            "/var/log/local/beacon/apps/ri-tools",
-        ),
-                api_url=_g(
-            "remote.api_url",
-            "http://beaconaf-isciiiciber.isciiides.es:8443",
-        ),
-        datasets_conf_dir=_g(
-            "remote.datasets_conf_dir",
-            "/opt/beacon/beacon2-pi-api-isciii/beacon/conf/datasets",
-        ),
-        datasets_permissions_dir=_g(
-            "remote.datasets_permissions_dir",
-            "/opt/beacon/beacon2-pi-api-isciii/beacon/permissions/datasets",
-        ),
-    )
-
-    containers = BeaconContainersConfig(
-        mongo=_g("containers.mongo", "mongoprod"),
-    )
-
-    mongo = BeaconMongoConfig(
-        user=_g("mongo.user", "root"),
-        password=_g("mongo.password", "example"),
-        auth_source=_g("mongo.auth_source", "admin"),
-        database=_g("mongo.database", "beacon"),
-        tls=bool(_g("mongo.tls", True)),
-        tls_cert=_g("mongo.tls_cert", "/etc/mongo/certs/server.pem"),
-        tls_ca=_g("mongo.tls_ca", "/etc/mongo/certs/ca.crt"),
-        tls_allow_invalid=bool(_g("mongo.tls_allow_invalid", True)),
-    )
-
-    runtime = BeaconRuntimeConfig(
-            remote_container_runtime=_g(
-                "runtime.remote_container_runtime",
-                "podman",
-            ),
-        )
-
-    ritools = BeaconRitoolsConfig(
-        python=_g(
-            "ritools.python",
-            "/opt/localEGA/tools/micromamba/envs/impact-tools/bin/python",
-        ),
-        db_host=_g("ritools.db_host", "localhost"),
-        tls_ca=_g(
-            "ritools.tls_ca",
-            "/opt/beacon/beacon2-pi-api-isciii/certs/ca.crt",
-        ),
-        tls_cert=_g(
-            "ritools.tls_cert",
-            "/opt/beacon/beacon2-pi-api-isciii/certs/server.pem",
-        ),
-    )
-
-    return BeaconDeploymentConfig(
-        remote=remote,
-        containers=containers,
-        mongo=mongo,
-        runtime=runtime,
-        ritools=ritools,
-    )
-
 
 # ---------------------------------------------------------------------------
 # SSH / SFTP helpers
@@ -232,7 +41,11 @@ def managed_ssh(cfg: BeaconRemoteConfig):
 
 
 def _open_ssh_client(cfg: BeaconRemoteConfig):
+    import logging as _logging
     import paramiko
+
+    # Suppress paramiko's transport-level INFO messages (Connected, Auth banner).
+    _logging.getLogger("paramiko.transport").setLevel(_logging.WARNING)
 
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -319,19 +132,6 @@ def _sftp_mkdir_parents(sftp, remote_dir: str) -> None:
 # ---------------------------------------------------------------------------
 # Beacon ingest orchestration
 # ---------------------------------------------------------------------------
-
-def upload_ritools_conf(
-    client,
-    local_conf: Path,
-    remote_cfg: BeaconRemoteConfig,
-    dataset_id: str,
-) -> str:
-    """Upload a per-dataset conf.py to <ri_tools_conf_base>/<dataset_id>/conf.py.
-    Returns the remote path where the conf was written.
-    """
-    remote_path = f"{remote_cfg.ri_tools_conf_base}/{dataset_id}/conf.py"
-    sftp_upload(client, local_conf, remote_path)
-    return remote_path
 
 def upload_metrics_file(
     client,
@@ -444,108 +244,3 @@ def restart_beacon_api(
     LOGGER.info("Waiting %ds for API to come back up...", wait_seconds)
     time.sleep(wait_seconds)
     LOGGER.info("Beacon API restart completed.")
-
-
-def verify_dataset_via_api(
-    client,
-    remote_cfg: BeaconRemoteConfig,
-    dataset_id: str,
-) -> bool:
-    """Verify that a dataset is visible via the Beacon API.
-
-    Runs `curl` from the VM against the public Beacon endpoint and checks
-    whether the dataset_id appears in the response from /api/datasets.
-
-    Returns True if the dataset is exposed by the API, False otherwise.
-    """
-    command = (
-        f"curl -s '{remote_cfg.api_url}/api/datasets"
-        f"?requestedGranularity=record&limit=1000' "
-        f"| grep -c '\"id\": \"{dataset_id}\"'"
-    )
-
-    LOGGER.info("Verifying dataset '%s' via API...", dataset_id)
-    result = exec_remote(client, command)
-
-    if result.returncode not in (0, 1):
-        raise RuntimeError(
-            f"verify_dataset_via_api failed for {dataset_id}.\n"
-            f"STDERR: {result.stderr}"
-        )
-
-    count = int(result.stdout.strip() or "0")
-    found = count > 0
-
-    if found:
-        LOGGER.info("Dataset '%s' is visible via API.", dataset_id)
-    else:
-        LOGGER.warning("Dataset '%s' is NOT visible via API.", dataset_id)
-
-    return found
-
-
-def verify_variant_count_via_api(
-    client,
-    remote_cfg: BeaconRemoteConfig,
-    dataset_id: str,
-    expected_count: int,
-) -> bool:
-    """Verify that a dataset exposes the expected number of variants via API.
-
-    Runs a Beacon genomic variants query from the VM and checks whether
-    responseSummary.numTotalResults matches the expected count.
-
-    Returns True if the API count matches, False otherwise.
-    """
-    import json
-
-    command = (
-        f"curl -s '{remote_cfg.api_url}/api/g_variants"
-        f"?datasets={dataset_id}"
-        f"&requestedGranularity=count"
-        f"&limit=0'"
-    )
-
-    LOGGER.info(
-        "Verifying variant count for dataset '%s' via API...",
-        dataset_id,
-    )
-    result = exec_remote(client, command)
-
-    if not result.ok:
-        raise RuntimeError(
-            f"verify_variant_count_via_api failed for {dataset_id}.\n"
-            f"STDERR: {result.stderr}"
-        )
-
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            "Could not parse Beacon API response as JSON.\n"
-            f"Dataset ID: {dataset_id}\n"
-            f"Response: {result.stdout[:1000]}"
-        ) from exc
-
-    observed_count = (
-        payload
-        .get("responseSummary", {})
-        .get("numTotalResults")
-    )
-
-    if observed_count != expected_count:
-        LOGGER.warning(
-            "Variant count mismatch via API for %s: observed=%s expected=%s",
-            dataset_id,
-            observed_count,
-            expected_count,
-        )
-        return False
-
-    LOGGER.info(
-        "Variant count verified via API for %s: %d variants",
-        dataset_id,
-        expected_count,
-    )
-
-    return True
