@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import shutil
+import socket
+import subprocess
 from contextlib import contextmanager
+from io import BytesIO
 from pathlib import Path, PurePosixPath
 
 from impact_tools.beacon.config import BeaconRemoteConfig
 
 LOGGER = logging.getLogger(__name__)
 
-# DEFAULT_CONFIG_PATH = Path("~/.config/impact-tools/config.yaml")
 
 # ---------------------------------------------------------------------------
 # SSH / SFTP helpers
@@ -30,9 +33,100 @@ class RemoteExecResult:
         return self.returncode == 0
 
 
+def _is_local_host(host: str) -> bool:
+    """Return True if *host* resolves to an IP address owned by this machine."""
+    if host in ("localhost", "127.0.0.1", "::1", ""):
+        return True
+    try:
+        resolved = socket.gethostbyname(host)
+    except socket.gaierror:
+        return False
+    try:
+        local_addrs = {
+            info[4][0]
+            for info in socket.getaddrinfo(socket.gethostname(), None)
+        }
+        local_addrs.add("127.0.0.1")
+    except socket.gaierror:
+        local_addrs: set[str] = set()
+    return resolved in local_addrs
+
+
+class _LocalSftpClient:
+    """SFTP-compatible client that operates on local files directly."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        pass
+
+    def open(self, path: str, mode: str = "r"):
+        return open(path, "rb" if "r" in mode else "wb")
+
+    def mkdir(self, path: str) -> None:
+        try:
+            Path(path).mkdir()
+        except FileExistsError:
+            pass
+
+    def put(self, local_path: str, remote_path: str) -> None:
+        shutil.copy2(local_path, remote_path)
+
+
+class _LocalShellClient:
+    """SSH-compatible client that runs commands locally via subprocess."""
+
+    class _Channel:
+        def __init__(self, returncode: int):
+            self._returncode = returncode
+
+        def recv_exit_status(self) -> int:
+            return self._returncode
+
+        def shutdown_write(self) -> None:
+            pass
+
+    class _Stream:
+        def __init__(self, data: bytes, channel):
+            self._buf = BytesIO(data)
+            self.channel = channel
+
+        def read(self) -> bytes:
+            return self._buf.read()
+
+        def write(self, data: bytes) -> None:
+            pass
+
+    def exec_command(self, command: str):
+        proc = subprocess.run(
+            command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        ch = self._Channel(proc.returncode)
+        return (
+            self._Stream(b"", ch),
+            self._Stream(proc.stdout, ch),
+            self._Stream(proc.stderr, ch),
+        )
+
+    def open_sftp(self) -> _LocalSftpClient:
+        return _LocalSftpClient()
+
+    def close(self) -> None:
+        pass
+
+
 @contextmanager
 def managed_ssh(cfg: BeaconRemoteConfig):
-    """Context manager that opens and closes a paramiko SSH connection."""
+    """Open an SSH connection, or fall back to local execution when on the same host."""
+    if _is_local_host(cfg.host):
+        LOGGER.info("Local exec mode: %s resolves to this machine — skipping SSH", cfg.host)
+        yield _LocalShellClient()
+        return
+
     client = _open_ssh_client(cfg)
     try:
         yield client

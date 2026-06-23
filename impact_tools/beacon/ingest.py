@@ -48,7 +48,13 @@ class DatasetIngestConfig:
     is_synthetic: bool = False
     base_dir: Path = Path(".")
     granularity: str = "record"
+    output_dir: Path | None = None
     dry_run: bool = False
+    generate_report: bool = True
+
+    @property
+    def logs_dir(self) -> Path:
+        return (self.output_dir if self.output_dir is not None else self.base_dir) / "logs"
 
 
 @dataclasses.dataclass
@@ -270,7 +276,7 @@ def write_dataset_ingest_metrics(
     error: str | None = None,
 ) -> Path:
     """Write a JSON metrics report for one dataset ingest execution."""
-    logs_dir = config.base_dir.resolve() / "logs"
+    logs_dir = config.logs_dir
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -548,19 +554,20 @@ def ingest_dataset(
 
             if result is not None:
                 result.metrics_file = metrics_file
-            try:
-                report_file = write_dataset_ingest_html_report(
-                    metrics_file=metrics_file,
-                )
-                LOGGER.info("HTML report written: %s", report_file)
+            if config.generate_report:
+                try:
+                    report_file = write_dataset_ingest_html_report(
+                        metrics_file=metrics_file,
+                    )
+                    LOGGER.info("HTML report written: %s", report_file)
 
-                if result is not None:
-                    result.report_file = report_file
+                    if result is not None:
+                        result.report_file = report_file
 
-            except Exception as report_exc:  # noqa: BLE001
-                LOGGER.warning(
-                    "Could not write dataset ingest HTML report: %s",
-                    report_exc,
+                except Exception as report_exc:  # noqa: BLE001
+                    LOGGER.warning(
+                        "Could not write dataset ingest HTML report: %s",
+                        report_exc,
                 )
 
         except Exception as metrics_exc:  # noqa: BLE001
@@ -586,14 +593,18 @@ class VariantsIngestConfig:
 
     dataset_id: str
     reference_genome: str = "GRCh38"
-    base_dir: Path = Path(".")
+    output_dir: Path | None = None
     vcf: Path | None = None
     vcf_dir: Path | None = None
     cleanup_old: bool = False
     skip_filtering_terms: bool = False
     dry_run: bool = True
     run_profile: str = "local"
-    generate_report_charts: bool = True
+    generate_report: bool = True
+
+    @property
+    def logs_dir(self) -> Path:
+        return (self.output_dir if self.output_dir is not None else Path(".")) / "logs"
 
 
 @dataclasses.dataclass
@@ -692,7 +703,7 @@ def build_variant_ingest_payload(
             "local_vcfs": result.local_vcfs,
             "vcf_files": len(result.local_vcfs),
             "reference_genome": config.reference_genome,
-            "base_dir": str(config.base_dir.resolve()),
+            "output_dir": str(config.output_dir.resolve()) if config.output_dir else None,
             "cleanup_old": config.cleanup_old,
             "skip_filtering_terms": config.skip_filtering_terms,
             "dry_run": config.dry_run,
@@ -724,7 +735,7 @@ def build_variant_ingest_artifact_paths(
     result: ApplyVariantsResult,
 ) -> tuple[Path, Path]:
     """Build standard artifact paths for one Beacon variant ingest execution."""
-    logs_dir = config.base_dir.resolve() / "logs"
+    logs_dir = config.logs_dir
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     run_token = result.staging_id.replace("/", "_").replace(":", "_")
@@ -785,7 +796,7 @@ def write_variant_ingest_html_report(
     write_variant_ingest_report(
         report_file,
         payload,
-        include_charts=config.generate_report_charts,
+        include_charts=True,
     )
 
     LOGGER.info("Beacon ingest HTML report written: %s", report_file)
@@ -809,12 +820,11 @@ def write_variant_ingest_artifacts(
     )
 
     result.manifest_file = manifest_file
-    result.report_file = report_file
+    result.report_file = report_file if config.generate_report else None
 
-    # Writers use `result.manifest_file` / `result.report_file` when
-    # building payloads, so ensure both are set before calling them.
     write_variant_ingest_manifest(config=config, result=result)
-    write_variant_ingest_html_report(config=config, result=result)
+    if config.generate_report:
+        write_variant_ingest_html_report(config=config, result=result)
 
 
 def count_vcf_variants(vcf_path: Path) -> int:

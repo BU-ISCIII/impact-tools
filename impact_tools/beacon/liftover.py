@@ -46,6 +46,12 @@ class LiftoverConfig:
     bcftools_image: str = BCFTOOLS_IMAGE
     crossmap_image: str = CROSSMAP_IMAGE
     workers: int = 4
+    output_dir: Path | None = None
+    run_profile: str = "local"
+
+    @property
+    def logs_dir(self) -> Path:
+        return (self.output_dir if self.output_dir is not None else self.base_dir) / "logs"
 
     @property
     def resources_dir(self) -> Path:
@@ -116,7 +122,7 @@ def write_liftover_metrics(
     error: str | None = None,
 ) -> Path:
     """Write a JSON metrics report for one Beacon liftover execution."""
-    logs_dir = config.base_dir.resolve() / "logs"
+    logs_dir = config.logs_dir
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")

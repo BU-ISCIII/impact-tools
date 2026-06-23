@@ -17,7 +17,8 @@ impact-tools/
 ├── impact_tools/
 │   ├── __main__.py              # CLI entry point: impact-tools
 │   ├── beacon/
-│   │   ├── liftover.py          # Beacon liftover workflow (GRCh37 -> GRCh38)
+│   │   ├── ingest.py            # Dataset and variant ingestion workflows
+│   │   ├── liftover.py          # VCF liftover workflow (GRCh37 → GRCh38)
 │   │   └── pgx.py               # pgx_pilot workspace preparation and execution
 │   └── ega/
 │       ├── encrypt.py           # Crypt4GH encryption workflow
@@ -225,6 +226,17 @@ Process samples in parallel (default 4 workers):
 impact-tools beacon liftover --base-dir /home/mmatitos/beacon_demo --workers 8
 ```
 
+Write logs and metrics to a custom directory (default: `<base-dir>/logs/`):
+
+```bash
+impact-tools beacon liftover \
+  --base-dir /home/mmatitos/beacon_demo \
+  -o /path/to/reports
+```
+
+Use `--no-report` to skip HTML report generation (metrics JSON is always written).
+Use `--force` to skip interactive confirmation prompts.
+
 ### Liftover Outputs
 
 Each liftover run writes per sample under `<base-dir>/liftover/`:
@@ -237,10 +249,10 @@ Each liftover run writes per sample under `<base-dir>/liftover/`:
 
 ### Prepare and Run pgx_pilot
 
-The command reads lifted VCFs from `liftover/`. Both single-sample and joint
-multi-sample VCFs are supported.
+The command discovers VCF inputs from `--vcf` (individual files, repeatable), `--vcf-dir` (directory) or `<base-dir>/liftover/` (default).
+Both single-sample and joint multi-sample VCFs are supported.
 
-For every lifted VCF, the workflow:
+For every VCF found, the workflow:
 
 1. Lists all contained sample identifiers with `bcftools query -l`.
 2. Associates each sample with the basename of its source VCF.
@@ -266,12 +278,30 @@ The bundled Snakefile is installed under `pgx_runs/Snakefile`. If the packaged
 Snakefile changes, the installed copy is refreshed automatically so existing
 working directories do not continue using stale workflow logic.
 
-Run the full pipeline (prepare workspaces + execute pgx_pilot):
+Run the full pipeline using liftover output (discovers VCFs from `<base-dir>/liftover/`):
 
 ```bash
 impact-tools beacon pgx \
   --base-dir /home/mmatitos/beacon_demo \
   --pgx-repo /home/mmatitos/git/beacon2/pgx_pilot
+```
+
+Run using a specific VCF directory instead of `liftover/`:
+
+```bash
+impact-tools beacon pgx \
+  --base-dir /home/mmatitos/beacon_demo \
+  --pgx-repo /home/mmatitos/git/beacon2/pgx_pilot \
+  --vcf-dir /path/to/vcfs
+```
+
+Run on specific individual files:
+
+```bash
+impact-tools beacon pgx \
+  --base-dir /home/mmatitos/beacon_demo \
+  --pgx-repo /home/mmatitos/git/beacon2/pgx_pilot \
+  --vcf /path/to/sample1.vcf.gz
 ```
 
 Only prepare workspaces and `inputs/samples.tsv` without running the pipeline:
@@ -286,7 +316,7 @@ Only run pgx_pilot on already-prepared workspaces:
 impact-tools beacon pgx \
   --base-dir /home/mmatitos/beacon_demo \
   --pgx-repo /home/mmatitos/git/beacon2/pgx_pilot \
-  --run 
+  --run
 ```
 
 Process samples in parallel (default 4 workers — applies to sex inference, workspace prep and pgx_pilot runs):
@@ -298,13 +328,17 @@ impact-tools beacon pgx \
   --workers 8
 ```
 
-The `--pgx-repo` path can also be set via the `PGX_REPO` environment variable.
+The `--pgx-repo` path can also be set via the `PGX_REPO` environment variable or
+the `beacon.pgx.repo` config key. Use `--no-report` to skip HTML report generation.
+Use `--force` to skip interactive confirmation prompts. Static pipeline resources are
+seeded into `<base-dir>/pgx_resources/` on first run and reused across samples.
 
 ### pgx_pilot Outputs
 
 | File | Content |
 | --- | --- |
 | `inputs/samples.tsv` | Global sample manifest containing sample ID, inferred sex, country code and source VCF basename. |
+| `pgx_resources/` | Shared resource cache seeded from `pgx_repo/resources/` (including downloaded reference genome). |
 | `pgx_runs/Snakefile` | Installed copy of the bundled PGx workflow, refreshed when the packaged version changes. |
 | `pgx_runs/<sample>/config.yaml` | pgx_pilot config for this sample. |
 | `pgx_runs/<sample>/data/samples.tsv` | Single-row per-sample metadata (sex, country code). |
@@ -343,9 +377,10 @@ impact-tools beacon ingest dataset \
   --no-synthetic
 ```
 
-The command writes dataset-specific working files under <base-dir>/config/,
-<base-dir>/work/ and <base-dir>/inputs/. It also writes an automatic metrics
-JSON file under <base-dir>/logs/.
+The command writes dataset-specific working files under `<base-dir>/config/`,
+`<base-dir>/work/` and `<base-dir>/inputs/`. It also writes a metrics JSON file
+under `<base-dir>/logs/` (or `<output-dir>/logs/` if `-o/--output-dir` is set).
+Use `--no-report` to skip HTML report generation.
 
 Remote Beacon deployment settings are resolved through the standard
 impact-tools configuration hierarchy: explicit CLI arguments, an
@@ -439,13 +474,14 @@ read-only MongoDB preview.
 ```text
 --cleanup-old            Delete the backup created during the current swap.
 --skip-filtering-terms   Skip the potentially slow filtering-term extraction.
---no-report-charts       Generate the HTML report without performance charts.
+--no-report              Skip HTML report generation (metrics JSON always written).
+-o, --output-dir         Write logs and metrics here instead of ./logs/.
 --run-profile            Record the execution environment as local, ws or hpc.
 ```
 
 #### Generated artifacts
 
-Each run writes its audit artifacts under `<base-dir>/logs/`:
+Each run writes its audit artifacts under `./logs/` (or `<output-dir>/logs/`):
 
 | File                                            | Content                                                                                             |
 | ----------------------------------------------- | --------------------------------------------------------------------------------------------------- |

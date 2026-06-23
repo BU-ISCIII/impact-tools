@@ -936,16 +936,33 @@ def beacon() -> None:
     help="Parallel worker threads for processing multiple samples.",
 )
 @click.option(
+    "-o",
+    "--output-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=None,
+    help="Directory for metrics and logs (default: <base-dir>/logs/).",
+)
+@click.option(
+    "--run-profile",
+    type=click.Choice(["local", "ws", "hpc"]),
+    default=None,
+    help="Execution environment label recorded in metrics.",
+)
+@click.option(
     "--check",
     "check_only",
     is_flag=True,
     help="Only check inputs and detected genome builds; do not run liftover.",
 )
 @click.option(
-    "-y",
-    "--yes",
+    "--force",
     is_flag=True,
-    help="Continue without interactive confirmation.",
+    help="Skip interactive confirmation prompts.",
+)
+@click.option(
+    "--no-report",
+    is_flag=True,
+    help="Skip HTML report generation. Metrics JSON is always written.",
 )
 @click.pass_context
 def liftover_cmd(
@@ -957,8 +974,11 @@ def liftover_cmd(
     crossmap_image: str,
     cleanup: bool,
     workers: int,
+    output_dir: Path | None,
+    run_profile: str | None,
     check_only: bool,
-    yes: bool,
+    force: bool,
+    no_report: bool,
 ) -> None:
     """Run Beacon liftover workflow (GRCh37 -> GRCh38) using CrossMap via Docker.
 
@@ -1030,7 +1050,7 @@ def liftover_cmd(
         log.info("Intermediate files found for cleanup: (%d)", len(intermediates))
         for p in intermediates:
             log.info("  %s", p.name)
-        if yes or click.confirm("Delete these intermediate files?", default=False):
+        if force or click.confirm("Delete these intermediate files?", default=False):
             beacon_liftover.cleanup_intermediates(
                 base_dir / "liftover", sample_ids
             )
@@ -1061,10 +1081,15 @@ def liftover_cmd(
         log.info("Check completed. Liftover was not executed because --check was used.")
         return
 
-    if not yes:
+    if not force:
         if not click.confirm("Continue with liftover execution?", default=False):
             log.info("Cancelled.")
             return
+
+    configuration = ctx.obj["configuration"]
+    effective_run_profile = run_profile or get_config_value(
+        configuration, "beacon.execution.profile", "local"
+    )
 
     config = beacon_liftover.LiftoverConfig(
         base_dir=base_dir,
@@ -1073,12 +1098,49 @@ def liftover_cmd(
         bcftools_image=bcftools_image,
         crossmap_image=crossmap_image,
         workers=workers,
+        output_dir=output_dir.resolve() if output_dir is not None else None,
+        run_profile=effective_run_profile,
     )
+
+    started_at = datetime.now().astimezone().isoformat()
+    started_perf = time.perf_counter()
+    status = "success"
+    error_message: str | None = None
+    result = None
 
     try:
         result = beacon_liftover.run_liftover(config)
     except Exception as exc:  # noqa: BLE001 - CLI boundary converts to clean error
+        status = "failed"
+        error_message = str(exc)
         raise click.ClickException(str(exc)) from exc
+    finally:
+        ended_at = datetime.now().astimezone().isoformat()
+        duration_seconds = time.perf_counter() - started_perf
+        try:
+            metrics_file = beacon_liftover.write_liftover_metrics(
+                config=config,
+                result=result,
+                started_at=started_at,
+                ended_at=ended_at,
+                duration_seconds=duration_seconds,
+                status=status,
+                error=error_message,
+            )
+            log.info("Liftover metrics written: %s", metrics_file)
+            if not no_report:
+                beacon_liftover.write_liftover_html_report(metrics_file=metrics_file)
+                log.info(
+                    "Liftover HTML report written: %s",
+                    metrics_file.with_name(
+                        metrics_file.name.removesuffix(".metrics.json") + ".report.html"
+                    ),
+                )
+        except Exception as metrics_exc:  # noqa: BLE001
+            log.warning("Could not write liftover metrics: %s", metrics_exc)
+
+    if result is None:
+        return
 
     log.info("==========================================")
     log.info("Liftover summary")
@@ -1090,7 +1152,7 @@ def liftover_cmd(
     if result.failed > 0:
         raise click.ClickException(
             f"Liftover finished with {result.failed} failed sample(s). "
-            "Check logs in <base-dir>/logs/ for details."
+            f"Check logs in {config.logs_dir} for details."
         )
 
     intermediates = beacon_liftover.list_intermediates(
@@ -1100,7 +1162,7 @@ def liftover_cmd(
         log.info("Intermediate files generated (%d):", len(intermediates))
         for p in intermediates:
             log.info("  %s", p.name)
-        if cleanup or yes or click.confirm("Remove intermediate files?", default=True):
+        if cleanup or force or click.confirm("Remove intermediate files?", default=True):
             beacon_liftover.cleanup_intermediates(
                 base_dir / "liftover", sample_ids
             )
@@ -1168,6 +1230,31 @@ def liftover_cmd(
     help="Parallel worker threads (sex inference, workspace prep, pgx runs).",
 )
 @click.option(
+    "--vcf",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    multiple=True,
+    help="Individual VCF file(s) to process. May be repeated. Overrides --vcf-dir and liftover/.",
+)
+@click.option(
+    "--vcf-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=None,
+    help="Directory of VCF files. Overrides the default <base-dir>/liftover/ discovery.",
+)
+@click.option(
+    "-o",
+    "--output-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=None,
+    help="Directory for metrics and logs (default: <base-dir>/logs/).",
+)
+@click.option(
+    "--run-profile",
+    type=click.Choice(["local", "ws", "hpc"]),
+    default=None,
+    help="Execution environment label recorded in metrics.",
+)
+@click.option(
     "--prepare",
     is_flag=True,
     help="Only prepare workspaces and samples.tsv; do not run pgx_pilot.",
@@ -1178,10 +1265,14 @@ def liftover_cmd(
     help="Only run pgx_pilot; skip workspace preparation (workspaces must already exist).",
 )
 @click.option(
-    "-y",
-    "--yes",
+    "--force",
     is_flag=True,
-    help="Continue without interactive confirmation.",
+    help="Skip interactive confirmation prompts.",
+)
+@click.option(
+    "--no-report",
+    is_flag=True,
+    help="Skip HTML report generation. Metrics JSON is always written.",
 )
 @click.pass_context
 def pgx_cmd(
@@ -1195,17 +1286,18 @@ def pgx_cmd(
     pgx_repo: Path | None,
     snakemake_jobs: int,
     workers: int,
+    vcf: tuple[Path, ...],
+    vcf_dir: Path | None,
+    output_dir: Path | None,
+    run_profile: str | None,
     prepare: bool,
     run: bool,
-    yes: bool,
+    force: bool,
+    no_report: bool,
 ) -> None:
     """Prepare pgx_pilot workspaces and run the AF pipeline for each WGS sample.
 
-    Reads lifted VCFs from <base-dir>/liftover/, infers sample sex from chrY
-    variant counts (ambiguous cases are asked interactively), creates one
-    workspace per sample under <base-dir>/pgx_runs/, then runs the pgx_pilot
-    Snakemake pipeline via Docker.
-
+    VCF inputs are resolved from --vcf-dir or <base-dir>/liftover/ (default).
     Use --prepare to stop after workspace creation, or --run to skip
     preparation and go straight to execution.
     """
@@ -1244,6 +1336,10 @@ def pgx_cmd(
     if pgx_repo is not None:
         pgx_repo = pgx_repo.resolve()
 
+    effective_run_profile = run_profile or get_config_value(
+        configuration, "beacon.execution.profile", "local"
+    )
+
     config = beacon_pgx.PgxConfig(
         base_dir=base_dir,
         country_code=country_code,
@@ -1254,17 +1350,21 @@ def pgx_cmd(
         pgx_repo=pgx_repo,
         snakemake_jobs=snakemake_jobs,
         workers=workers,
+        vcf=tuple(p.resolve() for p in vcf),
+        vcf_dir=vcf_dir.resolve() if vcf_dir is not None else None,
+        output_dir=output_dir.resolve() if output_dir is not None else None,
+        run_profile=effective_run_profile,
     )
 
-    try:
-        beacon_pgx.validate_pgx_layout(config)
+    beacon_pgx.validate_pgx_layout(config)
 
+    try:
         if not prepare:
             beacon_pgx.install_snakefile(config)
             beacon_pgx.validate_pgx_run_prereqs(config)
 
         # ------------------------------------------------------------
-        # Discover lifted VCFs and existing sample metadata
+        # Discover VCFs and existing sample metadata
         # ------------------------------------------------------------
 
         discovered_sources = beacon_pgx.discover_lifted_samples(
@@ -1453,11 +1553,29 @@ def pgx_cmd(
             pipeline_result.failed,
         )
 
+        pass_files = [
+            r.output_pass
+            for r in run_results
+            if r.output_pass is not None and r.output_pass.exists()
+        ]
+
+        if pass_files:
+            log.info("==========================================")
+            log.info("Output files (sites.pass — ingestion-ready)")
+            log.info("==========================================")
+            for f in pass_files:
+                log.info("  %s  (%s)", f, beacon_pgx._fmt_size(f))
+            log.info("--")
+            log.info(
+                "  Tip: copy the .sites.pass.vcf.gz files above to a dedicated"
+                " directory before running `beacon ingest variants --vcf-dir <dir>`"
+            )
+
         if pipeline_result.failed > 0:
             raise click.ClickException(
                 "pgx pipeline finished with "
                 f"{pipeline_result.failed} failed step(s). "
-                "Check logs in <base-dir>/logs/ for details."
+                f"Check logs in {config.logs_dir} for details."
             )
 
     except Exception as exc:
@@ -1501,24 +1619,25 @@ def pgx_cmd(
             if pipeline_result is not None:
                 pipeline_result.metrics_file = metrics_file
 
-            try:
-                report_file = beacon_pgx.write_pgx_html_report(
-                    metrics_file=metrics_file,
-                )
+            if not no_report:
+                try:
+                    report_file = beacon_pgx.write_pgx_html_report(
+                        metrics_file=metrics_file,
+                    )
 
-                log.info(
-                    "PGx HTML report written: %s",
-                    report_file,
-                )
+                    log.info(
+                        "PGx HTML report written: %s",
+                        report_file,
+                    )
 
-                if pipeline_result is not None:
-                    pipeline_result.report_file = report_file
+                    if pipeline_result is not None:
+                        pipeline_result.report_file = report_file
 
-            except Exception as report_exc:  # noqa: BLE001
-                log.warning(
-                    "Could not write PGx HTML report: %s",
-                    report_exc,
-                )
+                except Exception as report_exc:  # noqa: BLE001
+                    log.warning(
+                        "Could not write PGx HTML report: %s",
+                        report_exc,
+                    )
 
         except Exception as metrics_exc:  # noqa: BLE001
             log.warning(
@@ -1591,11 +1710,22 @@ def beacon_ingest_group(
     help="Default public entry type granularity.",
 )
 @click.option(
+    "-o",
+    "--output-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=None,
+    help="Directory for metrics and logs (default: <base-dir>/logs/).",
+)
+@click.option(
     "--dry-run",
     is_flag=True,
     help="Discover artifacts without writing files.",
 )
-
+@click.option(
+    "--no-report",
+    is_flag=True,
+    help="Skip HTML report generation. Metrics JSON is always written.",
+)
 @click.pass_context
 def ingest_dataset_cmd(
     ctx: click.Context,
@@ -1607,7 +1737,9 @@ def ingest_dataset_cmd(
     synthetic: bool | None,
     base_dir: Path,
     granularity: str,
+    output_dir: Path | None,
     dry_run: bool,
+    no_report: bool,
 ) -> None:
     """Prepare Beacon dataset registration artifacts."""
     configure_module_logging(ctx, "beacon_ingest_dataset")
@@ -1654,7 +1786,9 @@ def ingest_dataset_cmd(
         is_synthetic=synthetic,
         base_dir=base_dir,
         granularity=granularity,
+        output_dir=output_dir.resolve() if output_dir is not None else None,
         dry_run=dry_run,
+        generate_report=not no_report,
     )
 
     try:
@@ -1723,12 +1857,11 @@ def ingest_dataset_cmd(
     help="Reference genome used by the VCF.",
 )
 @click.option(
-    "-b",
-    "--base-dir",
+    "-o",
+    "--output-dir",
     type=click.Path(path_type=Path, file_okay=False),
-    default=Path("."),
-    show_default="current working directory",
-    help="Base Beacon operational directory for staging artifacts and logs.",
+    default=None,
+    help="Directory for metrics and logs (default: current directory/logs/).",
 )
 @click.option(
     "--cleanup-old",
@@ -1747,9 +1880,9 @@ def ingest_dataset_cmd(
     ),
 )
 @click.option(
-    "--no-report-charts",
+    "--no-report",
     is_flag=True,
-    help="Generate the HTML report without performance charts.",
+    help="Skip HTML report generation. Metrics JSON is always written.",
 )
 @click.option(
     "--dry-run",
@@ -1766,35 +1899,33 @@ def ingest_variants_cmd(
     vcf: Path | None,
     vcf_dir: Path | None,
     reference_genome: str,
-    base_dir: Path,
+    output_dir: Path | None,
     cleanup_old: bool,
     skip_filtering_terms: bool,
-    no_report_charts: bool,
+    no_report: bool,
     dry_run: bool,
 ) -> None:
     """Ingest variants into an existing Beacon dataset (stage→swap→cleanup)."""
     configure_module_logging(ctx, "beacon_ingest_variants")
 
-    base_dir = base_dir.resolve()
-
-    if (vcf is None) == (vcf_dir is None):
+    if vcf is None and vcf_dir is None:
         raise click.UsageError(
-            "Provide exactly one of --vcf or --vcf-dir."
+            "Provide --vcf (single file) or --vcf-dir (directory)."
         )
 
     run_profile = ctx.obj["beacon_ingest_run_profile"]
 
     cfg = beacon_ingest.VariantsIngestConfig(
         dataset_id=dataset_id,
-        vcf=vcf,
-        vcf_dir=vcf_dir,
+        vcf=vcf.resolve() if vcf is not None else None,
+        vcf_dir=vcf_dir.resolve() if vcf_dir is not None else None,
         reference_genome=reference_genome,
-        base_dir=base_dir,
+        output_dir=output_dir.resolve() if output_dir is not None else None,
         cleanup_old=cleanup_old,
         skip_filtering_terms=skip_filtering_terms,
         dry_run=dry_run,
         run_profile=run_profile,
-        generate_report_charts=not no_report_charts,
+        generate_report=not no_report,
     )
 
     try:

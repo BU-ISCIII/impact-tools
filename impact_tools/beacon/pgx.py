@@ -24,7 +24,7 @@ log = logging.getLogger(__name__)
 Sex = Literal["M", "F"]
 
 PGX_IMAGE = "goe/pgx-pipeline:latest"
-BCFTOOLS_IMAGE = "staphb/bcftools:1.21"
+BCFTOOLS_IMAGE = "docker.io/staphb/bcftools:1.21"
 DEFAULT_SEX_AMBIGUOUS_MIN = 5000
 DEFAULT_SEX_AMBIGUOUS_MAX = 7000
 
@@ -96,10 +96,35 @@ class PgxConfig:
     pgx_repo: Path | None = None
     snakemake_jobs: int = 8
     workers: int = 4
+    vcf: tuple[Path, ...] = ()
+    vcf_dir: Path | None = None
+    output_dir: Path | None = None
+    run_profile: str = "local"
 
     @property
     def liftover_dir(self) -> Path:
         return self.base_dir / "liftover"
+
+    @property
+    def logs_dir(self) -> Path:
+        return (self.output_dir if self.output_dir is not None else self.base_dir) / "logs"
+
+    @property
+    def pgx_resources_dir(self) -> Path:
+        return self.base_dir / "pgx_resources"
+
+    def resolve_vcf(self, vcf_basename: str) -> Path:
+        """Return the full path for a VCF given its basename.
+
+        Resolution order: --vcf → --vcf-dir → liftover dir.
+        """
+        if self.vcf:
+            for p in self.vcf:
+                if p.name == vcf_basename:
+                    return p
+        if self.vcf_dir is not None:
+            return self.vcf_dir / vcf_basename
+        return self.liftover_dir / vcf_basename
 
     @property
     def pgx_runs_dir(self) -> Path:
@@ -205,7 +230,7 @@ def write_pgx_metrics(
     error: str | None = None,
 ) -> Path:
     """Write a JSON metrics report for one Beacon PGx execution."""
-    logs_dir = config.base_dir.resolve() / "logs"
+    logs_dir = config.logs_dir
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -479,7 +504,25 @@ def write_pgx_html_report(
 
 def discover_lifted_vcfs(base_dir: Path) -> list[Path]:
     """Return sorted list of *.GRCh38.clean.vcf.gz under <base_dir>/liftover/."""
-    return sorted((base_dir / "liftover").glob("*.GRCh38.clean.vcf.gz"))
+    liftover_dir = base_dir / "liftover"
+    if not liftover_dir.exists():
+        return []
+    return sorted(liftover_dir.glob("*.GRCh38.clean.vcf.gz"))
+
+
+def _discover_vcfs_from_config(config: PgxConfig) -> list[Path]:
+    """Resolve VCF inputs. Priority: --vcf > --vcf-dir > liftover/."""
+    if config.vcf:
+        return sorted(config.vcf)
+    if config.vcf_dir is not None:
+        d = config.vcf_dir
+        if not d.exists():
+            return []
+        return sorted(
+            p for p in d.iterdir()
+            if p.is_file() and (p.suffix == ".vcf" or p.name.endswith(".vcf.gz"))
+        )
+    return discover_lifted_vcfs(config.base_dir)
 
 
 def _docker_data_path(config: PgxConfig, path: Path) -> str:
@@ -527,12 +570,20 @@ def list_vcf_samples(config: PgxConfig, vcf: Path) -> list[str]:
 
 
 def discover_lifted_samples(config: PgxConfig) -> list[SampleSource]:
-    """Expand lifted VCF files into one SampleSource per contained sample."""
-    vcfs = discover_lifted_vcfs(config.base_dir)
+    """Expand VCF files into one SampleSource per contained sample.
+
+    Sources are resolved from --vcf, --vcf-dir, or liftover dir (in that order).
+    """
+    vcfs = _discover_vcfs_from_config(config)
 
     if not vcfs:
+        if config.vcf:
+            raise ValueError(f"No VCF files resolved from the --vcf arguments provided.")
+        if config.vcf_dir is not None:
+            raise ValueError(f"No VCF files found in --vcf-dir: {config.vcf_dir}")
         raise ValueError(
-            f"No *.GRCh38.clean.vcf.gz files found in {config.liftover_dir}"
+            f"No *.GRCh38.clean.vcf.gz files found in {config.liftover_dir}. "
+            "Pass --vcf or --vcf-dir to specify VCF inputs explicitly."
         )
 
     sources: list[SampleSource] = []
@@ -624,7 +675,7 @@ def count_chry_variants(
     source: SampleSource,
 ) -> SexInferenceResult | None:
     """Count non-reference chrY genotypes for one selected sample."""
-    vcf = config.liftover_dir / source.vcf_basename
+    vcf = config.resolve_vcf(source.vcf_basename)
     docker_vcf = _docker_data_path(config, vcf)
 
     script = r"""
@@ -736,15 +787,47 @@ def infer_sex_batch(
 
 
 # ---------------------------------------------------------------------------
+# Resources cache
+# ---------------------------------------------------------------------------
+
+def ensure_pgx_resources_dir(config: PgxConfig) -> Path:
+    """Return a writable resources cache dir, seeding it from pgx_repo/resources/.
+
+    Creates base_dir/pgx_resources/ if it doesn't exist and copies any files
+    from pgx_repo/resources/ that are not already present (skips existing files
+    so cached downloads are preserved).
+    """
+    cache = config.pgx_resources_dir
+    cache.mkdir(parents=True, exist_ok=True)
+
+    if config.pgx_repo is not None:
+        src = config.pgx_repo / "resources"
+        if src.is_dir():
+            for item in src.iterdir():
+                dest = cache / item.name
+                if not dest.exists():
+                    if item.is_file():
+                        shutil.copy2(item, dest)
+                    elif item.is_dir():
+                        shutil.copytree(item, dest)
+
+    return cache
+
+
+# ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
 
 def validate_pgx_layout(config: PgxConfig) -> None:
-    """Check that the liftover output directory exists."""
+    """Warn if liftover dir is absent and no explicit VCF inputs were provided."""
+    if config.vcf or config.vcf_dir is not None:
+        return
     if not config.liftover_dir.exists():
-        raise ValueError(
-            f"Liftover directory not found: {config.liftover_dir}\n"
-            "Run `impact-tools beacon liftover` first."
+        log.warning(
+            "Liftover directory not found: %s. "
+            "Pass --vcf <file> or --vcf-dir <dir> to specify VCF inputs explicitly, "
+            "or run `impact-tools beacon liftover` first.",
+            config.liftover_dir,
         )
 
 
@@ -833,7 +916,7 @@ def prepare_workspace(
             error="Source VCF basename is missing.",
         )
 
-    vcf_src = (config.liftover_dir / record.vcf_basename).resolve()
+    vcf_src = config.resolve_vcf(record.vcf_basename).resolve()
     tbi_src = Path(f"{vcf_src}.tbi")
 
     if not vcf_src.is_file():
@@ -931,11 +1014,8 @@ def prepare_workspace(
 def run_pgx_pilot(config: PgxConfig, record: SampleRecord) -> PgxRunResult:
     """Run the pgx_pilot Snakemake pipeline for one sample via Docker."""
     ws = config.pgx_runs_dir / record.sample_id
-    vcf_in = (
-        config.liftover_dir / record.vcf_basename
-        if record.vcf_basename
-        else config.liftover_dir
-        / f"{record.sample_id}.GRCh38.clean.vcf.gz"
+    vcf_in = config.resolve_vcf(
+        record.vcf_basename or f"{record.sample_id}.GRCh38.clean.vcf.gz"
     )
     out_all = ws / "results" / f"{record.sample_id}.sites.all.vcf.gz"
     out_pass = ws / "results" / f"{record.sample_id}.sites.pass.vcf.gz"
@@ -963,13 +1043,15 @@ def run_pgx_pilot(config: PgxConfig, record: SampleRecord) -> PgxRunResult:
                 )
     (ws / "results").mkdir(exist_ok=True)
 
+    resources_cache = ensure_pgx_resources_dir(config)
+
     cmd = [
         "docker", "run", "--rm",
-        "-v", f"{ws}:/pipeline",
-        "-v", f"{vcf_in.parent}:{vcf_in.parent}:ro",
-        "-v", f"{config.snakefile}:/pipeline/Snakefile:ro",
-        "-v", f"{config.pgx_repo}/scripts:/pipeline/scripts:ro",
-        "-v", f"{config.pgx_repo}/resources:/pipeline/resources:ro",
+        "-v", f"{ws}:/pipeline:z",
+        "-v", f"{vcf_in.parent}:{vcf_in.parent}:ro,z",
+        "-v", f"{config.snakefile}:/pipeline/Snakefile:ro,z",
+        "-v", f"{config.pgx_repo}/scripts:/pipeline/scripts:ro,z",
+        "-v", f"{resources_cache}:/pipeline/resources:z",
         "-w", "/pipeline",
         config.pgx_image,
         "snakemake", "-s", "Snakefile",
