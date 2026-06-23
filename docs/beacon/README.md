@@ -66,7 +66,7 @@ pip install -e .
 
 ### Configuration
 
-Beacon configuration lives under the `beacon` key in `impact_tools/conf/configuration.json` (or the user-level override at `~/.config/impact-tools/config.yaml`). The relevant sections are:
+Beacon configuration lives under the `beacon` key in `~/.impact_tools/extra_config.json` or `.yaml` (user-level override). Defaults are shipped in `impact_tools/conf/configuration.json`. The relevant sections are:
 
 ```json
 {

@@ -200,14 +200,14 @@ Run liftover from a specific working directory:
 
 ```bash
 impact-tools beacon liftover \
-  --base-dir /home/mmatitos/beacon_demo
+  --base-dir /path/to/beacon
 ```
 
 Remove intermediate files after a successful run:
 
 ```bash
 impact-tools beacon liftover \
-  --base-dir /home/mmatitos/beacon_demo \
+  --base-dir /path/to/beacon \
   --cleanup
 ```
 
@@ -223,14 +223,14 @@ impact-tools beacon liftover \
 Process samples in parallel (default 4 workers):
 
 ```bash
-impact-tools beacon liftover --base-dir /home/mmatitos/beacon_demo --workers 8
+impact-tools beacon liftover --base-dir /path/to/beacon --workers 8
 ```
 
 Write logs and metrics to a custom directory (default: `<base-dir>/logs/`):
 
 ```bash
 impact-tools beacon liftover \
-  --base-dir /home/mmatitos/beacon_demo \
+  --base-dir /path/to/beacon \
   -o /path/to/reports
 ```
 
@@ -282,16 +282,16 @@ Run the full pipeline using liftover output (discovers VCFs from `<base-dir>/lif
 
 ```bash
 impact-tools beacon pgx \
-  --base-dir /home/mmatitos/beacon_demo \
-  --pgx-repo /home/mmatitos/git/beacon2/pgx_pilot
+  --base-dir /path/to/beacon \
+  --pgx-repo /path/to/pgx_pilot
 ```
 
 Run using a specific VCF directory instead of `liftover/`:
 
 ```bash
 impact-tools beacon pgx \
-  --base-dir /home/mmatitos/beacon_demo \
-  --pgx-repo /home/mmatitos/git/beacon2/pgx_pilot \
+  --base-dir /path/to/beacon \
+  --pgx-repo /path/to/pgx_pilot \
   --vcf-dir /path/to/vcfs
 ```
 
@@ -299,23 +299,23 @@ Run on specific individual files:
 
 ```bash
 impact-tools beacon pgx \
-  --base-dir /home/mmatitos/beacon_demo \
-  --pgx-repo /home/mmatitos/git/beacon2/pgx_pilot \
+  --base-dir /path/to/beacon \
+  --pgx-repo /path/to/pgx_pilot \
   --vcf /path/to/sample1.vcf.gz
 ```
 
 Only prepare workspaces and `inputs/samples.tsv` without running the pipeline:
 
 ```bash
-impact-tools beacon pgx --base-dir /home/mmatitos/beacon_demo --prepare
+impact-tools beacon pgx --base-dir /path/to/beacon --prepare
 ```
 
 Only run pgx_pilot on already-prepared workspaces:
 
 ```bash
 impact-tools beacon pgx \
-  --base-dir /home/mmatitos/beacon_demo \
-  --pgx-repo /home/mmatitos/git/beacon2/pgx_pilot \
+  --base-dir /path/to/beacon \
+  --pgx-repo /path/to/pgx_pilot \
   --run
 ```
 
@@ -323,8 +323,8 @@ Process samples in parallel (default 4 workers — applies to sex inference, wor
 
 ```bash
 impact-tools beacon pgx \
-  --base-dir /home/mmatitos/beacon_demo \
-  --pgx-repo /home/mmatitos/git/beacon2/pgx_pilot \
+  --base-dir /path/to/beacon \
+  --pgx-repo /path/to/pgx_pilot \
   --workers 8
 ```
 
