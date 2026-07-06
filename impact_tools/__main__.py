@@ -1440,481 +1440,337 @@ def liftover_cmd(
 
 @beacon.command("pgx")
 @click.option(
-    "-b",
-    "--base-dir",
-    type=click.Path(path_type=Path, file_okay=False, exists=True),
-    default=Path("."),
-    show_default="current working directory",
-    help="Base working directory. Defaults to the current directory.",
-)
-@click.option(
-    "--country-code",
-    default="ES",
-    show_default=True,
-    help="ISO 3166-1 alpha-2 country code written into each workspace samples.tsv.",
-)
-@click.option(
-    "--sex-ambiguous-min",
-    default=beacon_pgx.DEFAULT_SEX_AMBIGUOUS_MIN,
-    show_default=True,
-    help="Lower bound of the ambiguous sex zone (manual input required).",
-)
-@click.option(
-    "--sex-ambiguous-max",
-    default=beacon_pgx.DEFAULT_SEX_AMBIGUOUS_MAX,
-    show_default=True,
-    help="Upper bound of the ambiguous sex zone (manual input required).",
-)
-@click.option(
-    "--bcftools-image",
-    default=beacon_pgx.BCFTOOLS_IMAGE,
-    show_default=True,
-    help="Docker image for bcftools (used for chrY sex inference).",
-)
-@click.option(
-    "--pgx-image",
-    default=beacon_pgx.PGX_IMAGE,
-    show_default=True,
-    help="Docker image for pgx_pilot.",
-)
-@click.option(
-    "--pgx-repo",
-    type=click.Path(path_type=Path, file_okay=False),
-    envvar="PGX_REPO",
+    "--release-id", "release_id",
+    default=None,
     help=(
-        "Path to the pgx_pilot repository. "
-        "scripts/ and resources/ are mounted read-only into each run container. "
-        "Can also be set via the PGX_REPO environment variable."
+        "Release identifier (alphanumeric, _ and -, max 63 chars). "
+        "Auto-derived from --samples-tsv filename if omitted."
     ),
 )
 @click.option(
-    "--snakemake-jobs",
-    default=8,
-    show_default=True,
-    help="Parallel jobs passed to Snakemake (-j).",
-)
-@click.option(
-    "-w",
-    "--workers",
-    default=4,
-    show_default=True,
-    help="Parallel worker threads (sex inference, workspace prep, pgx runs).",
-)
-@click.option(
-    "--vcf",
+    "--samples-tsv",
     type=click.Path(path_type=Path, exists=True, dir_okay=False),
-    multiple=True,
-    help="Individual VCF file(s) to process. May be repeated. Overrides --vcf-dir and liftover/.",
+    required=True,
+    help="Tab-separated sample metadata: sample_id, sex, country_code[, batch_id[, ancestry_group]].",
 )
 @click.option(
-    "--vcf-dir",
+    "--gvcf-dir",
     type=click.Path(path_type=Path, file_okay=False),
     default=None,
-    help="Directory of VCF files. Overrides the default <base-dir>/liftover/ discovery.",
+    help="Directory to search recursively for *.hard-filtered.gvcf.gz files (DRAGEN output).",
 )
 @click.option(
-    "-o",
-    "--output-dir",
-    type=click.Path(path_type=Path, file_okay=False),
+    "--gvcf-list",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
     default=None,
-    help="Directory for metrics and logs (default: <base-dir>/logs/).",
+    help="File listing sample_id<TAB>gvcf_path entries (one per line).",
 )
 @click.option(
-    "--run-profile",
-    type=click.Choice(["local", "ws", "hpc"]),
+    "--executor",
+    type=click.Choice(["local", "hpc"]),
     default=None,
-    help="Execution environment label recorded in metrics.",
+    help=(
+        "Execution backend. 'local' runs with Docker; "
+        "'hpc' generates an sbatch script for SLURM using Singularity. "
+        "Defaults to beacon.pgx.executor in config, or 'local'."
+    ),
 )
 @click.option(
     "--prepare",
     is_flag=True,
-    help="Only prepare workspaces and samples.tsv; do not run pgx_pilot.",
+    help="Prepare the workspace and generate the launcher script; do not execute or submit.",
 )
 @click.option(
-    "--run",
+    "--dry-run",
     is_flag=True,
-    help="Only run pgx_pilot; skip workspace preparation (workspaces must already exist).",
+    help="Validate inputs and print the plan without writing any files.",
 )
 @click.option(
     "--force",
     is_flag=True,
-    help="Skip interactive confirmation prompts.",
+    help="Remove existing workspace and start fresh.",
+)
+@click.option(
+    "--pypgx",
+    is_flag=True,
+    help=(
+        "Enable the optional PyPGx sub-workflow. "
+        "Disabled by default until its offline resources are configured."
+    ),
+)
+@click.option(
+    "--output-dir", "-o",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=None,
+    help="Root output directory (pgx_runs/ is created inside). Overrides beacon.pgx.output_dir in config.",
+)
+@click.option(
+    "--ref-fasta", "ref_fasta",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help=(
+        "Reference genome FASTA. Required, but may instead be set via "
+        "beacon.pgx.ref_fasta in config."
+    ),
+)
+@click.option(
+    "--pgx-image", "pgx_image",
+    default=None,
+    help=(
+        "pgx_pilot container image: a .sif path for --executor hpc, or a Docker "
+        "image reference for --executor local. Required, but may instead be set "
+        "via beacon.pgx.pgx_image in config."
+    ),
 )
 @click.option(
     "--no-report",
     is_flag=True,
     help="Skip HTML report generation. Metrics JSON is always written.",
 )
+@click.option(
+    "--cleanup",
+    is_flag=True,
+    help=(
+        "Remove the results/temp scratch intermediates after a successful run. "
+        "Prompts for confirmation unless --force is given."
+    ),
+)
 @click.pass_context
 def pgx_cmd(
     ctx: click.Context,
-    base_dir: Path,
-    country_code: str,
-    sex_ambiguous_min: int,
-    sex_ambiguous_max: int,
-    bcftools_image: str,
-    pgx_image: str,
-    pgx_repo: Path | None,
-    snakemake_jobs: int,
-    workers: int,
-    vcf: tuple[Path, ...],
-    vcf_dir: Path | None,
+    release_id: str | None,
+    samples_tsv: Path,
+    gvcf_dir: Path | None,
+    gvcf_list: Path | None,
+    executor: str | None,
     output_dir: Path | None,
-    run_profile: str | None,
+    ref_fasta: Path | None,
+    pgx_image: str | None,
     prepare: bool,
-    run: bool,
+    dry_run: bool,
     force: bool,
+    pypgx: bool,
     no_report: bool,
+    cleanup: bool,
 ) -> None:
-    """Prepare pgx_pilot workspaces and run the AF pipeline for each WGS sample.
+    """Run the pgx_pilot AF/QC pipeline for a DRAGEN gVCF batch.
 
-    VCF inputs are resolved from --vcf-dir or <base-dir>/liftover/ (default).
-    Use --prepare to stop after workspace creation, or --run to skip
-    preparation and go straight to execution.
+    ref_fasta, output_dir and pgx_image are required: pass them via
+    --ref-fasta / --output-dir / --pgx-image, or set them under the beacon.pgx
+    namespace in ~/.impact_tools/extra_config.json. Remaining infrastructure
+    (glnexus_image, slurm settings, ...) is read from config. See the README
+    for the full config schema.
     """
-
     configure_module_logging(ctx, "beacon_pgx")
 
-    if prepare and run:
-        raise click.UsageError(
-            "--prepare and --run are mutually exclusive."
+    # Exactly one gVCF input source is required (Click cannot express XOR).
+    if gvcf_dir is None and gvcf_list is None:
+        raise click.UsageError("One of --gvcf-dir or --gvcf-list is required.")
+    if gvcf_dir is not None and gvcf_list is not None:
+        raise click.UsageError("--gvcf-dir and --gvcf-list are mutually exclusive.")
+
+    # --cleanup bakes a `rm -rf results/temp` into the generated script. Confirm
+    # interactively (default No) unless --force is given. Skip in dry-run, which
+    # writes no script.
+    cleanup_temp = False
+    if cleanup and not dry_run:
+        cleanup_temp = force or click.confirm(
+            "Remove intermediate files (results/temp) after a successful run?",
+            default=False,
         )
+
+    resolved_samples_tsv = samples_tsv.resolve()
+    if not release_id:
+        release_id = beacon_pgx._derive_batch_id(resolved_samples_tsv)
+        log.info("release_id auto-derived: %s", release_id)
+
+    configuration = ctx.obj["configuration"]
+
+    # ── Read infrastructure from persistent config ────────────────────────────
+    pgx_conf = get_config_value(configuration, "beacon.pgx", {}) or {}
+
+    def _pgx_path(key: str) -> Path | None:
+        v = pgx_conf.get(key) or get_config_value(configuration, f"beacon.pgx.{key}", None)
+        return Path(v).expanduser().resolve() if v else None
+
+    ref_fasta = (
+        ref_fasta.expanduser().resolve() if ref_fasta is not None else _pgx_path("ref_fasta")
+    )
+    output_dir = (
+        output_dir.expanduser().resolve() if output_dir is not None else _pgx_path("output_dir")
+    )
+    pgx_image_raw = (
+        pgx_image
+        or pgx_conf.get("pgx_image")
+        or get_config_value(configuration, "beacon.pgx.pgx_image", None)
+    )
+    glnexus_image_raw = pgx_conf.get("glnexus_image") or get_config_value(
+        configuration, "beacon.pgx.glnexus_image", None
+    )
+    resolved_executor: str = (
+        executor
+        or pgx_conf.get("executor")
+        or get_config_value(configuration, "beacon.pgx.executor", "local")
+    )
+    pgx_image: Path | None = (
+        Path(pgx_image_raw).expanduser().resolve()
+        if pgx_image_raw is not None and resolved_executor == "hpc"
+        else Path(pgx_image_raw)
+        if pgx_image_raw is not None
+        else None
+    )
+    glnexus_image: Path | None = (
+        Path(glnexus_image_raw).expanduser().resolve()
+        if glnexus_image_raw is not None and resolved_executor == "hpc"
+        else Path(glnexus_image_raw)
+        if glnexus_image_raw is not None
+        else None
+    )
+    glnexus_config: str = (
+        pgx_conf.get("glnexus_config")
+        or get_config_value(configuration, "beacon.pgx.glnexus_config", "gatk")
+    )
+    snakemake_jobs: int = int(
+        pgx_conf.get("snakemake_jobs")
+        or get_config_value(configuration, "beacon.pgx.snakemake_jobs", 8)
+    )
+    pypgx_snakefile_raw = pgx_conf.get("pypgx_snakefile") or get_config_value(
+        configuration, "beacon.pgx.pypgx_snakefile", None
+    )
+    pypgx_snakefile: Path | None = (
+        Path(pypgx_snakefile_raw).expanduser().resolve() if pypgx_snakefile_raw else None
+    )
+
+    # Validate required values early with clear guidance. Each may be supplied
+    # either via its CLI flag or under the beacon.pgx config namespace.
+    missing: list[str] = []
+    if ref_fasta is None:
+        missing.append("--ref-fasta / beacon.pgx.ref_fasta")
+    if output_dir is None:
+        missing.append("--output-dir / beacon.pgx.output_dir")
+    if pgx_image is None:
+        missing.append("--pgx-image / beacon.pgx.pgx_image")
+    if missing:
+        raise click.UsageError(
+            "Required values are missing. Pass them on the command line, or add "
+            "them to your extra_config.json under the beacon.pgx namespace:\n"
+            + "\n".join(f"  {k}" for k in missing)
+        )
+    assert ref_fasta is not None and output_dir is not None and pgx_image is not None
+
+    slurm_conf = pgx_conf.get("slurm") or get_config_value(configuration, "beacon.pgx.slurm", {}) or {}
+    slurm = beacon_pgx.SlurmConfig(
+        time_limit=slurm_conf.get("time_limit", "24:00:00"),
+        memory=slurm_conf.get("memory", "32G"),
+        cpus=slurm_conf.get("cpus", 8),
+        job_name=slurm_conf.get("job_name", f"pgx_{release_id}"),
+        extra_args=tuple(slurm_conf.get("extra_args", [])),
+    )
+
+    config = beacon_pgx.PgxPipelineConfig(
+        release_id=release_id,
+        output_dir=output_dir,
+        ref_fasta=ref_fasta,
+        pgx_image=pgx_image,
+        gvcf_dir=gvcf_dir.resolve() if gvcf_dir else None,
+        gvcf_list=gvcf_list.resolve() if gvcf_list else None,
+        samples_tsv=resolved_samples_tsv,
+        executor=resolved_executor,  # type: ignore[arg-type]
+        slurm=slurm,
+        snakemake_jobs=snakemake_jobs,
+        no_pypgx=not pypgx,
+        no_report=no_report,
+        prepare=prepare,
+        dry_run=dry_run,
+        force=force,
+        cleanup_temp=cleanup_temp,
+        pypgx_snakefile=pypgx_snakefile,
+        glnexus_image=glnexus_image,
+        glnexus_config=glnexus_config,
+    )
 
     started_at = datetime.now().astimezone().isoformat()
     started_perf = time.perf_counter()
-
-    status = "success"
+    status: beacon_pgx.BatchStatus = "planned"
     error_message: str | None = None
+    batch: beacon_pgx.PgxBatch | None = None
+    execution_script_path: Path | None = None
+    plan_warnings: list[str] = []
 
-    discovered_sources: list[beacon_pgx.SampleSource] = []
-    existing: list[beacon_pgx.SampleRecord] = []
-    new_records: list[beacon_pgx.SampleRecord] = []
-    inferences: list[
-        beacon_pgx.SexInferenceResult | None
-    ] = []
-    prepare_results: list[beacon_pgx.WorkspaceResult] = []
-    run_results: list[beacon_pgx.PgxRunResult] = []
-    pipeline_result: beacon_pgx.PgxPipelineResult | None = None
-
-    base_dir = base_dir.resolve()
-    configuration = ctx.obj["configuration"]
-
-    pgx_repo = pgx_repo or _configured_path(
-        configuration,
-        "beacon.pgx.repo",
-    )
-
-    if pgx_repo is not None:
-        pgx_repo = pgx_repo.resolve()
-
-    effective_run_profile = run_profile or get_config_value(
-        configuration, "beacon.execution.profile", "local"
-    )
-
-    config = beacon_pgx.PgxConfig(
-        base_dir=base_dir,
-        country_code=country_code,
-        sex_ambiguous_min=sex_ambiguous_min,
-        sex_ambiguous_max=sex_ambiguous_max,
-        bcftools_image=bcftools_image,
-        pgx_image=pgx_image,
-        pgx_repo=pgx_repo,
-        snakemake_jobs=snakemake_jobs,
-        workers=workers,
-        vcf=tuple(p.resolve() for p in vcf),
-        vcf_dir=vcf_dir.resolve() if vcf_dir is not None else None,
-        output_dir=output_dir.resolve() if output_dir is not None else None,
-        run_profile=effective_run_profile,
-    )
-
-    beacon_pgx.validate_pgx_layout(config)
+    log.info("=" * 46)
+    log.info("Beacon pgx — release: %s", release_id)
+    log.info("=" * 46)
+    log.info("  Input mode:  %s", config.input_mode)
+    log.info("  Executor:    %s", resolved_executor)
+    log.info("  Output dir:  %s", config.workspace)
 
     try:
-        if not prepare:
-            beacon_pgx.install_snakefile(config)
-            beacon_pgx.validate_pgx_run_prereqs(config)
+        if dry_run:
+            # Validate but do not write anything
+            plan_warnings = beacon_pgx.validate_pre_job(config)
+            batch = beacon_pgx.build_batch(config)
+            log.info("[dry-run] Batch plan for %r: %d sample(s)", release_id, len(batch.samples))
+            for s in batch.samples:
+                log.info("  %s  sex=%s  country=%s", s.sample_id, s.sex, s.country_code)
+            log.info("[dry-run] No files written.")
+            return
 
-        # ------------------------------------------------------------
-        # Discover VCFs and existing sample metadata
-        # ------------------------------------------------------------
+        batch, execution_script_path = beacon_pgx.plan_batch(config)
+        status = "planned"
 
-        discovered_sources = beacon_pgx.discover_lifted_samples(
-            config
-        )
+        log.info("Workspace:        %s", batch.workspace)
+        log.info("Execution script: %s", execution_script_path)
 
-        existing = (
-            beacon_pgx.read_samples_tsv(config.samples_tsv)
-            if config.samples_tsv.exists()
-            else []
-        )
+        if prepare:
+            if resolved_executor == "hpc":
+                log.info("--prepare: workspace ready. Submit with: sbatch %s", execution_script_path)
+            else:
+                log.info("--prepare: workspace ready. Run with: bash %s", execution_script_path)
+            return
 
-        existing_sample_ids = {
-            record.sample_id
-            for record in existing
-        }
-
-        new_sources = [
-            source
-            for source in discovered_sources
-            if source.sample_id not in existing_sample_ids
-        ]
-
-        lifted_vcf_count = len(
-            {
-                source.vcf_basename
-                for source in discovered_sources
-            }
-        )
-
-        log.info("==========================================")
-        log.info("Beacon pgx")
-        log.info("==========================================")
-        log.info("Base directory:          %s", base_dir)
-        log.info("Lifted VCFs found:       %d", lifted_vcf_count)
-        log.info(
-            "Samples discovered:      %d",
-            len(discovered_sources),
-        )
-        log.info(
-            "Already in samples.tsv:  %d",
-            len(existing),
-        )
-        log.info("New samples:             %d", len(new_sources))
-        log.info("==========================================")
-
-        # ------------------------------------------------------------
-        # Infer sex for newly discovered samples
-        # ------------------------------------------------------------
-
-        if new_sources:
-            log.info(
-                "Counting non-ref chrY variants for %d new sample(s) "
-                "(workers=%d)...",
-                len(new_sources),
-                workers,
-            )
-
-            inferences = beacon_pgx.infer_sex_batch(
-                config,
-                new_sources,
-            )
-
-            for source, inference in zip(
-                new_sources,
-                inferences,
-                strict=True,
-            ):
-                if inference is None:
-                    log.warning(
-                        "[%s] %s: chrY count failed — skipping",
-                        source.vcf_basename,
-                        source.sample_id,
-                    )
-                    continue
-
-                sex = inference.sex
-
-                if sex is None:
-                    log.warning(
-                        "[%s] %s: %d chrY variants — ambiguous "
-                        "zone (%d–%d), manual input required",
-                        source.vcf_basename,
-                        source.sample_id,
-                        inference.n_chry,
-                        sex_ambiguous_min,
-                        sex_ambiguous_max,
-                    )
-
-                    raw = click.prompt(
-                        f"  Sex for {source.sample_id} (M/F)",
-                        type=click.Choice(
-                            ["M", "F"],
-                            case_sensitive=False,
-                        ),
-                    ).upper()
-
-                    sex = "M" if raw == "M" else "F"
-
-                else:
-                    log.info(
-                        "[%s] %s: %d chrY -> %s",
-                        source.vcf_basename,
-                        source.sample_id,
-                        inference.n_chry,
-                        sex,
-                    )
-
-                record = beacon_pgx.SampleRecord(
-                    sample_id=source.sample_id,
-                    sex=sex,
-                    country_code=country_code,
-                    vcf_basename=source.vcf_basename,
-                )
-
-                new_records.append(record)
-
-                beacon_pgx.append_sample_to_tsv(
-                    config.samples_tsv,
-                    record,
-                )
-
-                log.info(
-                    "[%s] Added to samples.tsv "
-                    "(source VCF: %s)",
-                    record.sample_id,
-                    record.vcf_basename,
-                )
-
-        all_records = existing + new_records
-
-        # ------------------------------------------------------------
-        # Prepare workspaces
-        # ------------------------------------------------------------
-
-        if not run:
-            log.info("==========================================")
-            log.info(
-                "Preparing workspaces  (workers=%d)",
-                workers,
-            )
-            log.info("==========================================")
-
-            prepare_results = beacon_pgx.prepare_workspaces(
-                config,
-                all_records,
-            )
-
-        # ------------------------------------------------------------
-        # Run pgx_pilot
-        # ------------------------------------------------------------
-
-        if not prepare:
-            log.info("==========================================")
-            log.info(
-                "Running pgx_pilot  (workers=%d)",
-                workers,
-            )
-            log.info("==========================================")
-
-            run_results = beacon_pgx.run_pgx_pilots(
-                config,
-                all_records,
-            )
-
-        pipeline_result = beacon_pgx.PgxPipelineResult(
-            prepare_results=prepare_results,
-            run_results=run_results,
-        )
-
-        total = len(prepare_results) + len(run_results)
-
-        log.info("==========================================")
-        log.info("pgx summary")
-        log.info("==========================================")
-        log.info(
-            "  Steps OK:       %d",
-            pipeline_result.succeeded,
-        )
-        log.info(
-            "  Steps warnings: %d",
-            pipeline_result.warned,
-        )
-        log.info(
-            "  Steps failed:   %d",
-            pipeline_result.failed,
-        )
-
-        pass_files = [
-            r.output_pass
-            for r in run_results
-            if r.output_pass is not None and r.output_pass.exists()
-        ]
-
-        if pass_files:
-            log.info("==========================================")
-            log.info("Output files (sites.pass — ingestion-ready)")
-            log.info("==========================================")
-            for f in pass_files:
-                log.info("  %s  (%s)", f, beacon_pgx._fmt_size(f))
-            log.info("--")
-            log.info(
-                "  Tip: copy the .sites.pass.vcf.gz files above to a dedicated"
-                " directory before running `beacon ingest variants --vcf-dir <dir>`"
-            )
-
-        if pipeline_result.failed > 0:
-            raise click.ClickException(
-                "pgx pipeline finished with "
-                f"{pipeline_result.failed} failed step(s). "
-                f"Check logs in {config.logs_dir} for details."
-            )
+    except beacon_pgx.ValidationError as exc:
+        status = "planned"
+        error_message = str(exc)
+        raise click.UsageError(str(exc)) from exc
 
     except Exception as exc:
-        status = "failed"
+        status = "planned"
         error_message = f"{type(exc).__name__}: {exc}"
-
-        if isinstance(
-            exc,
-            (click.ClickException, click.UsageError),
-        ):
+        if isinstance(exc, (click.ClickException, click.UsageError)):
             raise
-
         raise click.ClickException(str(exc)) from exc
 
     finally:
         ended_at = datetime.now().astimezone().isoformat()
         duration_seconds = time.perf_counter() - started_perf
 
-        try:
-            metrics_file = beacon_pgx.write_pgx_metrics(
-                config=config,
-                discovered_sources=discovered_sources,
-                existing_records=existing,
-                new_records=new_records,
-                inferences=inferences,
-                result=pipeline_result,
-                prepare_only=prepare,
-                run_only=run,
-                started_at=started_at,
-                ended_at=ended_at,
-                duration_seconds=duration_seconds,
-                status=status,
-                error=error_message,
-            )
+        if not dry_run and batch is not None:
+            try:
+                metrics_file = beacon_pgx.write_pgx_metrics(
+                    config=config,
+                    batch=batch,
+                    execution_script_path=execution_script_path,
+                    job_id=None,
+                    status=status,
+                    started_at=started_at,
+                    ended_at=ended_at,
+                    duration_seconds=duration_seconds,
+                    warnings=plan_warnings,
+                    error=error_message,
+                )
+                log.info("Metrics written: %s", metrics_file)
 
-            log.info(
-                "PGx metrics written: %s",
-                metrics_file,
-            )
+                if not no_report:
+                    try:
+                        report_file = beacon_pgx.write_pgx_html_report(
+                            metrics_file=metrics_file
+                        )
+                        log.info("HTML report: %s", report_file)
+                    except Exception as report_exc:  # noqa: BLE001
+                        log.warning("Could not write HTML report: %s", report_exc)
 
-            if pipeline_result is not None:
-                pipeline_result.metrics_file = metrics_file
-
-            if not no_report:
-                try:
-                    report_file = beacon_pgx.write_pgx_html_report(
-                        metrics_file=metrics_file,
-                    )
-
-                    log.info(
-                        "PGx HTML report written: %s",
-                        report_file,
-                    )
-
-                    if pipeline_result is not None:
-                        pipeline_result.report_file = report_file
-
-                except Exception as report_exc:  # noqa: BLE001
-                    log.warning(
-                        "Could not write PGx HTML report: %s",
-                        report_exc,
-                    )
-
-        except Exception as metrics_exc:  # noqa: BLE001
-            log.warning(
-                "Could not write PGx metrics: %s",
-                metrics_exc,
-            )
+            except Exception as metrics_exc:  # noqa: BLE001
+                log.warning("Could not write metrics: %s", metrics_exc)
 
 @beacon.group("ingest")
 @click.option(
