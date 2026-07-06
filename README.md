@@ -148,9 +148,8 @@ Lifted VCFs (GRCh38, liftover/)
         v
 impact-tools beacon pgx
         |
-        |  inputs/samples.tsv          (sex inferred from chrY)
-        |  pgx_runs/<sample>/          (workspace per sample)
-        |  <sample>.sites.pass.vcf.gz  (Beacon-ready, PASS QC)
+        |  pgx_runs/<release_id>/      (shared workspace)
+        |  <release_id>.sites.pass.vcf.gz  (Beacon-ready, PASS QC, with AF)
         v
 impact-tools beacon ingest dataset
         |
@@ -247,104 +246,117 @@ Each liftover run writes per sample under `<base-dir>/liftover/`:
 | `<sample>.GRCh38.clean.vcf.gz.tbi` | Tabix index. |
 | `<sample>_liftover.log` | Full stdout/stderr log from bcftools and CrossMap. |
 
-### Prepare and Run pgx_pilot
+### Prepare and Run the PGx Batch Pipeline
 
-The command discovers VCF inputs from `--vcf` (individual files, repeatable), `--vcf-dir` (directory) or `<base-dir>/liftover/` (default).
-Both single-sample and joint multi-sample VCFs are supported.
+`beacon pgx` runs the pgx_pilot AF/QC pipeline over a cohort of DRAGEN gVCF
+files. It performs joint genotyping with GLnexus, validates the resulting
+multi-sample VCF, and executes the Snakemake AF/QC and optional PyPGx workflows
+inside a container.
 
-For every VCF found, the workflow:
+#### Configuration
 
-1. Lists all contained sample identifiers with `bcftools query -l`.
-2. Associates each sample with the basename of its source VCF.
-3. Infers sex independently for each sample from non-reference chrY genotypes.
-4. Creates one independent workspace under `pgx_runs/<sample>/`.
-5. Subsets the requested sample from the source VCF during the Snakemake run.
-6. Produces per-sample sites-only VCFs for Beacon ingestion.
+Infrastructure paths live in `~/.impact_tools/extra_config.json` under the
+`beacon.pgx` namespace. `ref_fasta`, `output_dir` and `pgx_image` are required;
+everything else has defaults.
 
-Sex inference is automatic. Samples whose chrY variant count falls between
-`--sex-ambiguous-min` (default 5,000) and `--sex-ambiguous-max` (default 7,000)
-are flagged and the user is prompted to enter the sex manually.
-
-Sample metadata is stored in `inputs/samples.tsv` using four columns:
-
-```text
-sample_id<TAB>sex<TAB>country_code<TAB>vcf_basename
+```json
+{
+  "beacon": {
+    "pgx": {
+      "ref_fasta":       "/refs/GRCh38.fa",
+      "output_dir":      "/results/pgx",
+      "pgx_image":       "/images/pgx_pilot_v1.sif",
+      "glnexus_image":   "/images/glnexus_v1.4.1.sif",
+      "executor":        "hpc",
+      "glnexus_config":  "gatk",
+      "snakemake_jobs":  8,
+      "pypgx_snakefile": null,
+      "slurm": {
+        "time_limit": "48:00:00",
+        "memory":     "64G",
+        "cpus":       16,
+        "extra_args": []
+      }
+    }
+  }
+}
 ```
 
-The `vcf_basename` field preserves the relationship between a sample workspace
-and the lifted joint VCF from which that sample must be selected.
+Use `--config-file` to override the persistent config for a single run.
 
-The bundled Snakefile is installed under `pgx_runs/Snakefile`. If the packaged
-Snakefile changes, the installed copy is refreshed automatically so existing
-working directories do not continue using stale workflow logic.
+#### Usage
 
-Run the full pipeline using liftover output (discovers VCFs from `<base-dir>/liftover/`):
+Prepare the workspace and SLURM script, without submitting:
 
 ```bash
 impact-tools beacon pgx \
-  --base-dir /path/to/beacon \
-  --pgx-repo /path/to/pgx_pilot
+  --samples-tsv /data/IMPACT_BATCH_001.samples.tsv \
+  --gvcf-dir /data/gvcfs/ \
+  --executor hpc \
+  --prepare
 ```
 
-Run using a specific VCF directory instead of `liftover/`:
+Pass gVCF paths explicitly instead of a directory scan:
 
 ```bash
 impact-tools beacon pgx \
-  --base-dir /path/to/beacon \
-  --pgx-repo /path/to/pgx_pilot \
-  --vcf-dir /path/to/vcfs
+  --samples-tsv /data/IMPACT_BATCH_001.samples.tsv \
+  --gvcf-list /data/batch001.list \
+  --prepare
 ```
 
-Run on specific individual files:
+Override the output directory for this run only:
 
 ```bash
 impact-tools beacon pgx \
-  --base-dir /path/to/beacon \
-  --pgx-repo /path/to/pgx_pilot \
-  --vcf /path/to/sample1.vcf.gz
+  --samples-tsv /data/IMPACT_BATCH_001.samples.tsv \
+  --gvcf-dir /data/gvcfs/ \
+  --output-dir /scratch/pgx_runs \
+  --prepare
 ```
 
-Only prepare workspaces and `inputs/samples.tsv` without running the pipeline:
-
-```bash
-impact-tools beacon pgx --base-dir /path/to/beacon --prepare
-```
-
-Only run pgx_pilot on already-prepared workspaces:
+Validate inputs and print the plan without writing anything:
 
 ```bash
 impact-tools beacon pgx \
-  --base-dir /path/to/beacon \
-  --pgx-repo /path/to/pgx_pilot \
-  --run
+  --samples-tsv /data/IMPACT_BATCH_001.samples.tsv \
+  --gvcf-dir /data/gvcfs/ \
+  --dry-run
 ```
 
-Process samples in parallel (default 4 workers — applies to sex inference, workspace prep and pgx_pilot runs):
+Exactly one gVCF source is required: `--gvcf-dir` (recursive scan) or
+`--gvcf-list` (explicit `sample_id<TAB>path` file).
+`--release-id` is auto-derived from the TSV filename when omitted
+(e.g. `IMPACT_BATCH_001.samples.tsv` → `IMPACT_BATCH_001`).
+`--ref-fasta`, `--output-dir` and `--pgx-image` override their config counterparts
+for a single run.
+Use `--force` to remove an existing workspace and start fresh.
+Use `--pypgx` to enable the optional PyPGx pharmacogenomics sub-workflow.
+Use `--no-report` to skip HTML report generation (metrics JSON is always written).
+Use `--cleanup` to remove the `results/temp` scratch intermediates after a
+successful run (prompts for confirmation unless `--force` is given).
 
-```bash
-impact-tools beacon pgx \
-  --base-dir /path/to/beacon \
-  --pgx-repo /path/to/pgx_pilot \
-  --workers 8
-```
+#### What the generated script does
 
-The `--pgx-repo` path can also be set via the `PGX_REPO` environment variable or
-the `beacon.pgx.repo` config key. Use `--no-report` to skip HTML report generation.
-Use `--force` to skip interactive confirmation prompts. Static pipeline resources are
-seeded into `<base-dir>/pgx_resources/` on first run and reused across samples.
+1. **GLnexus joint genotyping** — all gVCFs are merged into a single multi-sample VCF.
+2. **Sample validation** — the VCF sample list is diffed against `expected_samples.txt`; the script aborts on mismatch.
+3. **Snakemake AF/QC pipeline** — normalisation, masking, allele-frequency calculation and QC tagging, producing a sites-only PASS VCF ready for Beacon ingestion.
+4. **PyPGx** (optional, `--pypgx`) — per-sample pharmacogenomic allele, genotype and phenotype calls.
+5. **Cleanup** (optional, `--cleanup`) — removes the `results/temp` scratch intermediates. Runs only after the steps above succeed, so failures leave the temp files in place for debugging.
 
-### pgx_pilot Outputs
+#### pgx_pilot Outputs
 
 | File | Content |
 | --- | --- |
-| `inputs/samples.tsv` | Global sample manifest containing sample ID, inferred sex, country code and source VCF basename. |
-| `pgx_resources/` | Shared resource cache seeded from `pgx_repo/resources/` (including downloaded reference genome). |
-| `pgx_runs/Snakefile` | Installed copy of the bundled PGx workflow, refreshed when the packaged version changes. |
-| `pgx_runs/<sample>/config.yaml` | pgx_pilot config for this sample. |
-| `pgx_runs/<sample>/data/samples.tsv` | Single-row per-sample metadata (sex, country code). |
-| `pgx_runs/<sample>/results/<sample>.sites.all.vcf.gz` | Sites-only VCF, all variants. |
-| `pgx_runs/<sample>/results/<sample>.sites.pass.vcf.gz` | Sites-only VCF, PASS QC only (Beacon-ready). |
-| `logs/<sample>_pgx.log` | Snakemake stdout/stderr log. |
+| `pgx_runs/<release_id>/config.yaml` | Snakemake config for this release. |
+| `pgx_runs/<release_id>/manifests/` | `samples.tsv`, `gvcfs.list`, `expected_samples.txt`, `batch.json`. |
+| `pgx_runs/<release_id>/slurm/pgx_<release_id>.sbatch` | Generated SLURM launcher (`.sh` for `--executor local`). |
+| `pgx_runs/<release_id>/data/<release_id>.joint.vcf.gz` | GLnexus multi-sample VCF. |
+| `pgx_runs/<release_id>/results/<release_id>.sites.pass.vcf.gz` | Sites-only VCF, PASS QC, with population AF. Ready for Beacon ingestion. |
+| `pgx_runs/<release_id>/results/<release_id>.sites.all.vcf.gz` | Sites-only VCF, all variants. |
+| `pgx_runs/<release_id>/results/intermediate/<release_id>.full_sample_data.vcf.gz` | Per-sample genotypes with QC tags. |
+| `pgx_runs/<release_id>/results/pgx/` | PyPGx allele, genotype and phenotype CSVs (when `--pypgx` is used). |
+| `pgx_runs/<release_id>/logs/` | SLURM stdout/stderr, metrics JSON and HTML report. |
 
 
 ### Register Beacon Datasets into MongoDB
@@ -897,13 +909,12 @@ The upload command transfers encrypted files to the Inbox. The subsequent
 LocalEGA ingestion, accessioning, dataset mapping, release, DAC permission
 propagation and distribution steps are handled by the LocalEGA / CEGA workflow.
 
-### Parallel execution for Beacon preprocessing
+### Parallel execution for Beacon liftover
 
-Both `beacon liftover` and `beacon pgx` support `--workers N` to process
-multiple samples concurrently using threads. Each worker runs independent Docker
-containers, so `--workers` also controls the maximum number of simultaneous
-containers. The default is 4. Tune this value to your available CPU, memory, and
-Docker daemon capacity.
+`beacon liftover` supports `--workers N` to process multiple samples concurrently
+using threads. Each worker runs an independent Docker container, so `--workers`
+also controls the maximum number of simultaneous containers. The default is 4.
+Tune this value to your available CPU, memory, and Docker daemon capacity.
 
 ## Development
 
