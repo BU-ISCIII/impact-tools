@@ -34,7 +34,7 @@ include-package-data = true
 zip-safe = false
 
 [tool.setuptools.package-data]
-"impact_tools.beacon.resources" = ["Snakefile", "*.html", "*.css"]
+"impact_tools.beacon.resources" = ["Snakefile", "*.html", "*.css", "targets.bed", "scripts/*.py"]
 "impact_tools.ega.resources" = ["*.html", "*.css"]
 impact_tools = ["conf/*.json", "conf/*.yaml"]
 "impact_tools.conf.ega.submission_profiles" = ["*.yaml", "*.json"]
