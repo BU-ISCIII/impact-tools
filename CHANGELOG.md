@@ -30,6 +30,8 @@ where possible.
 - Replace SSH-based MongoDB operations with PyMongo and HTTP connections
 [#13](https://github.com/BU-ISCIII/impact-tools/pull/13)
 - Adds EGA submission support for submitting to the FEGA Submitter Portal API [#16](https://github.com/BU-ISCIII/impact-tools/pull/16)
+-- Reworked the Beacon `pgx` command into a batch release pipeline with GLnexus joint genotyping, Snakemake AF/QC, optional PyPGx and `--cleanup`. [#17](https://github.com/BU-ISCIII/impact-tools/pull/17)
+
 
 ## [0.1.0] - 2026-05-21
 
