@@ -1,59 +1,613 @@
-"""Beacon pgx_pilot workspace preparation and execution."""
+"""Beacon pgx pipeline — batch-level orchestration.
+
+The unit of execution is a *batch*: a set of samples processed together so
+that allele frequencies, HWE, missingness and stratified statistics are
+computed over the full cohort at once.
+
+Pipeline overview
+-----------------
+  DRAGEN gVCF files (per sample)
+        |
+        v  STEP 1 — GLnexus joint genotyping  (Docker / Singularity)
+  <batch_id>.joint.vcf.gz
+        |
+        v  STEP 2 — sample validation  (bcftools query vs expected_samples.txt)
+        |
+        +---------------------------+
+        |                           |
+        v                           v
+  AF/QC Snakefile  [STEP 3]   Snakefile.pypgx  [STEP 4 · optional]
+        |                           |
+        v                           v
+  <batch_id>.sites.all.vcf.gz   merged_alleles.csv
+  <batch_id>.sites.pass.vcf.gz  merged_genotypes.csv
+                                 merged_phenotypes.csv
+
+No bioinformatics tools are called from the login node or the VM.
+All subprocess calls happen inside the generated script via Docker
+(--executor local) or Singularity inside a SLURM job (--executor hpc).
+
+Upstream reference
+------------------
+pgx_pilot commit 2026-06-22 ("Set default AF cutoff to 0.0")
+https://github.com/Genome-of-Europe/pgx_pilot
+"""
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import json
+import logging
 import platform
+import re
+import shlex
 import socket
 import sys
-import dataclasses
-import logging
-import shlex
-import shutil
-import subprocess
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from impact_tools.beacon.html_report import write_pgx_report
+from importlib.resources import files
 from pathlib import Path
 from typing import Literal
-from importlib.resources import files
 
 log = logging.getLogger(__name__)
 
-Sex = Literal["M", "F"]
+# ---------------------------------------------------------------------------
+# Public constants
+# ---------------------------------------------------------------------------
 
-PGX_IMAGE = "goe/pgx-pipeline:latest"
-BCFTOOLS_IMAGE = "docker.io/staphb/bcftools:1.21"
-DEFAULT_SEX_AMBIGUOUS_MIN = 5000
-DEFAULT_SEX_AMBIGUOUS_MAX = 7000
+PGX_PILOT_COMMIT = "2026-06-22-set-default-af-cutoff-to-0.0"
+GLNEXUS_DEFAULT_DOCKER_IMAGE = "ghcr.io/dnanexus-rnd/glnexus:v1.4.1"
 
-def _fmt_size(path: Path) -> str:
-    """Return human-readable file size, or 'N/A' if the file is missing."""
+# ---------------------------------------------------------------------------
+# Type aliases
+# ---------------------------------------------------------------------------
+
+Sex = Literal["M", "F", "unknown"]
+BatchStatus = Literal[
+    "planned",
+    "running",
+    "af_failed",
+    "pypgx_failed",
+    "completed_with_warnings",
+    "completed",
+]
+InputMode = Literal["gvcf_dir", "gvcf_list"]
+Executor = Literal["local", "hpc"]
+ContainerRuntime = Literal["docker", "singularity"]
+
+VALID_SEX_VALUES: frozenset[str] = frozenset({"M", "F", "unknown"})
+
+_BATCH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,62}$")
+_SAMPLE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]{0,99}$")
+_RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,62}$")
+
+# ---------------------------------------------------------------------------
+# Section 1: Data models
+# ---------------------------------------------------------------------------
+
+
+def is_safe_batch_id(batch_id: str) -> bool:
+    return bool(_BATCH_ID_RE.match(batch_id))
+
+def is_safe_release_id(release_id: str) -> bool:
+    return bool(_RELEASE_ID_RE.match(release_id))
+
+
+@dataclasses.dataclass(frozen=True)
+class BatchSampleMeta:
+    """Sample metadata parsed from samples.tsv (before gVCF path resolution)."""
+
+    sample_id: str
+    sex: str
+    country_code: str
+    batch_id: str = ""
+    ancestry_group: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class BatchSample:
+    """Sample with resolved gVCF paths, ready for pipeline execution."""
+
+    sample_id: str
+    sex: str
+    country_code: str
+    gvcf: Path
+    gvcf_index: Path | None = None
+    batch_id: str = ""
+    ancestry_group: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class PgxBatch:
+    """A cumulative release processed as a single execution unit."""
+
+    release_id: str
+    samples: tuple[BatchSample, ...]
+    workspace: Path
+    ref_fasta: Path
+
+    @property
+    def sample_ids(self) -> tuple[str, ...]:
+        return tuple(s.sample_id for s in self.samples)
+
+    @property
+    def included_batch_ids(self) -> tuple[str, ...]:
+        """Original sequencing/processing batches included in this release."""
+        return tuple(
+            sorted({sample.batch_id for sample in self.samples if sample.batch_id})
+        )
+
+    @property
+    def joint_vcf_path(self) -> Path:
+        return self.workspace / "data" / f"{self.release_id}.joint.vcf.gz"
+
+    @property
+    def joint_vcf_index_path(self) -> Path:
+        return self.workspace / "data" / f"{self.release_id}.joint.vcf.gz.tbi"
+
+@dataclasses.dataclass(frozen=True)
+class SlurmConfig:
+    """SLURM submission parameters."""
+
+    time_limit: str = "24:00:00"
+    memory: str = "32G"
+    cpus: int = 8
+    job_name: str = "pgx_pipeline"
+    extra_args: tuple[str, ...] = ()
+
+
+@dataclasses.dataclass
+class PgxPipelineConfig:
+    """Top-level runtime configuration assembled from CLI and persistent config."""
+
+    release_id: str
+    output_dir: Path
+    ref_fasta: Path
+    pgx_image: Path
+    gvcf_dir: Path | None = None
+    gvcf_list: Path | None = None
+    samples_tsv: Path | None = None
+    executor: Executor = "local"
+    slurm: SlurmConfig = dataclasses.field(default_factory=SlurmConfig)
+    snakemake_jobs: int = 8
+    no_pypgx: bool = True  # PyPGx offline bundle not yet validated; opt in with --pypgx
+    no_report: bool = False
+    prepare: bool = False
+    dry_run: bool = False
+    force: bool = False
+    cleanup_temp: bool = False  # remove results/temp scratch after a successful run
+    pgx_pilot_commit: str = PGX_PILOT_COMMIT
+    pypgx_snakefile: Path | None = None
+    glnexus_image: Path | None = None
+    # "gatk" is the standard preset for DRAGEN gVCFs in public GLnexus v1.4.1.
+    # If your image includes a "dragen_prod" preset, pass --glnexus-config dragen_prod.
+    glnexus_config: str = "gatk"
+
+    @property
+    def workspace(self) -> Path:
+        return self.output_dir / "pgx_runs" / self.release_id
+
+    @property
+    def input_mode(self) -> InputMode:
+        if self.gvcf_dir is not None:
+            return "gvcf_dir"
+        return "gvcf_list"
+
+    @property
+    def container_runtime(self) -> ContainerRuntime:
+        return "docker" if self.executor == "local" else "singularity"
+    
+    @property
+    def execution_script_path(self) -> Path:
+        """Path of the generated launcher script for the selected executor."""
+        if self.executor == "hpc":
+            return (
+                self.workspace
+                / "slurm"
+                / f"pgx_{self.release_id}.sbatch"
+            )
+
+        return (
+            self.workspace
+            / "run"
+            / f"pgx_{self.release_id}.sh"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Section 2: Validation
+# ---------------------------------------------------------------------------
+
+
+class ValidationError(ValueError):
+    pass
+
+
+def _validate_sample_id(sample_id: str) -> None:
+    if sample_id in {".", ".."} or not _SAMPLE_ID_RE.match(sample_id):
+        raise ValidationError(f"Unsafe sample_id {sample_id!r}.")
+
+
+def parse_samples_tsv(
+    tsv_path: Path,
+) -> list[BatchSampleMeta]:
+    """Parse samples.tsv into BatchSampleMeta objects.
+
+    Columns (tab-separated): sample_id, sex, country_code[, batch_id[, ancestry_group]]
+    A header row starting with 'sample_id' is skipped if present.
+
+    Sex must be one of VALID_SEX_VALUES ('M', 'F', 'unknown').
+    Non-matching values raise ValidationError; they are never silently coerced.
+    ancestry_group is kept as-is; it is never inferred from country_code.
+    """
+    if not tsv_path.is_file():
+        raise ValidationError(f"samples.tsv not found: {tsv_path}")
+
+    records: list[BatchSampleMeta] = []
+    seen_ids: dict[str, int] = {}
+    errors: list[str] = []
+    header_skipped = False
+
+    with tsv_path.open(encoding="utf-8") as fh:
+        for lineno, raw in enumerate(fh, start=1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            fields = line.split("\t")
+
+            if not header_skipped and fields[0].lower() == "sample_id":
+                header_skipped = True
+                continue
+
+            if len(fields) < 3:
+                errors.append(
+                    f"Line {lineno}: expected ≥3 tab-separated fields, "
+                    f"got {len(fields)}: {line!r}"
+                )
+                continue
+
+            sample_id = fields[0].strip()
+            sex_raw = fields[1].strip()
+            country_code = fields[2].strip()
+            tsv_batch_id = fields[3].strip() if len(fields) >= 4 else ""
+            raw_ancestry = fields[4].strip() if len(fields) >= 5 else ""
+            ancestry_group: str | None = raw_ancestry or None
+
+            try:
+                _validate_sample_id(sample_id)
+            except ValidationError as exc:
+                errors.append(f"Line {lineno}: {exc}")
+                continue
+
+            if sample_id in seen_ids:
+                errors.append(
+                    f"Line {lineno}: duplicate sample_id {sample_id!r} "
+                    f"(first seen at line {seen_ids[sample_id]})."
+                )
+                continue
+            seen_ids[sample_id] = lineno
+
+            if sex_raw not in VALID_SEX_VALUES:
+                errors.append(
+                    f"Line {lineno}: unrecognised sex value {sex_raw!r} for sample "
+                    f"{sample_id!r}. Accepted: {sorted(VALID_SEX_VALUES)}."
+                )
+                continue
+
+            if tsv_batch_id and not is_safe_batch_id(tsv_batch_id):
+                errors.append(
+                    f"Line {lineno}: invalid batch_id {tsv_batch_id!r} "
+                    f"for sample {sample_id!r}."
+                )
+                continue
+
+            records.append(
+                BatchSampleMeta(
+                    sample_id=sample_id,
+                    sex=sex_raw,
+                    country_code=country_code,
+                    batch_id=tsv_batch_id,
+                    ancestry_group=ancestry_group,
+                )
+            )
+
+    if errors:
+        raise ValidationError(
+            f"{len(errors)} error(s) in {tsv_path}:\n"
+            + "\n".join(f"  {e}" for e in errors)
+        )
+
+    if not records:
+        raise ValidationError(f"No valid samples found in {tsv_path}")
+
+    return records
+
+
+def resolve_gvcfs_from_dir(
+    gvcf_dir: Path,
+    metas: list[BatchSampleMeta],
+) -> list[BatchSample]:
+    """Find one *.hard-filtered.gvcf.gz per sample under gvcf_dir (recursive).
+
+    Uses a single filesystem traversal to avoid N×rglob calls on NFS.
+    Logs a warning for any gVCF present under gvcf_dir that is not declared in
+    metas, so the user can audit inclusions and exclusions.
+    """
+    # Single pass: index all gVCFs found under gvcf_dir.
+    found: dict[str, list[Path]] = {}
+    for candidate in gvcf_dir.rglob("*.hard-filtered.gvcf.gz"):
+        if not candidate.is_file():
+            continue
+        sample_id = candidate.name.removesuffix(".hard-filtered.gvcf.gz")
+        found.setdefault(sample_id, []).append(candidate)
+
+    declared_ids = {m.sample_id for m in metas}
+    for sample_id in found:
+        if sample_id not in declared_ids:
+            for path in found[sample_id]:
+                log.warning(
+                    "gVCF found for undeclared sample %r: %s "
+                    "— add it to samples.tsv or it will be excluded from this batch.",
+                    sample_id,
+                    path,
+                )
+
+    errors: list[str] = []
+    samples: list[BatchSample] = []
+
+    for meta in metas:
+        matches = found.get(meta.sample_id, [])
+
+        if not matches:
+            errors.append(
+                f"No gVCF found for sample {meta.sample_id!r} under {gvcf_dir}. "
+                f"Expected filename: {meta.sample_id}.hard-filtered.gvcf.gz"
+            )
+            continue
+        if len(matches) > 1:
+            errors.append(
+                f"Multiple gVCFs found for {meta.sample_id!r}: "
+                + ", ".join(str(m) for m in sorted(matches))
+            )
+            continue
+
+        gvcf = matches[0]
+        tbi = Path(f"{gvcf}.tbi")
+        if not tbi.is_file():
+            log.warning(
+                "No .tbi index found for %s. "
+                "GLnexus can ingest the gVCF without it, but downstream "
+                "bcftools operations may require an index.",
+                gvcf,
+            )
+        samples.append(
+            BatchSample(
+                sample_id=meta.sample_id,
+                sex=meta.sex,
+                country_code=meta.country_code,
+                gvcf=gvcf,
+                gvcf_index=tbi if tbi.is_file() else None,
+                batch_id=meta.batch_id,
+                ancestry_group=meta.ancestry_group,
+            )
+        )
+
+    if errors:
+        raise ValidationError(
+            f"{len(errors)} gVCF resolution error(s):\n"
+            + "\n".join(f"  {e}" for e in errors)
+        )
+
+    return samples
+
+
+def resolve_gvcfs_from_list(
+    list_path: Path,
+    metas: list[BatchSampleMeta],
+) -> list[BatchSample]:
+    """Parse a gVCF list file and cross-reference against metas from samples.tsv.
+
+    File format (one entry per non-comment line, tab-separated):
+        sample_id<TAB>/absolute/path/to/sample.hard-filtered.gvcf.gz
+
+    Each path must be absolute and its .tbi index must exist.
+    Every sample in metas must appear exactly once; extras are rejected.
+    """
+    if not list_path.is_file():
+        raise ValidationError(f"gVCF list file not found: {list_path}")
+
+    meta_by_id = {m.sample_id: m for m in metas}
+    errors: list[str] = []
+    seen: dict[str, int] = {}
+    entries: dict[str, tuple[Path, Path | None]] = {}
+
+    with list_path.open(encoding="utf-8") as fh:
+        for lineno, raw in enumerate(fh, start=1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if len(fields) < 2:
+                errors.append(f"Line {lineno}: expected sample_id<TAB>path.")
+                continue
+
+            sample_id = fields[0].strip()
+            gvcf = Path(fields[1].strip())
+
+            if sample_id in seen:
+                errors.append(f"Line {lineno}: duplicate sample_id {sample_id!r}.")
+                continue
+            seen[sample_id] = lineno
+
+            if not gvcf.is_absolute():
+                errors.append(f"Line {lineno}: path must be absolute: {gvcf}")
+                continue
+            if not gvcf.is_file():
+                errors.append(f"Line {lineno}: gVCF not found: {gvcf}")
+                continue
+            tbi = Path(f"{gvcf}.tbi")
+            if not tbi.is_file():
+                log.warning(
+                    "No .tbi index found for %s. "
+                    "GLnexus can ingest the gVCF without it, but downstream "
+                    "bcftools operations may require an index.",
+                    gvcf,
+                )
+            if sample_id not in meta_by_id:
+                errors.append(
+                    f"Line {lineno}: {sample_id!r} not declared in samples.tsv."
+                )
+                continue
+
+            entries[sample_id] = (gvcf, tbi if tbi.is_file() else None)
+
+    missing = set(meta_by_id) - set(entries)
+    if missing:
+        errors.append(
+            f"{len(missing)} sample(s) in samples.tsv have no gVCF entry: "
+            + ", ".join(sorted(missing))
+        )
+
+    undeclared = set(seen) - set(meta_by_id)
+    if undeclared:
+        errors.append(
+            f"{len(undeclared)} sample(s) in gVCF list not in samples.tsv: "
+            + ", ".join(sorted(undeclared))
+        )
+
+    if errors:
+        raise ValidationError(
+            f"{len(errors)} error(s) in {list_path}:\n"
+            + "\n".join(f"  {e}" for e in errors)
+        )
+
+    return [
+        BatchSample(
+            sample_id=m.sample_id,
+            sex=m.sex,
+            country_code=m.country_code,
+            gvcf=entries[m.sample_id][0],
+            gvcf_index=entries[m.sample_id][1],
+            batch_id=m.batch_id,
+            ancestry_group=m.ancestry_group,
+        )
+        for m in metas
+        if m.sample_id in entries
+    ]
+
+
+
+def validate_pre_job(config: PgxPipelineConfig) -> list[str]:
+    """Run all pre-submission validations.
+
+    Returns non-fatal warnings. Raises ValidationError on hard failures.
+    Never calls subprocess or bioinformatics tools.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if not is_safe_release_id(config.release_id):
+        errors.append(
+            f"Invalid release_id {config.release_id!r}. "
+            "Use only [A-Za-z0-9_-], max 63 chars, start with alphanumeric."
+        )
+
+    if not config.ref_fasta.is_file():
+        errors.append(f"Reference FASTA not found: {config.ref_fasta}")
+
+    if config.container_runtime == "singularity":
+        if not config.pgx_image.is_file():
+            errors.append(f"pgx Singularity image not found: {config.pgx_image}")
+        elif not str(config.pgx_image).endswith(".sif"):
+            warnings.append(
+                f"pgx_image {config.pgx_image.name!r} does not have .sif extension."
+            )
+        if config.glnexus_image is None:
+            errors.append(
+                "GLnexus Singularity image is required for --executor hpc.\n"
+                "  Set it in your config (beacon.pgx.glnexus_image) or pass --glnexus-image.\n"
+                "  Download the image with:\n"
+                f"    singularity pull glnexus_v1.4.1.sif docker://{GLNEXUS_DEFAULT_DOCKER_IMAGE}"
+            )
+        elif not config.glnexus_image.is_file():
+            errors.append(
+                f"GLnexus Singularity image not found: {config.glnexus_image}\n"
+                "  Download it with:\n"
+                f"    singularity pull {config.glnexus_image.name} docker://{GLNEXUS_DEFAULT_DOCKER_IMAGE}"
+            )
+    # Docker: images are pulled automatically on first use; no file check needed.
+
+    # Validate mutually exclusive input modes
+    if config.gvcf_dir is not None and config.gvcf_list is not None:
+        errors.append("--gvcf-dir and --gvcf-list are mutually exclusive.")
+    elif config.gvcf_dir is None and config.gvcf_list is None:
+        errors.append("One of --gvcf-dir or --gvcf-list is required.")
+
+    if config.gvcf_dir is not None and not config.gvcf_dir.is_dir():
+        errors.append(f"--gvcf-dir not found: {config.gvcf_dir}")
+
+    if config.gvcf_list is not None and not config.gvcf_list.is_file():
+        errors.append(f"--gvcf-list not found: {config.gvcf_list}")
+
+    if config.samples_tsv is None:
+        errors.append("--samples-tsv is required.")
+    elif not config.samples_tsv.is_file():
+        errors.append(f"--samples-tsv not found: {config.samples_tsv}")
+
+    workspace = config.workspace
+    if (
+        workspace.exists()
+        and config.execution_script_path.exists()
+        and not config.force
+    ):
+        errors.append(
+            f"Workspace already exists: {workspace}. "
+            "Use --force to overwrite."
+        )
+
+    # targets.bed is a controlled workflow resource bundled with impact-tools.
     try:
-        size = path.stat().st_size
-    except OSError:
-        return "N/A"
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024:
-            return f"{size:.1f} {unit}"
-        size /= 1024
-    return f"{size:.1f} TB"
+        bundled_targets = files(
+            "impact_tools.beacon.resources"
+        ).joinpath("targets.bed")
+        bundled_targets.read_bytes()
+    except (FileNotFoundError, TypeError):
+        errors.append(
+            "Required bundled PGx resource is missing: "
+            "impact_tools/beacon/resources/targets.bed"
+        )
 
+    try:
+        config.output_dir.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        errors.append(f"Output directory not writable: {config.output_dir}")
+
+    if errors:
+        raise ValidationError(
+            f"Pre-job validation failed ({len(errors)} error(s)):\n"
+            + "\n".join(f"  {e}" for e in errors)
+        )
+
+    return warnings
+
+
+# ---------------------------------------------------------------------------
+# Section 3: Workspace creation
+# ---------------------------------------------------------------------------
 
 _CONFIG_YAML_TEMPLATE = """\
-input_vcf: "data/{sample_id}.vcf.gz"
-sample_id: "{sample_id}"
-sample_id_file: "data/sample_id.txt"
+# pgx_pilot config — release: {release_id}
+# pgx_pilot upstream commit: {pgx_pilot_commit}
+# Generated by impact-tools beacon pgx
+
+input_vcf: "data/{release_id}.joint.vcf.gz"
 genome_build: "GRCh38"
-country_code: "{country_code}"
-sample_info: "data/samples.tsv"
-
-resources:
-  ref_fasta_url: "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz"
-
-regions_bed: "resources/targets.bed"
-output_prefix: "{sample_id}"
+sample_info: "manifests/samples.tsv"
+sample_id_file: "manifests/expected_samples.txt"
+regions_bed: "{regions_bed}"
+local_resources:
+  ref_fasta: "{ref_fasta}"
+output_prefix: "{release_id}"
 qc_thresholds:
   qual: 30.0
   qd: 2.0
@@ -61,7 +615,7 @@ qc_thresholds:
   fs: 60.0
   readpos: -8.0
   hwe: 1.0e-6
-  maf: 0.01
+  maf: 0.0
   min_dp: 10
   min_gq: 20
   ab_ratio: 0.2
@@ -69,1136 +623,803 @@ qc_thresholds:
 """
 
 
-@dataclasses.dataclass
-class SampleRecord:
-    sample_id: str
-    sex: Sex
-    country_code: str
-    vcf_basename: str = ""
+def create_workspace(
+    batch: PgxBatch,
+    config: PgxPipelineConfig,
+    *,
+    input_mode: InputMode,
+) -> None:
+    """Create the batch workspace directory tree and write all manifest files."""
+    ws = batch.workspace
+    (ws / "manifests").mkdir(parents=True, exist_ok=True)
+    (ws / "data").mkdir(exist_ok=True)
+    (ws / "results" / "intermediate").mkdir(parents=True, exist_ok=True)
+    (ws / "results" / "pgx").mkdir(exist_ok=True)
+    (ws / "logs").mkdir(exist_ok=True)
+    config.execution_script_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    (ws / "resources").mkdir(exist_ok=True)
+
+    # Install bundled workflow files into workspace
+    _install_snakefile(ws)
+    _install_helper_scripts(ws)
+
+    # Link or copy targets BED into workspace/resources/
+    regions_bed = _install_targets_bed(ws)
+
+    # Write config.yaml consumed by the Snakemake pipeline
+    (ws / "config.yaml").write_text(
+        _CONFIG_YAML_TEMPLATE.format(
+            release_id=batch.release_id,
+            pgx_pilot_commit=config.pgx_pilot_commit,
+            regions_bed=regions_bed,
+            ref_fasta=str(batch.ref_fasta),
+        ),
+        encoding="utf-8",
+    )
+
+    # Write manifests/samples.tsv consumed by pgx_pilot (all samples)
+    _write_samples_tsv(ws / "manifests" / "samples.tsv", batch.samples)
+
+    # Write expected sample list for in-container header validation
+    expected = "\n".join(sorted(batch.sample_ids)) + "\n"
+    (ws / "manifests" / "expected_samples.txt").write_text(
+        expected, encoding="utf-8"
+    )
+
+    # Write gvcfs.list for traceability (sample_id + paths, with header)
+    _write_gvcfs_list(ws / "manifests" / "gvcfs.list", batch.samples)
+    # Write plain list consumed by glnexus_cli --list (one path per line, no header)
+    _write_glnexus_inputs_list(ws / "manifests" / "glnexus_inputs.list", batch.samples)
+
+    # Write batch.json manifest
+    _write_batch_json(ws, batch, config, input_mode)
+
+    log.info("Workspace ready: %s", ws)
 
 
-@dataclasses.dataclass(frozen=True)
-class SampleSource:
-    """A sample contained in a lifted single- or multi-sample VCF."""
-
-    sample_id: str
-    vcf_basename: str
-
-
-@dataclasses.dataclass
-class PgxConfig:
-    base_dir: Path
-    country_code: str = "ES"
-    sex_ambiguous_min: int = DEFAULT_SEX_AMBIGUOUS_MIN
-    sex_ambiguous_max: int = DEFAULT_SEX_AMBIGUOUS_MAX
-    bcftools_image: str = BCFTOOLS_IMAGE
-    pgx_image: str = PGX_IMAGE
-    pgx_repo: Path | None = None
-    snakemake_jobs: int = 8
-    workers: int = 4
-    vcf: tuple[Path, ...] = ()
-    vcf_dir: Path | None = None
-    output_dir: Path | None = None
-    run_profile: str = "local"
-
-    @property
-    def liftover_dir(self) -> Path:
-        return self.base_dir / "liftover"
-
-    @property
-    def logs_dir(self) -> Path:
-        return (self.output_dir if self.output_dir is not None else self.base_dir) / "logs"
-
-    @property
-    def pgx_resources_dir(self) -> Path:
-        return self.base_dir / "pgx_resources"
-
-    def resolve_vcf(self, vcf_basename: str) -> Path:
-        """Return the full path for a VCF given its basename.
-
-        Resolution order: --vcf → --vcf-dir → liftover dir.
-        """
-        if self.vcf:
-            for p in self.vcf:
-                if p.name == vcf_basename:
-                    return p
-        if self.vcf_dir is not None:
-            return self.vcf_dir / vcf_basename
-        return self.liftover_dir / vcf_basename
-
-    @property
-    def pgx_runs_dir(self) -> Path:
-        return self.base_dir / "pgx_runs"
-
-    @property
-    def samples_tsv(self) -> Path:
-        return self.base_dir / "inputs" / "samples.tsv"
-
-    @property
-    def snakefile(self) -> Path:
-        return self.pgx_runs_dir / "Snakefile"
+def _install_snakefile(workspace: Path) -> None:
+    src = files("impact_tools.beacon.resources").joinpath("Snakefile")
+    dest = workspace / "Snakefile"
+    bundled = src.read_text(encoding="utf-8")
+    if not dest.exists() or dest.read_text(encoding="utf-8") != bundled:
+        dest.write_text(bundled, encoding="utf-8")
+        log.debug("Installed Snakefile -> %s", dest)
 
 
-@dataclasses.dataclass
-class SexInferenceResult:
-    sample_id: str
-    vcf_basename: str
-    n_chry: int
-    sex: Sex | None  # None = ambiguous zone, requires manual input
+def _install_helper_scripts(workspace: Path) -> None:
+    """Install the Python scripts required by the bundled Snakefile."""
+    scripts_dir = workspace / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+
+    resource_scripts = files(
+        "impact_tools.beacon.resources"
+    ).joinpath("scripts")
+
+    script_names = (
+        "generate_groups.py",
+        "tag_variant_qc.py",
+    )
+
+    for script_name in script_names:
+        src = resource_scripts.joinpath(script_name)
+        dest = scripts_dir / script_name
+
+        try:
+            bundled = src.read_text(encoding="utf-8")
+        except (FileNotFoundError, TypeError) as exc:
+            raise ValidationError(
+                f"Required PGx helper script is not bundled: "
+                f"impact_tools/beacon/resources/scripts/{script_name}"
+            ) from exc
+
+        if not dest.exists() or dest.read_text(encoding="utf-8") != bundled:
+            dest.write_text(bundled, encoding="utf-8")
+            log.debug("Installed PGx helper script -> %s", dest)
 
 
-@dataclasses.dataclass
-class WorkspaceResult:
-    sample_id: str
-    workspace: Path
-    status: str  # "ok", "warn", "error"
-    duration_seconds: float | None = None
-    error: str | None = None
+def _install_targets_bed(workspace: Path) -> str:
+    """Install the controlled pharmacogene targets BED into the workspace."""
+    src = files(
+        "impact_tools.beacon.resources"
+    ).joinpath("targets.bed")
+
+    dest = workspace / "resources" / "targets.bed"
+
+    try:
+        dest.write_bytes(src.read_bytes())
+    except (FileNotFoundError, TypeError) as exc:
+        raise ValidationError(
+            "Required bundled PGx resource is missing: "
+            "impact_tools/beacon/resources/targets.bed"
+        ) from exc
+
+    log.debug("Installed bundled targets.bed -> %s", dest)
+
+    return "resources/targets.bed"
 
 
-@dataclasses.dataclass
-class PgxRunResult:
-    sample_id: str
-    output_all: Path | None
-    output_pass: Path | None
-    status: str  # "ok", "warn", "error"
-    duration_seconds: float | None = None
-    return_code: int | None = None
-    error: str | None = None
-
-
-@dataclasses.dataclass
-class PgxPipelineResult:
-    prepare_results: list[WorkspaceResult]
-    run_results: list[PgxRunResult]
-    metrics_file: Path | None = None
-    report_file: Path | None = None
-
-    @property
-    def failed(self) -> int:
-        return sum(
-            1
-            for result in [*self.prepare_results, *self.run_results]
-            if result.status == "error"
+def _write_samples_tsv(dest: Path, samples: tuple[BatchSample, ...]) -> None:
+    lines = ["sample_id\tsex\tcountry_code\tbatch_id\tancestry_group"]
+    for s in samples:
+        lines.append(
+            f"{s.sample_id}\t{s.sex}\t{s.country_code}\t"
+            f"{s.batch_id}\t{s.ancestry_group or ''}"
         )
-
-    @property
-    def warned(self) -> int:
-        return sum(
-            1
-            for result in [*self.prepare_results, *self.run_results]
-            if result.status == "warn"
-        )
-
-    @property
-    def succeeded(self) -> int:
-        return sum(
-            1
-            for result in [*self.prepare_results, *self.run_results]
-            if result.status == "ok"
-        )
+    dest.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _pgx_file_metrics(path: Path | None) -> dict | None:
-    """Return existence and size metrics for one PGx output file."""
-    if path is None:
-        return None
+def _write_gvcfs_list(dest: Path, samples: tuple[BatchSample, ...]) -> None:
+    lines = ["# sample_id\tgvcf_path\tgvcf_index_path"]
+    for s in samples:
+        lines.append(f"{s.sample_id}\t{s.gvcf}\t{s.gvcf_index or ''}")
+    dest.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    exists = path.exists()
 
-    return {
-        "path": str(path),
-        "exists": exists,
-        "size_bytes": path.stat().st_size if exists else None,
+def _write_glnexus_inputs_list(dest: Path, samples: tuple[BatchSample, ...]) -> None:
+    """Write one gVCF path per line for glnexus_cli --list (no header, no tabs)."""
+    dest.write_text(
+        "\n".join(str(s.gvcf) for s in samples) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_batch_json(
+    workspace: Path,
+    batch: PgxBatch,
+    config: PgxPipelineConfig,
+    input_mode: InputMode,
+) -> None:
+    payload = {
+        "release_id": batch.release_id,
+        "included_batch_ids": list(batch.included_batch_ids),
+        "created_at": dt.datetime.now().astimezone().isoformat(),
+        "input_mode": input_mode,
+        "sample_count": len(batch.samples),
+        "pgx_pilot_commit": config.pgx_pilot_commit,
+        "ref_fasta": str(batch.ref_fasta),
+        "pgx_image": str(config.pgx_image),
+        "executor": config.executor,
+        "container_runtime": config.container_runtime,
+        "glnexus_image": str(config.glnexus_image) if config.glnexus_image else GLNEXUS_DEFAULT_DOCKER_IMAGE,
+        "glnexus_config": config.glnexus_config,
+        "no_pypgx": config.no_pypgx,
+        "status": "planned",
+        "samples": [
+            {
+                "sample_id": s.sample_id,
+                "sex": s.sex,
+                "country_code": s.country_code,
+                "batch_id": s.batch_id,
+                "ancestry_group": s.ancestry_group,
+                "gvcf": str(s.gvcf) if s.gvcf else None,
+            }
+            for s in batch.samples
+        ],
     }
+    dest = workspace / "manifests" / "batch.json"
+    dest.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Section 4: Script generation
+# ---------------------------------------------------------------------------
+
+
+def _container_exec_lines(
+    runtime: ContainerRuntime,
+    image: str,
+    binds: list[tuple[str, str, bool]],
+) -> list[str]:
+    """Return shell continuation lines for the container invocation up to the image.
+
+    Each line ends with ' \\' for shell line continuation.  The caller appends
+    the command and its arguments as further continuation lines.
+
+    Args:
+        runtime: "docker" or "singularity".
+        image:   Docker image reference or absolute path to a .sif file.
+        binds:   List of (host_path, container_path, read_only) mount specs.
+    """
+    if runtime == "singularity":
+        lines: list[str] = ["singularity exec \\", "  --cleanenv \\"]
+        for src, dest, ro in binds:
+            mount = f"{src}:{dest}:ro" if ro else f"{src}:{dest}"
+            lines.append(f"  --bind {shlex.quote(mount)} \\")
+    else:
+        lines = ["docker run --rm \\"]
+        for src, dest, ro in binds:
+            mount = f"{src}:{dest}:ro" if ro else f"{src}:{dest}"
+            lines.append(f"  -v {shlex.quote(mount)} \\")
+    lines.append(f"  {shlex.quote(image)} \\")
+    return lines
+
+_SBATCH_HEADER = """\
+#!/usr/bin/env bash
+# pgx_pilot batch pipeline — generated by impact-tools beacon pgx
+# Release: {release_id}
+# Generated: {generated_at}
+# pgx_pilot commit: {pgx_pilot_commit}
+#
+#SBATCH --job-name={job_name}
+#SBATCH --cpus-per-task={cpus}
+#SBATCH --mem={memory}
+#SBATCH --time={time_limit}
+#SBATCH --output={log_dir}/pgx_{release_id}_%j.out
+#SBATCH --error={log_dir}/pgx_{release_id}_%j.err
+##SBATCH --partition=YOUR_PARTITION   # uncomment and set your cluster partition
+##SBATCH --account=YOUR_ACCOUNT       # uncomment and set your compute account
+"""
+
+_LOCAL_HEADER = """\
+#!/usr/bin/env bash
+# pgx_pilot batch pipeline — generated by impact-tools beacon pgx
+# Release: {release_id}
+# Generated: {generated_at}
+# pgx_pilot commit: {pgx_pilot_commit}
+"""
+
+
+def _pipeline_body_lines(
+    batch: PgxBatch,
+    config: PgxPipelineConfig,
+    *,
+    cpus_assignment: str,
+) -> list[str]:
+    """Generate the pipeline body shared by local and HPC launchers."""
+    ws = batch.workspace
+
+    lines: list[str] = [
+        "# --- Variables ---",
+        f"WORKSPACE={shlex.quote(str(ws))}",
+        f"PGX_IMAGE={shlex.quote(str(config.pgx_image))}",
+        f"REF_FASTA={shlex.quote(str(batch.ref_fasta))}",
+        f"RELEASE_ID={shlex.quote(batch.release_id)}",
+        f"JOINT_VCF={shlex.quote(str(batch.joint_vcf_path))}",
+        (
+            "EXPECTED_SAMPLES="
+            + shlex.quote(
+                str(ws / "manifests" / "expected_samples.txt")
+            )
+        ),
+        cpus_assignment,
+        "",
+    ]
+
+    # Step 1: Joint genotyping with GLnexus
+    lines += _glnexus_lines(batch, config)
+    lines.append("")
+
+    # Step 2: Validate samples in the joint VCF
+    lines += _in_container_validation_lines(batch, config)
+    lines.append("")
+
+    # Step 3: AF/QC Snakemake workflow
+    lines += _snakemake_lines(
+        batch,
+        config,
+        snakefile="Snakefile",
+    )
+    lines.append("")
+
+    # Step 4: Optional PyPGx workflow
+    if not config.no_pypgx:
+        lines += _pypgx_lines(batch, config)
+        lines.append("")
+
+    # Final output validation
+    lines += _output_validation_lines(batch, config)
+
+    # Optional cleanup of scratch intermediates. Placed after output validation
+    # so that, under `set -euo pipefail`, temp files survive any earlier failure.
+    if config.cleanup_temp:
+        lines.append("")
+        lines += _cleanup_temp_lines(batch)
+
+    return lines
+
+
+def write_sbatch(
+    batch: PgxBatch,
+    config: PgxPipelineConfig,
+) -> Path:
+    """Generate the HPC SLURM launcher using Singularity."""
+    slurm = config.slurm
+    ws = batch.workspace
+    log_dir = ws / "logs"
+
+    header = _SBATCH_HEADER.format(
+        release_id=batch.release_id,
+        generated_at=dt.datetime.now().astimezone().isoformat(),
+        pgx_pilot_commit=config.pgx_pilot_commit,
+        job_name=slurm.job_name,
+        cpus=slurm.cpus,
+        memory=slurm.memory,
+        time_limit=slurm.time_limit,
+        log_dir=log_dir,
+    )
+
+    lines: list[str] = [header]
+
+    for extra in slurm.extra_args:
+        lines.append(f"#SBATCH {extra}")
+
+    lines += [
+        "",
+        "set -euo pipefail",
+        "",
+        "# module load singularity   # uncomment if required by the HPC",
+        "",
+    ]
+
+    lines += _pipeline_body_lines(
+        batch,
+        config,
+        cpus_assignment=(
+            'CPUS="${SLURM_CPUS_PER_TASK:-'
+            + str(slurm.cpus)
+            + '}"'
+        ),
+    )
+
+    script_path = config.execution_script_path
+    script_path.write_text(
+        "\n".join(lines) + "\n",
+        encoding="utf-8",
+    )
+    script_path.chmod(0o750)
+
+    log.info("SBATCH script written: %s", script_path)
+    return script_path
+
+
+def write_local_script(
+    batch: PgxBatch,
+    config: PgxPipelineConfig,
+) -> Path:
+    """Generate the local Docker launcher."""
+    header = _LOCAL_HEADER.format(
+        release_id=batch.release_id,
+        generated_at=dt.datetime.now().astimezone().isoformat(),
+        pgx_pilot_commit=config.pgx_pilot_commit,
+    )
+
+    lines: list[str] = [
+        header,
+        "",
+        "set -euo pipefail",
+        "",
+    ]
+
+    lines += _pipeline_body_lines(
+        batch,
+        config,
+        cpus_assignment=f"CPUS={config.snakemake_jobs}",
+    )
+
+    script_path = config.execution_script_path
+    script_path.write_text(
+        "\n".join(lines) + "\n",
+        encoding="utf-8",
+    )
+    script_path.chmod(0o750)
+
+    log.info("Local execution script written: %s", script_path)
+    return script_path
+
+
+def write_execution_script(
+    batch: PgxBatch,
+    config: PgxPipelineConfig,
+) -> Path:
+    """Generate the launcher corresponding to the selected executor."""
+    if config.executor == "hpc":
+        return write_sbatch(batch, config)
+
+    return write_local_script(batch, config)
+
+
+def _glnexus_lines(batch: PgxBatch, config: PgxPipelineConfig) -> list[str]:
+    """Return sbatch lines for GLnexus joint genotyping.
+
+    Skips execution if the joint VCF and its index already exist, so the script
+    is safe to re-run after a partial failure.
+    """
+    ws = batch.workspace
+    runtime = config.container_runtime
+    image = (
+        str(config.glnexus_image)
+        if config.glnexus_image is not None
+        else GLNEXUS_DEFAULT_DOCKER_IMAGE
+    )
+
+    # Mount workspace at /workspace.
+    # For gvcf_dir mode: one bind covers all samples under the same root.
+    # For gvcf_list mode: bind each unique parent dir (paths may be scattered).
+    binds: list[tuple[str, str, bool]] = [(str(ws), "/workspace", False)]
+    if config.gvcf_dir is not None:
+        gvcf_root = str(config.gvcf_dir.resolve())
+        binds.append((gvcf_root, gvcf_root, True))
+    else:
+        for d in sorted({str(s.gvcf.parent) for s in batch.samples}):
+            binds.append((d, d, True))
+
+    container_joint_vcf = f"/workspace/data/{batch.release_id}.joint.vcf.gz"
+    container_glnexus_inputs = "/workspace/manifests/glnexus_inputs.list"
+    container_glnexus_work = "/workspace/data/glnexus_work"
+
+    inner_cmd = (
+        f"set -euo pipefail && "
+        f"glnexus_cli "
+        f"--config {shlex.quote(config.glnexus_config)} "
+        f"--dir {shlex.quote(container_glnexus_work)} "
+        f"--list {shlex.quote(container_glnexus_inputs)} "
+        f"| bcftools view -O z -o {shlex.quote(container_joint_vcf)} && "
+        f"bcftools index -t {shlex.quote(container_joint_vcf)}"
+    )
+
+    exec_lines = _container_exec_lines(runtime, image, binds)
+
+    lines = [
+        "# ================================================================",
+        "# STEP 1: Joint genotyping — GLnexus",
+        "# ================================================================",
+        'if [ -f "$JOINT_VCF" ] && [ -f "${JOINT_VCF}.tbi" ]; then',
+        '  echo "Joint VCF already exists — skipping GLnexus."',
+        "else",
+        '  echo "Running GLnexus joint genotyping..."',
+        f'  rm -rf {shlex.quote(str(ws / "data" / "glnexus_work"))}',
+    ]
+    for line in exec_lines:
+        lines.append("  " + line)
+    lines.append(f"    bash -c {shlex.quote(inner_cmd)}")
+    lines += [
+        "fi",
+        "",
+        '[ -f "$JOINT_VCF" ] || { echo "ERROR: Joint VCF not found after GLnexus: $JOINT_VCF" >&2; exit 1; }',
+        '[ -f "${JOINT_VCF}.tbi" ] || { echo "ERROR: index not found: ${JOINT_VCF}.tbi" >&2; exit 1; }',
+        'echo "Joint VCF ready: $JOINT_VCF"',
+    ]
+    return lines
+
+
+def _in_container_validation_lines(
+    batch: PgxBatch,
+    config: PgxPipelineConfig,
+) -> list[str]:
+    ref_parent = batch.ref_fasta.parent
+    binds = [
+        (str(batch.workspace), str(batch.workspace), False),
+        (str(ref_parent), str(ref_parent), True),
+    ]
+    lines = [
+        "# --- In-container validation ---",
+        'echo "Validating joint VCF sample list..."',
+    ]
+    validation_script = r"""
+set -euo pipefail
+ACTUAL=$(bcftools query -l "$1" | sort)
+EXPECTED=$(sort "$2")
+if [ "$ACTUAL" != "$EXPECTED" ]; then
+  echo "ERROR: sample list mismatch in joint VCF" >&2
+  diff <(echo "$EXPECTED") <(echo "$ACTUAL") >&2
+  exit 1
+fi
+echo "Sample validation OK ($(echo "$ACTUAL" | wc -l) samples)"
+"""
+    lines += _container_exec_lines(config.container_runtime, str(config.pgx_image), binds)
+    lines += [
+        f"  bash -c {shlex.quote(validation_script)} _ \\",
+        '  "$JOINT_VCF" "$EXPECTED_SAMPLES"',
+    ]
+    return lines
+
+
+def _snakemake_lines(
+    batch: PgxBatch,
+    config: PgxPipelineConfig,
+    snakefile: str,
+) -> list[str]:
+    ws = batch.workspace
+    ref_parent = batch.ref_fasta.parent
+    binds = [
+        (str(ws), "/pipeline", False),
+        (str(ref_parent), str(ref_parent), True),
+    ]
+    lines = [
+        f"# --- AF/QC pipeline ({snakefile}) ---",
+        f'echo "Running Snakemake ({snakefile})..."',
+    ]
+    lines += _container_exec_lines(config.container_runtime, str(config.pgx_image), binds)
+    lines += [
+        "  snakemake \\",
+        f"    --snakefile /pipeline/{snakefile} \\",
+        "    --directory /pipeline \\",
+        '    --cores "$CPUS" \\',
+        "    --rerun-incomplete \\",
+        "    --printshellcmds",
+    ]
+    return lines
+
+
+def _pypgx_lines(batch: PgxBatch, config: PgxPipelineConfig) -> list[str]:
+    ws = batch.workspace
+    ref_parent = batch.ref_fasta.parent
+    snakefile_arg = "/pipeline/Snakefile.pypgx"
+    if config.pypgx_snakefile is not None:
+        snakefile_arg = str(config.pypgx_snakefile)
+    binds = [
+        (str(ws), "/pipeline", False),
+        (str(ref_parent), str(ref_parent), True),
+    ]
+    lines = [
+        "# --- PyPGx pipeline ---",
+        "# NOTE: PyPGx bundle (v0.26.0) must be pre-downloaded and available",
+        "# inside the container or via a bind-mount. Nodes must not access the internet.",
+        'echo "Running Snakemake (Snakefile.pypgx)..."',
+    ]
+    lines += _container_exec_lines(config.container_runtime, str(config.pgx_image), binds)
+    lines += [
+        "  snakemake \\",
+        f"    --snakefile {shlex.quote(snakefile_arg)} \\",
+        "    --directory /pipeline \\",
+        '    --cores "$CPUS" \\',
+        "    --rerun-incomplete \\",
+        "    --printshellcmds",
+    ]
+    return lines
+
+
+def _cleanup_temp_lines(batch: PgxBatch) -> list[str]:
+    """Remove the scratch intermediates under results/temp (host-side, post-run)."""
+    temp_dir = batch.workspace / "results" / "temp"
+    return [
+        "# --- Cleanup: remove scratch intermediates (--cleanup) ---",
+        'echo "Removing intermediate files: results/temp"',
+        f"rm -rf {shlex.quote(str(temp_dir))}",
+    ]
+
+
+def _output_validation_lines(
+    batch: PgxBatch, config: PgxPipelineConfig
+) -> list[str]:
+    ws = batch.workspace
+    ref_parent = batch.ref_fasta.parent
+    release_id = batch.release_id
+    binds = [
+        (str(ws), "/pipeline", False),
+        (str(ref_parent), str(ref_parent), True),
+    ]
+    lines = [
+        "# --- Output validation ---",
+        'echo "Validating outputs..."',
+    ]
+    lines += _container_exec_lines(config.container_runtime, str(config.pgx_image), binds)
+    lines += [
+        "  bash -c '" + f"""
+    set -euo pipefail
+    PASS=/pipeline/results/{release_id}.sites.pass.vcf.gz
+    ALL=/pipeline/results/{release_id}.sites.all.vcf.gz
+    for F in "$PASS" "$ALL"; do
+      [ -s "$F" ] || {{ echo "ERROR: missing or empty output: $F" >&2; exit 1; }}
+      [ -f "${{F}}.tbi" ] || {{ echo "ERROR: missing index: ${{F}}.tbi" >&2; exit 1; }}
+    done
+    # Verify sites-only (no sample columns)
+    N=$(bcftools query -l "$PASS" | wc -l)
+    [ "$N" -eq 0 ] || {{ echo "ERROR: sites.pass.vcf.gz contains $N sample column(s)" >&2; exit 1; }}
+    echo "Output validation OK"
+  '""",
+    ]
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Section 5: Orchestration
+# ---------------------------------------------------------------------------
+
+
+def _derive_batch_id(samples_tsv: Path) -> str:
+    """Derive a safe batch_id from the TSV's batch_id column or its filename."""
+    # Try batch_id column: if all rows agree on one value, use it
+    try:
+        with samples_tsv.open(encoding="utf-8") as fh:
+            header_skipped = False
+            batch_ids: set[str] = set()
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                fields = line.split("\t")
+                if not header_skipped and fields[0].lower() == "sample_id":
+                    header_skipped = True
+                    continue
+                if len(fields) >= 4 and fields[3].strip():
+                    batch_ids.add(fields[3].strip())
+        if len(batch_ids) == 1:
+            candidate = batch_ids.pop()
+            if is_safe_batch_id(candidate):
+                return candidate
+    except OSError:
+        pass
+
+    # Fall back to TSV filename stem (strip known suffixes)
+    stem = samples_tsv.stem  # removes last extension (.tsv)
+    for suffix in (".samples", "_samples", ".meta", "_meta", ".batch"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    safe = re.sub(r"[^A-Za-z0-9_\-]", "_", stem)
+    safe = re.sub(r"^[^A-Za-z0-9]+", "", safe)
+    return (safe or "batch")[:63]
+
+
+def build_batch(config: PgxPipelineConfig) -> PgxBatch:
+    """Validate inputs and build a PgxBatch from the pipeline config."""
+    assert config.samples_tsv is not None  # validated by validate_pre_job
+
+    metas = parse_samples_tsv(config.samples_tsv)
+
+    if config.input_mode == "gvcf_dir":
+        assert config.gvcf_dir is not None
+        samples = tuple(resolve_gvcfs_from_dir(config.gvcf_dir, metas))
+    else:
+        assert config.gvcf_list is not None
+        samples = tuple(resolve_gvcfs_from_list(config.gvcf_list, metas))
+
+    return PgxBatch(
+        release_id=config.release_id,
+        samples=samples,
+        workspace=config.workspace,
+        ref_fasta=config.ref_fasta,
+    )
+
+
+def plan_batch(config: PgxPipelineConfig) -> tuple[PgxBatch, Path]:
+    """Validate, build workspace and generate sbatch script. No subprocess calls.
+
+    Returns (batch, execution_script_path).
+    """
+    import shutil
+
+    warnings = validate_pre_job(config)
+    for w in warnings:
+        log.warning(w)
+
+    if config.workspace.exists() and config.force:
+        shutil.rmtree(config.workspace)
+        log.info("Removed existing workspace (--force): %s", config.workspace)
+
+    batch = build_batch(config)
+
+    log.info(
+        "Release %r: %d sample(s), input_mode=%s, executor=%s",
+        batch.release_id,
+        len(batch.samples),
+        config.input_mode,
+        config.executor,
+    )
+
+    create_workspace(batch, config, input_mode=config.input_mode)
+
+    script_path = write_execution_script(batch, config)
+
+    return batch, script_path
+
+
+# ---------------------------------------------------------------------------
+# Section 7: Metrics and reporting
+# ---------------------------------------------------------------------------
 
 
 def write_pgx_metrics(
     *,
-    config: PgxConfig,
-    discovered_sources: list[SampleSource],
-    existing_records: list[SampleRecord],
-    new_records: list[SampleRecord],
-    inferences: list[SexInferenceResult | None],
-    result: PgxPipelineResult | None,
-    prepare_only: bool,
-    run_only: bool,
+    config: PgxPipelineConfig,
+    batch: PgxBatch | None,
+    execution_script_path: Path | None,
+    job_id: str | None,
+    status: BatchStatus,
     started_at: str,
     ended_at: str,
     duration_seconds: float,
-    status: str,
-    error: str | None = None,
+    warnings: list[str],
+    error: str | None,
 ) -> Path:
-    """Write a JSON metrics report for one Beacon PGx execution."""
-    logs_dir = config.logs_dir
+    """Write a JSON metrics file for one batch PGx execution."""
+    logs_dir = config.workspace / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    metrics_file = logs_dir / f"beacon_pgx_{timestamp}.metrics.json"
+    metrics_file = logs_dir / f"pgx_{config.release_id}_{timestamp}.metrics.json"
 
-    all_records = [*existing_records, *new_records]
-
-    source_by_sample = {
-        source.sample_id: source
-        for source in discovered_sources
-    }
-    record_by_sample = {
-        record.sample_id: record
-        for record in all_records
-    }
-    inference_by_sample = {
-        inference.sample_id: inference
-        for inference in inferences
-        if inference is not None
-    }
-
-    prepare_results = (
-        result.prepare_results
-        if result is not None
-        else []
-    )
-    run_results = (
-        result.run_results
-        if result is not None
-        else []
-    )
-
-    prepare_by_sample = {
-        item.sample_id: item
-        for item in prepare_results
-    }
-    run_by_sample = {
-        item.sample_id: item
-        for item in run_results
-    }
-
-    sample_ids = [
-        source.sample_id
-        for source in discovered_sources
-    ]
-
-    for record in all_records:
-        if record.sample_id not in sample_ids:
-            sample_ids.append(record.sample_id)
-
-    existing_sample_ids = {
-        record.sample_id
-        for record in existing_records
-    }
-
-    samples = []
-
-    for sample_id in sample_ids:
-        source = source_by_sample.get(sample_id)
-        record = record_by_sample.get(sample_id)
-        inference = inference_by_sample.get(sample_id)
-        workspace = prepare_by_sample.get(sample_id)
-        pgx_run = run_by_sample.get(sample_id)
-
-        if sample_id in existing_sample_ids:
-            sex_resolution = "existing"
-        elif inference is None:
-            sex_resolution = "failed"
-        elif inference.sex is None and record is not None:
-            sex_resolution = "manual"
-        else:
-            sex_resolution = "automatic"
-
-        samples.append(
-            {
-                "sample_id": sample_id,
-                "vcf_basename": (
-                    source.vcf_basename
-                    if source is not None
-                    else (
-                        record.vcf_basename
-                        if record is not None
-                        else None
-                    )
-                ),
-                "sex": record.sex if record is not None else None,
-                "country_code": (
-                    record.country_code
-                    if record is not None
-                    else None
-                ),
-                "sex_inference": {
-                    "status": sex_resolution,
-                    "n_chry": (
-                        inference.n_chry
-                        if inference is not None
-                        else None
-                    ),
-                    "inferred_sex": (
-                        inference.sex
-                        if inference is not None
-                        else None
-                    ),
-                },
-                "workspace": (
-                    {
-                        "status": workspace.status,
-                        "path": str(workspace.workspace),
-                        "duration_seconds": (
-                            round(workspace.duration_seconds, 3)
-                            if workspace.duration_seconds is not None
-                            else None
-                        ),
-                        "error": workspace.error,
-                    }
-                    if workspace is not None
-                    else None
-                ),
-                "pgx_run": (
-                    {
-                        "status": pgx_run.status,
-                        "duration_seconds": (
-                            round(pgx_run.duration_seconds, 3)
-                            if pgx_run.duration_seconds is not None
-                            else None
-                        ),
-                        "return_code": pgx_run.return_code,
-                        "error": pgx_run.error,
-                        "output_all": _pgx_file_metrics(
-                            pgx_run.output_all
-                        ),
-                        "output_pass": _pgx_file_metrics(
-                            pgx_run.output_pass
-                        ),
-                    }
-                    if pgx_run is not None
-                    else None
-                ),
-            }
-        )
-
-    if prepare_only:
-        mode = "prepare"
-    elif run_only:
-        mode = "run"
-    else:
-        mode = "full"
+    outputs: dict = {}
+    if batch is not None:
+        ws = batch.workspace
+        outputs = {
+            "sites_all": str(ws / "results" / f"{batch.release_id}.sites.all.vcf.gz"),
+            "sites_pass": str(ws / "results" / f"{batch.release_id}.sites.pass.vcf.gz"),
+            "intermediate": str(
+                ws / "results" / "intermediate"
+                / f"{batch.release_id}.full_sample_data.vcf.gz"
+            ),
+            "pgx_alleles": str(ws / "results" / "pgx" / "merged_alleles.csv"),
+            "pgx_genotypes": str(ws / "results" / "pgx" / "merged_genotypes.csv"),
+            "pgx_phenotypes": str(ws / "results" / "pgx" / "merged_phenotypes.csv"),
+        }
 
     report = {
         "workflow": "beacon.pgx",
+        "release_id": config.release_id,
         "status": status,
         "error": error,
+        "warnings": warnings,
         "started_at": started_at,
         "ended_at": ended_at,
         "duration_seconds": round(duration_seconds, 3),
         "command": " ".join(sys.argv),
+        "job_id": job_id,
+        "execution_script": (
+            str(execution_script_path)
+            if execution_script_path is not None
+            else None
+        ),
+        "sbatch_script": (
+            str(execution_script_path)
+            if execution_script_path is not None
+            and config.executor == "hpc"
+            else None
+        ),
         "config": {
-            "base_dir": str(config.base_dir.resolve()),
-            "country_code": config.country_code,
-            "sex_ambiguous_min": config.sex_ambiguous_min,
-            "sex_ambiguous_max": config.sex_ambiguous_max,
-            "bcftools_image": config.bcftools_image,
-            "pgx_image": config.pgx_image,
-            "pgx_repo": (
-                str(config.pgx_repo)
-                if config.pgx_repo is not None
-                else None
-            ),
-            "snakemake_jobs": config.snakemake_jobs,
-            "workers": config.workers,
-            "mode": mode,
+            "release_id": config.release_id,
+            "input_mode": config.input_mode,
+            "output_dir": str(config.output_dir),
+            "ref_fasta": str(config.ref_fasta),
+            "pgx_image": str(config.pgx_image),
+            "executor": config.executor,
+            "container_runtime": config.container_runtime,
+            "glnexus_image": str(config.glnexus_image) if config.glnexus_image else GLNEXUS_DEFAULT_DOCKER_IMAGE,
+            "glnexus_config": config.glnexus_config,
+            "no_pypgx": config.no_pypgx,
+            "pgx_pilot_commit": config.pgx_pilot_commit,
+            "slurm": dataclasses.asdict(config.slurm),
         },
         "environment": {
             "hostname": socket.gethostname(),
             "platform": platform.platform(),
             "python": sys.version.split()[0],
-            "cwd": str(Path.cwd()),
         },
         "summary": {
-            "lifted_vcfs": len(
-                {
-                    source.vcf_basename
-                    for source in discovered_sources
-                }
-            ),
-            "samples_discovered": len(discovered_sources),
-            "existing_samples": len(existing_records),
-            "new_samples": len(new_records),
-            "sex_inference_attempted": len(inferences),
-            "sex_inference_failed": sum(
-                inference is None
-                for inference in inferences
-            ),
-            "sex_ambiguous": sum(
-                inference is not None
-                and inference.sex is None
-                for inference in inferences
-            ),
-            "prepare_steps": len(prepare_results),
-            "run_steps": len(run_results),
-            "succeeded": (
-                result.succeeded
-                if result is not None
-                else 0
-            ),
-            "warned": (
-                result.warned
-                if result is not None
-                else 0
-            ),
-            "failed": (
-                result.failed
-                if result is not None
-                else 0
-            ),
+            "sample_count": len(batch.samples) if batch else 0,
+            "sample_ids": list(batch.sample_ids) if batch else [],
+            "included_batch_ids": list(batch.included_batch_ids) if batch else [],
         },
-        "samples": samples,
+        "outputs": outputs,
         "metrics_file": str(metrics_file),
         "report_file": None,
     }
 
     metrics_file.write_text(
-        json.dumps(
-            report,
-            indent=2,
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
+        json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
     )
-
     return metrics_file
 
 
-def write_pgx_html_report(
-    *,
-    metrics_file: Path,
-) -> Path:
+def write_pgx_html_report(*, metrics_file: Path) -> Path:
     """Generate an HTML report from a PGx metrics JSON."""
-    payload = json.loads(
-        metrics_file.read_text(encoding="utf-8")
-    )
+    from impact_tools.beacon.html_report import write_pgx_report  # lazy to avoid circular
 
-    report_name = (
-        metrics_file.name.removesuffix(".metrics.json")
-        + ".report.html"
-    )
+    payload = json.loads(metrics_file.read_text(encoding="utf-8"))
+
+    report_name = metrics_file.name.removesuffix(".metrics.json") + ".report.html"
     report_file = metrics_file.with_name(report_name)
 
     payload["metrics_file"] = str(metrics_file)
     payload["report_file"] = str(report_file)
 
-    write_pgx_report(
-        report_file,
-        payload,
-    )
+    write_pgx_report(report_file, payload)
 
     metrics_file.write_text(
-        json.dumps(
-            payload,
-            indent=2,
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
+        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
     )
-
     return report_file
-
-# ---------------------------------------------------------------------------
-# Discovery and samples.tsv I/O
-# ---------------------------------------------------------------------------
-
-def discover_lifted_vcfs(base_dir: Path) -> list[Path]:
-    """Return sorted list of *.GRCh38.clean.vcf.gz under <base_dir>/liftover/."""
-    liftover_dir = base_dir / "liftover"
-    if not liftover_dir.exists():
-        return []
-    return sorted(liftover_dir.glob("*.GRCh38.clean.vcf.gz"))
-
-
-def _discover_vcfs_from_config(config: PgxConfig) -> list[Path]:
-    """Resolve VCF inputs. Priority: --vcf > --vcf-dir > liftover/."""
-    if config.vcf:
-        return sorted(config.vcf)
-    if config.vcf_dir is not None:
-        d = config.vcf_dir
-        if not d.exists():
-            return []
-        return sorted(
-            p for p in d.iterdir()
-            if p.is_file() and (p.suffix == ".vcf" or p.name.endswith(".vcf.gz"))
-        )
-    return discover_lifted_vcfs(config.base_dir)
-
-
-def _docker_data_path(config: PgxConfig, path: Path) -> str:
-    """Translate a path below base_dir to its /data path inside Docker."""
-    relative = path.resolve().relative_to(config.base_dir.resolve())
-    return f"/data/{relative.as_posix()}"
-
-
-def list_vcf_samples(config: PgxConfig, vcf: Path) -> list[str]:
-    """Return every sample declared in a VCF header."""
-    cmd = [
-        "docker", "run", "--rm",
-        "-v", f"{config.base_dir.resolve()}:/data:ro",
-        config.bcftools_image,
-        "bcftools", "query", "-l",
-        _docker_data_path(config, vcf),
-    ]
-
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    if proc.returncode != 0:
-        raise ValueError(
-            f"Could not read samples from {vcf}\n"
-            f"STDERR: {proc.stderr.strip()}"
-        )
-
-    samples = [
-        line.strip()
-        for line in proc.stdout.splitlines()
-        if line.strip()
-    ]
-
-    if not samples:
-        raise ValueError(f"No samples found in VCF: {vcf}")
-
-    if len(samples) != len(set(samples)):
-        raise ValueError(f"Duplicated sample names inside VCF: {vcf}")
-
-    return samples
-
-
-def discover_lifted_samples(config: PgxConfig) -> list[SampleSource]:
-    """Expand VCF files into one SampleSource per contained sample.
-
-    Sources are resolved from --vcf, --vcf-dir, or liftover dir (in that order).
-    """
-    vcfs = _discover_vcfs_from_config(config)
-
-    if not vcfs:
-        if config.vcf:
-            raise ValueError(f"No VCF files resolved from the --vcf arguments provided.")
-        if config.vcf_dir is not None:
-            raise ValueError(f"No VCF files found in --vcf-dir: {config.vcf_dir}")
-        raise ValueError(
-            f"No *.GRCh38.clean.vcf.gz files found in {config.liftover_dir}. "
-            "Pass --vcf or --vcf-dir to specify VCF inputs explicitly."
-        )
-
-    sources: list[SampleSource] = []
-    seen: dict[str, Path] = {}
-
-    for vcf in vcfs:
-        samples = list_vcf_samples(config, vcf)
-
-        log.info(
-            "%s: %d sample(s)",
-            vcf.name,
-            len(samples),
-        )
-
-        for sample_id in samples:
-            if (
-                not sample_id
-                or "/" in sample_id
-                or "\\" in sample_id
-                or sample_id in {".", ".."}
-            ):
-                raise ValueError(
-                    f"Unsafe sample identifier {sample_id!r} in {vcf}"
-                )
-
-            previous = seen.get(sample_id)
-            if previous is not None:
-                raise ValueError(
-                    f"Sample {sample_id!r} occurs in more than one VCF:\n"
-                    f"  - {previous}\n"
-                    f"  - {vcf}"
-                )
-
-            seen[sample_id] = vcf
-            sources.append(
-                SampleSource(
-                    sample_id=sample_id,
-                    vcf_basename=vcf.name,
-                )
-            )
-
-    log.info(
-        "Discovered %d sample(s) across %d lifted VCF file(s).",
-        len(sources),
-        len(vcfs),
-    )
-
-    return sources
-
-
-def read_samples_tsv(tsv_path: Path) -> list[SampleRecord]:
-    """Parse samples.tsv (sample_id<TAB>sex<TAB>country_code) into SampleRecord objects."""
-    records: list[SampleRecord] = []
-    with tsv_path.open() as fh:
-        for raw in fh:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            fields = line.split("\t")
-            if len(fields) < 2:
-                continue
-            sample_id = fields[0]
-            sex: Sex = "M" if fields[1].upper() == "M" else "F"
-            country_code = fields[2] if len(fields) >= 3 else "ES"
-            vcf_basename = fields[3] if len(fields) >= 4 else ""
-            records.append(SampleRecord(sample_id=sample_id, sex=sex, country_code=country_code, vcf_basename=vcf_basename))
-    return records
-
-
-def append_sample_to_tsv(tsv_path: Path, record: SampleRecord) -> None:
-    """Append one sample line to samples.tsv, creating the file with a header if needed."""
-    if not tsv_path.exists():
-        tsv_path.parent.mkdir(parents=True, exist_ok=True)
-        tsv_path.write_text(
-            "# samples.tsv — IMPaCT cohort sample metadata\n"
-            "# sample_id<TAB>sex<TAB>country_code<TAB>vcf_basename\n"
-            "# sex: M or F (inferred from non-ref chrY variant count)\n"
-        )
-    with tsv_path.open("a") as fh:
-        fh.write(f"{record.sample_id}\t{record.sex}\t{record.country_code}\t{record.vcf_basename}\n")
-
-
-# ---------------------------------------------------------------------------
-# Sex inference
-# ---------------------------------------------------------------------------
-
-def count_chry_variants(
-    config: PgxConfig,
-    source: SampleSource,
-) -> SexInferenceResult | None:
-    """Count non-reference chrY genotypes for one selected sample."""
-    vcf = config.resolve_vcf(source.vcf_basename)
-    docker_vcf = _docker_data_path(config, vcf)
-
-    script = r"""
-VCF="$1"
-SAMPLE="$2"
-
-n=$(
-    bcftools query \
-        -s "$SAMPLE" \
-        -r chrY \
-        -f '[%GT\n]' \
-        "$VCF" 2>/dev/null |
-    grep -cvE '^(0[/|]0|\.[/|]\.|\.)(\t|$)' || true
-)
-
-printf '%s\n' "$n"
-"""
-
-    cmd = [
-        "docker", "run", "--rm",
-        "-v", f"{config.base_dir.resolve()}:/data:ro",
-        config.bcftools_image,
-        "bash", "-c",
-        script,
-        "_",
-        docker_vcf,
-        source.sample_id,
-    ]
-
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    if proc.returncode != 0 or not proc.stdout.strip():
-        log.error(
-            "chrY count failed for %s in %s: %s",
-            source.sample_id,
-            source.vcf_basename,
-            proc.stderr.strip(),
-        )
-        return None
-
-    try:
-        n_chry = int(proc.stdout.strip())
-    except ValueError:
-        log.error(
-            "Non-integer chrY count for %s: %r",
-            source.sample_id,
-            proc.stdout.strip(),
-        )
-        return None
-
-    return SexInferenceResult(
-        sample_id=source.sample_id,
-        vcf_basename=source.vcf_basename,
-        n_chry=n_chry,
-        sex=infer_sex(n_chry, config),
-    )
-
-
-def infer_sex(
-    n_chry: int,
-    config: PgxConfig,
-) -> Sex | None:
-    """Infer sex from the number of non-reference chrY genotypes."""
-    if n_chry > config.sex_ambiguous_max:
-        return "M"
-
-    if n_chry < config.sex_ambiguous_min:
-        return "F"
-
-    return None
-
-
-def infer_sex_batch(
-    config: PgxConfig,
-    sources: list[SampleSource],
-) -> list[SexInferenceResult | None]:
-    """Infer sex independently for every sample in every lifted VCF."""
-    if config.workers <= 1 or len(sources) <= 1:
-        return [count_chry_variants(config, source) for source in sources]
-
-    ordered: dict[int, SexInferenceResult | None] = {}
-
-    with ThreadPoolExecutor(max_workers=config.workers) as pool:
-        future_to_idx = {
-            pool.submit(count_chry_variants, config, source): i
-            for i, source in enumerate(sources)
-        }
-
-        for future in as_completed(future_to_idx):
-            i = future_to_idx[future]
-            source = sources[i]
-
-            try:
-                ordered[i] = future.result()
-            except Exception as exc:
-                log.error(
-                    "Sex inference error for %s: %s",
-                    source.sample_id,
-                    exc,
-                )
-                ordered[i] = None
-
-    return [ordered[i] for i in range(len(sources))]
-
-
-# ---------------------------------------------------------------------------
-# Resources cache
-# ---------------------------------------------------------------------------
-
-def ensure_pgx_resources_dir(config: PgxConfig) -> Path:
-    """Return a writable resources cache dir, seeding it from pgx_repo/resources/.
-
-    Creates base_dir/pgx_resources/ if it doesn't exist and copies any files
-    from pgx_repo/resources/ that are not already present (skips existing files
-    so cached downloads are preserved).
-    """
-    cache = config.pgx_resources_dir
-    cache.mkdir(parents=True, exist_ok=True)
-
-    if config.pgx_repo is not None:
-        src = config.pgx_repo / "resources"
-        if src.is_dir():
-            for item in src.iterdir():
-                dest = cache / item.name
-                if not dest.exists():
-                    if item.is_file():
-                        shutil.copy2(item, dest)
-                    elif item.is_dir():
-                        shutil.copytree(item, dest)
-
-    return cache
-
-
-# ---------------------------------------------------------------------------
-# Validation
-# ---------------------------------------------------------------------------
-
-def validate_pgx_layout(config: PgxConfig) -> None:
-    """Warn if liftover dir is absent and no explicit VCF inputs were provided."""
-    if config.vcf or config.vcf_dir is not None:
-        return
-    if not config.liftover_dir.exists():
-        log.warning(
-            "Liftover directory not found: %s. "
-            "Pass --vcf <file> or --vcf-dir <dir> to specify VCF inputs explicitly, "
-            "or run `impact-tools beacon liftover` first.",
-            config.liftover_dir,
-        )
-
-
-def validate_pgx_run_prereqs(config: PgxConfig) -> None:
-    """Check prerequisites needed for the pgx_pilot run step."""
-    if config.pgx_repo is None or not config.pgx_repo.exists():
-        raise ValueError(
-            f"pgx_pilot repo not found: {config.pgx_repo}\n"
-            "Pass --pgx-repo or set the PGX_REPO environment variable."
-        )
-    try:
-        subprocess.run(
-            ["docker", "image", "inspect", config.pgx_image],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True,
-        )
-    except subprocess.CalledProcessError:
-        raise ValueError(
-            f"Docker image {config.pgx_image!r} not found locally.\n"
-            f"Build it with: cd {config.pgx_repo} && docker build -t {config.pgx_image} ."
-        )
-
-def install_snakefile(config: PgxConfig) -> None:
-    """Install or update the bundled Snakefile under pgx_runs/."""
-    dest = config.snakefile
-
-    config.pgx_runs_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    src = files("impact_tools.beacon.resources").joinpath(
-        "Snakefile"
-    )
-    bundled_content = src.read_text()
-
-    if dest.exists():
-        installed_content = dest.read_text()
-
-        if installed_content == bundled_content:
-            log.info(
-                "Snakefile is already up to date at %s.",
-                dest,
-            )
-            return
-
-        log.info(
-            "Updating installed Snakefile: %s",
-            dest,
-        )
-
-    dest.write_text(
-        bundled_content,
-        encoding="utf-8",
-    )
-
-    log.info(
-        "Installed bundled Snakefile -> %s",
-        dest,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Workspace preparation
-# ---------------------------------------------------------------------------
-
-def prepare_workspace(
-    config: PgxConfig,
-    record: SampleRecord,
-) -> WorkspaceResult:
-    """Create the pgx_pilot workspace for one sample."""
-    ws = config.pgx_runs_dir / record.sample_id
-    started = time.monotonic()
-
-    if not record.vcf_basename:
-        log.error(
-            "[%s] Source VCF basename is missing",
-            record.sample_id,
-        )
-        return WorkspaceResult(
-            sample_id=record.sample_id,
-            workspace=ws,
-            status="error",
-            duration_seconds=time.monotonic() - started,
-            error="Source VCF basename is missing.",
-        )
-
-    vcf_src = config.resolve_vcf(record.vcf_basename).resolve()
-    tbi_src = Path(f"{vcf_src}.tbi")
-
-    if not vcf_src.is_file():
-        log.error(
-            "[%s] Missing lifted VCF: %s",
-            record.sample_id,
-            vcf_src,
-        )
-        return WorkspaceResult(
-            sample_id=record.sample_id,
-            workspace=ws,
-            status="error",
-            duration_seconds=time.monotonic() - started,
-            error=f"Missing lifted VCF: {vcf_src}",
-        )
-
-    if not tbi_src.is_file():
-        log.error(
-            "[%s] Missing .tbi index: %s",
-            record.sample_id,
-            tbi_src,
-        )
-        return WorkspaceResult(
-            sample_id=record.sample_id,
-            workspace=ws,
-            status="error",
-            duration_seconds=time.monotonic() - started,
-            error=f"Missing VCF index: {tbi_src}",
-        )
-
-    data_dir = ws / "data"
-    results_dir = ws / "results"
-
-    data_dir.mkdir(parents=True, exist_ok=True)
-    results_dir.mkdir(parents=True, exist_ok=True)
-
-    links = [
-        (
-            data_dir / f"{record.sample_id}.vcf.gz",
-            vcf_src,
-        ),
-        (
-            data_dir / f"{record.sample_id}.vcf.gz.tbi",
-            tbi_src,
-        ),
-    ]
-
-    for link, target in links:
-        if link.exists() or link.is_symlink():
-            link.unlink()
-
-        link.symlink_to(target)
-
-    # Used by bcftools view -S to select this sample from a joint VCF.
-    (data_dir / "sample_id.txt").write_text(
-        f"{record.sample_id}\n",
-        encoding="utf-8",
-    )
-
-    # Metadata consumed by pgx_pilot.
-    (data_dir / "samples.tsv").write_text(
-        f"{record.sample_id}\t"
-        f"{record.sex}\t"
-        f"{record.country_code}\n",
-        encoding="utf-8",
-    )
-
-    (ws / "config.yaml").write_text(
-        _CONFIG_YAML_TEMPLATE.format(
-            sample_id=record.sample_id,
-            country_code=record.country_code,
-        ),
-        encoding="utf-8",
-    )
-
-    log.info(
-        "[%s] Workspace ready -> %s "
-        "(source VCF: %s)",
-        record.sample_id,
-        ws,
-        record.vcf_basename,
-    )
-
-    return WorkspaceResult(
-        sample_id=record.sample_id,
-        workspace=ws,
-        status="ok",
-        duration_seconds=time.monotonic() - started,
-    )
-
-# ---------------------------------------------------------------------------
-# pgx_pilot execution
-# ---------------------------------------------------------------------------
-
-def run_pgx_pilot(config: PgxConfig, record: SampleRecord) -> PgxRunResult:
-    """Run the pgx_pilot Snakemake pipeline for one sample via Docker."""
-    ws = config.pgx_runs_dir / record.sample_id
-    vcf_in = config.resolve_vcf(
-        record.vcf_basename or f"{record.sample_id}.GRCh38.clean.vcf.gz"
-    )
-    out_all = ws / "results" / f"{record.sample_id}.sites.all.vcf.gz"
-    out_pass = ws / "results" / f"{record.sample_id}.sites.pass.vcf.gz"
-    log_file = config.base_dir / "logs" / f"{record.sample_id}_pgx.log"
-
-    if not ws.exists() or not (ws / "config.yaml").exists():
-        log.error("[%s] Workspace missing — run prepare step first", record.sample_id)
-        return PgxRunResult(
-            sample_id=record.sample_id,
-            output_all=None,
-            output_pass=None,
-            status="error",
-            error="Workspace or config.yaml is missing.",
-        )
-
-    for path in [ws / "results", ws / ".snakemake"]:
-        if path.exists():
-            try:
-                shutil.rmtree(path)
-            except PermissionError:
-                log.warning(
-                    "[%s] Could not remove %s (Docker may own it). "
-                    "Run: sudo rm -rf %s",
-                    record.sample_id, path, path,
-                )
-    (ws / "results").mkdir(exist_ok=True)
-
-    resources_cache = ensure_pgx_resources_dir(config)
-
-    cmd = [
-        "docker", "run", "--rm",
-        "-v", f"{ws}:/pipeline:z",
-        "-v", f"{vcf_in.parent}:{vcf_in.parent}:ro,z",
-        "-v", f"{config.snakefile}:/pipeline/Snakefile:ro,z",
-        "-v", f"{config.pgx_repo}/scripts:/pipeline/scripts:ro,z",
-        "-v", f"{resources_cache}:/pipeline/resources:z",
-        "-w", "/pipeline",
-        config.pgx_image,
-        "snakemake", "-s", "Snakefile",
-        "-j", str(config.snakemake_jobs),
-        "--rerun-incomplete",
-    ]
-
-    log.info(
-        "[%s] Input:  %s  (%s)",
-        record.sample_id, vcf_in.name, _fmt_size(vcf_in),
-    )
-    log.info("[%s] Running pgx_pilot (log: %s)", record.sample_id, log_file)
-    t0 = time.monotonic()
-    with log_file.open("w") as lf:
-        proc = subprocess.run(cmd, stdout=lf, stderr=lf, check=False)
-    elapsed = time.monotonic() - t0
-
-    if proc.returncode != 0:
-        log.error(
-            "[%s] pgx_pilot failed (rc=%d, %.1fs) — check %s",
-            record.sample_id, proc.returncode, elapsed, log_file,
-        )
-        return PgxRunResult(
-            sample_id=record.sample_id,
-            output_all=None,
-            output_pass=None,
-            status="error",
-            duration_seconds=elapsed,
-            return_code=proc.returncode,
-            error=f"pgx_pilot failed. Check log: {log_file}",
-        )
-
-    if not out_pass.exists():
-        log.warning(
-            "[%s] Snakemake exited OK but %s not found (%.1fs) — check %s",
-            record.sample_id, out_pass.name, elapsed, log_file,
-        )
-        return PgxRunResult(
-            sample_id=record.sample_id,
-            output_all=out_all if out_all.exists() else None,
-            output_pass=None,
-            status="warn",
-            duration_seconds=elapsed,
-            return_code=proc.returncode,
-            error=f"Expected output not found: {out_pass}",
-        )
-
-    log.info(
-        "[%s] pgx_pilot OK  (%.1fs)  all=%s  pass=%s",
-        record.sample_id, elapsed,
-        _fmt_size(out_all) if out_all.exists() else "N/A",
-        _fmt_size(out_pass),
-    )
-    return PgxRunResult(
-        sample_id=record.sample_id,
-        output_all=out_all if out_all.exists() else None,
-        output_pass=out_pass,
-        status="ok",
-        duration_seconds=elapsed,
-        return_code=proc.returncode,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Parallel batch helpers
-# ---------------------------------------------------------------------------
-
-def _parallel(fn, config: PgxConfig, items: list, error_factory) -> list:
-    """Run one function per item while preserving input order."""
-    ordered: dict[int, object] = {}
-
-    if config.workers <= 1 or len(items) <= 1:
-        for index, item in enumerate(items):
-            try:
-                ordered[index] = fn(config, item)
-            except Exception as exc:
-                log.error(
-                    "Unexpected error processing item %d: %s",
-                    index,
-                    exc,
-                )
-                ordered[index] = error_factory(item)
-
-        return [ordered[index] for index in range(len(items))]
-
-    with ThreadPoolExecutor(max_workers=config.workers) as pool:
-        future_to_idx = {
-            pool.submit(fn, config, item): index
-            for index, item in enumerate(items)
-        }
-
-        for future in as_completed(future_to_idx):
-            index = future_to_idx[future]
-
-            try:
-                ordered[index] = future.result()
-            except Exception as exc:
-                log.error(
-                    "Unexpected error processing item %d: %s",
-                    index,
-                    exc,
-                )
-                ordered[index] = error_factory(items[index])
-
-    return [ordered[index] for index in range(len(items))]
-
-
-def prepare_workspaces(
-    config: PgxConfig,
-    records: list[SampleRecord],
-) -> list[WorkspaceResult]:
-    """Prepare workspaces in parallel; results are in the same order as records."""
-
-    def _err(record: SampleRecord) -> WorkspaceResult:
-        return WorkspaceResult(
-            sample_id=record.sample_id,
-            workspace=config.pgx_runs_dir / record.sample_id,
-            status="error",
-            error="Unexpected workspace preparation error.",
-        )
-
-    return _parallel(
-        prepare_workspace,
-        config,
-        records,
-        _err,
-    )
-
-
-def run_pgx_pilots(
-    config: PgxConfig,
-    records: list[SampleRecord],
-) -> list[PgxRunResult]:
-    """Run pgx_pilot in parallel; results are in the same order as records."""
-
-    def _err(record: SampleRecord) -> PgxRunResult:
-        return PgxRunResult(
-            sample_id=record.sample_id,
-            output_all=None,
-            output_pass=None,
-            status="error",
-            error="Unexpected pgx_pilot execution error.",
-        )
-
-    return _parallel(
-        run_pgx_pilot,
-        config,
-        records,
-        _err,
-    )
