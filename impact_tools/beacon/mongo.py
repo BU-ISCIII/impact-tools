@@ -306,3 +306,233 @@ def mongo_list_old_backups(
         )
 
     return rows
+
+
+def mongo_set_dataset_flags(
+    database: Database,
+    dataset_id: str,
+    *,
+    is_test: bool,
+    is_synthetic: bool | None = None,
+) -> bool:
+    """Set Beacon dataset flags stored in db.datasets."""
+
+    update: dict[str, Any] = {
+        "isTest": is_test,
+    }
+
+    if is_synthetic is not None:
+        update["isSynthetic"] = is_synthetic
+
+    result = database.datasets.update_one(
+        {"id": dataset_id},
+        {"$set": update},
+        upsert=False,
+    )
+
+    if result.matched_count == 0:
+        raise ValueError(f"Dataset not found in db.datasets: {dataset_id}")
+
+    return result.modified_count > 0
+
+
+def _validate_dataset_permission_level(level: str) -> None:
+    """Validate supported Beacon dataset permission levels."""
+
+    allowed = {"public", "registered", "controlled"}
+
+    if level not in allowed:
+        raise ValueError(
+            f"permissions level must be one of: {', '.join(sorted(allowed))}"
+        )
+
+
+def _validate_dataset_granularity(granularity: str) -> None:
+    """Validate supported Beacon response granularities."""
+
+    allowed = {"boolean", "count", "record"}
+
+    if granularity not in allowed:
+        raise ValueError(
+            f"granularity must be one of: {', '.join(sorted(allowed))}"
+        )
+
+
+def _normalise_controlled_user_list(
+    user_list: list[dict[str, Any]] | None,
+    *,
+    default_granularity: str,
+) -> list[dict[str, Any]]:
+    """Validate and normalise controlled user-list entries.
+
+    The output preserves the Beacon permissions YAML-compatible shape:
+
+    controlled:
+      user-list:
+        - user_e-mail: jane.smith@beacon.ga4gh
+          default_entry_types_granularity: record
+    """
+
+    _validate_dataset_granularity(default_granularity)
+
+    if user_list is None:
+        return []
+
+    normalised: list[dict[str, Any]] = []
+
+    for index, user in enumerate(user_list, start=1):
+        if not isinstance(user, dict):
+            raise ValueError(
+                f"controlled user-list entry {index} must be an object."
+            )
+
+        email = user.get("user_e-mail")
+
+        if not isinstance(email, str) or not email.strip():
+            raise ValueError(
+                f"controlled user-list entry {index} requires user_e-mail."
+            )
+
+        granularity = user.get(
+            "default_entry_types_granularity",
+            default_granularity,
+        )
+
+        if not isinstance(granularity, str):
+            raise ValueError(
+                f"controlled user-list entry {index} has invalid "
+                "default_entry_types_granularity."
+            )
+
+        _validate_dataset_granularity(granularity)
+
+        normalised.append(
+            {
+                "user_e-mail": email.strip(),
+                "default_entry_types_granularity": granularity,
+            }
+        )
+
+    return normalised
+
+
+def mongo_set_dataset_flags(
+    database: Database,
+    dataset_id: str,
+    *,
+    is_test: bool,
+    is_synthetic: bool | None = None,
+) -> bool:
+    """Set dataset-level flags in db.datasets.
+
+    These fields replace the datasets_conf.yml source:
+
+    DATASET_ID:
+      isTest: true|false
+      isSynthetic: true|false
+    """
+
+    update: dict[str, Any] = {
+        "isTest": bool(is_test),
+    }
+
+    if is_synthetic is not None:
+        update["isSynthetic"] = bool(is_synthetic)
+
+    result = database.datasets.update_one(
+        {"id": dataset_id},
+        {"$set": update},
+        upsert=False,
+    )
+
+    if result.matched_count == 0:
+        raise ValueError(f"Dataset not found in db.datasets: {dataset_id}")
+
+    return result.modified_count > 0
+
+
+def mongo_set_dataset_permissions(
+    database: Database,
+    dataset_id: str,
+    *,
+    level: str,
+    granularity: str = "record",
+    user_list: list[dict[str, Any]] | None = None,
+) -> bool:
+    """Set dataset permissions in db.datasetPermissions.
+
+    Please keep the stored document as datasets_permissions.yml shape as closely
+    as possible, but one dataset per Mongo document.
+
+    Examples
+    --------
+    public:
+      default_entry_types_granularity: record
+
+    registered:
+      default_entry_types_granularity: record
+
+    controlled:
+      user-list:
+        - user_e-mail: jane.smith@beacon.ga4gh
+          default_entry_types_granularity: record
+    """
+
+    _validate_dataset_permission_level(level)
+    _validate_dataset_granularity(granularity)
+
+    if level == "controlled":
+        permission_block: dict[str, Any] = {
+            "user-list": _normalise_controlled_user_list(
+                user_list,
+                default_granularity=granularity,
+            )
+        }
+    else:
+        if user_list:
+            raise ValueError(
+                "user_list is only valid for controlled permissions."
+            )
+
+        permission_block = {
+            "default_entry_types_granularity": granularity,
+        }
+
+    document = {
+        "_id": dataset_id,
+        "datasetId": dataset_id,
+        level: permission_block,
+    }
+
+    result = database.datasetPermissions.replace_one(
+        {"_id": dataset_id},
+        document,
+        upsert=True,
+    )
+
+    return result.modified_count > 0 or result.upserted_id is not None
+
+
+def mongo_get_dataset_permissions(
+    database: Database,
+    dataset_id: str,
+) -> dict[str, Any] | None:
+    """Return the dataset permission document from db.datasetPermissions."""
+
+    return database.datasetPermissions.find_one(
+        {"_id": dataset_id},
+        {"_id": 0},
+    )
+
+
+def mongo_delete_dataset_permissions(
+    database: Database,
+    dataset_id: str,
+) -> int:
+    """Delete one dataset permission document from db.datasetPermissions."""
+
+    result = database.datasetPermissions.delete_one(
+        {"_id": dataset_id}
+    )
+
+    return result.deleted_count

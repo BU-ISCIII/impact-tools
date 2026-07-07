@@ -1810,16 +1810,29 @@ def beacon_ingest_group(
     help="Reference genome used by the dataset. If omitted, you will be prompted.",
 )
 @click.option(
-    "--test/--no-test",
+    "--set-permissions",
+    "permissions_level",
+    type=click.Choice(["public", "registered", "controlled"]),
     default=None,
-    show_default=True,
-    help="Whether this dataset is a test dataset.",
+    help="Initial dataset permissions level.",
 )
 @click.option(
-    "--synthetic/--no-synthetic",
+    "--set-email",
+    "permissions_email",
     default=None,
-    show_default=True,
-    help="Whether this dataset is synthetic.",
+    help="Initial controlled user e-mail. Only used with --set-permissions controlled.",
+)
+@click.option(
+    "--is-test",
+    type=click.Choice(["y", "n"], case_sensitive=False),
+    default=None,
+    help="Whether this dataset is a test dataset: y/N.",
+)
+@click.option(
+    "--is-synthetic",
+    is_flag=True,
+    default=None,
+    help="Mark this dataset as synthetic.",
 )
 @click.option(
     "-b",
@@ -1860,8 +1873,10 @@ def ingest_dataset_cmd(
     name: str | None,
     description: str | None,
     reference_genome: str | None,
-    test: bool | None,
-    synthetic: bool | None,
+    permissions_level: str | None,
+    permissions_email: str | None,
+    is_test: str | None,
+    is_synthetic: bool | None,
     base_dir: Path,
     granularity: str,
     output_dir: Path | None,
@@ -1896,11 +1911,20 @@ def ingest_dataset_cmd(
             show_default=True,
         )
 
-    if test is None:
-        test = click.confirm("Is this a <test> dataset?", default=False)
+    if permissions_level is None:
+        permissions_level = "public"
 
-    if synthetic is None:
-        synthetic = click.confirm("Is this a <synthetic> dataset?", default=False)
+    if permissions_level == "controlled" and permissions_email is None:
+        if click.get_text_stream("stdin").isatty():
+            permissions_email = click.prompt("Controlled user e-mail")
+        else:
+            raise click.UsageError(
+                "--set-email is required with --set-permissions controlled "
+                "when stdin is not interactive."
+            )
+
+    test = (is_test or "n").lower() == "y"
+    synthetic = bool(is_synthetic)
 
     base_dir = base_dir.resolve()
 
@@ -1913,6 +1937,8 @@ def ingest_dataset_cmd(
         is_synthetic=synthetic,
         base_dir=base_dir,
         granularity=granularity,
+        permissions_level=permissions_level,
+        permissions_email=permissions_email,
         output_dir=output_dir.resolve() if output_dir is not None else None,
         dry_run=dry_run,
         generate_report=not no_report,

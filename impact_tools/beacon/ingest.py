@@ -22,7 +22,6 @@ from impact_tools.beacon.config import BeaconDeploymentConfig
 from impact_tools.beacon.html_report import write_dataset_ingest_report
 from impact_tools.beacon.html_report import write_variant_ingest_report
 from impact_tools.beacon.registry import BeaconRegistry
-from impact_tools.beacon.remote import exec_remote
 from impact_tools.ega.execution import (
     ProcessMetrics,
     collect_execution_environment,
@@ -48,6 +47,8 @@ class DatasetIngestConfig:
     is_synthetic: bool = False
     base_dir: Path = Path(".")
     granularity: str = "record"
+    permissions_level: str = "public"
+    permissions_email: str | None = None
     output_dir: Path | None = None
     dry_run: bool = False
     generate_report: bool = True
@@ -77,10 +78,6 @@ class BeaconIngestPaths:
     # Dataset-specific generated artifacts
     datasets_csv: Path
     datasets_json: Path
-
-    # Global Beacon deployment files
-    datasets_conf_yml: Path
-    datasets_permissions_yml: Path
 
 
 @dataclasses.dataclass
@@ -141,8 +138,6 @@ def build_dataset_paths(base_dir: Path, dataset_id: str) -> BeaconIngestPaths:
         dataset_input_dir=dataset_input_dir,
         datasets_csv=dataset_config_dir / "datasets.csv",
         datasets_json=dataset_config_dir / "datasets.json",
-        datasets_conf_yml=config_dir / "datasets_conf.yml",
-        datasets_permissions_yml=config_dir / "datasets_permissions.yml",
     )
 
 
@@ -164,27 +159,6 @@ def render_datasets_csv(config: DatasetIngestConfig) -> str:
     return output.getvalue()
 
 
-def render_datasets_conf_yml(config: DatasetIngestConfig) -> str:
-    """Render Beacon datasets_conf.yml candidate entry."""
-    is_synthetic = "true" if config.is_synthetic else "false"
-    is_test = "true" if config.is_test else "false"
-
-    return (
-        f"{config.dataset_id}:\n"
-        f"  isSynthetic: {is_synthetic}\n"
-        f"  isTest: {is_test}\n"
-    )
-
-
-def render_datasets_permissions_yml(config: DatasetIngestConfig) -> str:
-    """Render Beacon datasets_permissions.yml candidate entry."""
-    return (
-        f"{config.dataset_id}:\n"
-        "  public:\n"
-        f"    default_entry_types_granularity: {config.granularity}\n"
-    )
-
-
 def prepare_dataset_artifacts(config: DatasetIngestConfig) -> DatasetIngestResult:
     """Generate dataset registration artifacts without touching MongoDB."""
     validate_dataset_id(config.dataset_id)
@@ -195,8 +169,6 @@ def prepare_dataset_artifacts(config: DatasetIngestConfig) -> DatasetIngestResul
 
     generated_files = [
         paths.datasets_csv,
-        paths.datasets_conf_yml,
-        paths.datasets_permissions_yml,
     ]
 
     if config.dry_run:
@@ -211,14 +183,7 @@ def prepare_dataset_artifacts(config: DatasetIngestConfig) -> DatasetIngestResul
     paths.dataset_input_dir.mkdir(parents=True, exist_ok=True)
 
     paths.datasets_csv.write_text(render_datasets_csv(config), encoding="utf-8")
-    paths.datasets_conf_yml.write_text(
-        render_datasets_conf_yml(config),
-        encoding="utf-8",
-    )
-    paths.datasets_permissions_yml.write_text(
-        render_datasets_permissions_yml(config),
-        encoding="utf-8",
-    )
+
     generate_datasets_json(config, paths)
     generated_files.append(paths.datasets_json)
 
@@ -391,13 +356,14 @@ def apply_dataset_to_remote(
     paths: BeaconIngestPaths,
     deployment: BeaconDeploymentConfig,
 ) -> ApplyDatasetResult:
-    """Apply a prepared dataset to the running Beacon deployment.
+    """Apply a prepared dataset to the Beacon deployment through PyMongo only.
 
     Expects `prepare_dataset_artifacts(config)` to have run first, so the
-    local files referenced by `paths` already exist.
+    local datasets.json file already exists.
 
-    MongoDB and Beacon API operations use direct connections. SSH is retained
-    temporarily for RI-tools configuration, YAML updates and API restart.
+    MongoDB is the only write path:
+    - db.datasets stores dataset metadata plus isTest/isSynthetic.
+    - db.datasetPermissions stores access permissions.
     """
 
     from impact_tools.beacon.api import (
@@ -408,16 +374,10 @@ def apply_dataset_to_remote(
         managed_mongo,
         mongo_count_dataset,
         mongo_import_datasets,
-    )
-    from impact_tools.beacon.remote import (
-        managed_ssh,
-        restart_beacon_api,
-        update_yaml_block_remote,
+        mongo_set_dataset_flags,
+        mongo_set_dataset_permissions,
     )
 
-
-    # 1. Import datasets.json directly through PyMongo.
-    # 2. Verify that the dataset exists in MongoDB.
     with managed_mongo(deployment.mongo) as database:
         imported = mongo_import_datasets(
             database,
@@ -429,35 +389,37 @@ def apply_dataset_to_remote(
             config.dataset_id,
         )
 
-    if count == 0:
-        raise RuntimeError(
-            f"Dataset '{config.dataset_id}' not found in MongoDB "
-            f"after import (imported={imported})."
-        )
+        if count == 0:
+            raise RuntimeError(
+                f"Dataset '{config.dataset_id}' not found in MongoDB "
+                f"after import (imported={imported})."
+            )
 
-    # 3. Update the Beacon YAML files on the VM.
-    # 4. Restart the API so it reloads the configuration.
-    with managed_ssh(deployment.remote) as client:
-        update_yaml_block_remote(
-            client,
-            deployment.remote.datasets_conf_yml,
+        mongo_set_dataset_flags(
+            database,
             config.dataset_id,
-            render_datasets_conf_yml(config),
+            is_test=config.is_test,
+            is_synthetic=config.is_synthetic,
         )
 
-        update_yaml_block_remote(
-            client,
-            deployment.remote.datasets_permissions_yml,
+        user_list = None
+
+        if config.permissions_level == "controlled" and config.permissions_email:
+            user_list = [
+                {
+                    "user_e-mail": config.permissions_email,
+                    "default_entry_types_granularity": config.granularity,
+                }
+            ]
+
+        mongo_set_dataset_permissions(
+            database,
             config.dataset_id,
-            render_datasets_permissions_yml(config),
+            level=config.permissions_level,
+            granularity=config.granularity,
+            user_list=user_list,
         )
 
-        restart_beacon_api(
-            client,
-            deployment.remote,
-        )
-
-    # 5. Verify the dataset directly through the Beacon HTTP API.
     with managed_beacon_api(deployment.api) as api_client:
         api_visible = verify_dataset_via_api(
             api_client,
@@ -467,10 +429,9 @@ def apply_dataset_to_remote(
     if not api_visible:
         raise RuntimeError(
             f"Dataset '{config.dataset_id}' not visible via API after "
-            "restart. Check beaconprod logs and the deployed dataset YAML."
+            "MongoDB registration. Check API logs and MongoDB dataset state."
         )
 
-    # 6. Record the registration in the local Beacon registry.
     with BeaconRegistry() as registry:
         registry.record_dataset_registration(
             dataset_id=config.dataset_id,
@@ -873,61 +834,6 @@ def check_variant_counts(
     )
 
 
-def run_filtering_terms_remote(
-    client,
-    containers_cfg,
-) -> None:
-    """Run Beacon filtering terms extraction inside the Beacon API container."""
-    import itertools
-    import sys
-    import threading
-
-    command = (
-        f"podman exec {shlex.quote(containers_cfg.api)} "
-        f"python -m beacon.connections.mongo.extract_filtering_terms "
-    )
-
-    LOGGER.info("Running filtering terms extraction: %s. This may take a few minutes!", command)
-
-    stop_waiting = threading.Event()
-
-    def _waiting_message() -> None:
-        messages = itertools.cycle([
-            "Running filtering terms extraction.  ",
-            "Running filtering terms extraction.. ",
-            "Running filtering terms extraction...",
-        ])
-        while not stop_waiting.is_set():
-            sys.stderr.write("\r" + next(messages))
-            sys.stderr.flush()
-            stop_waiting.wait(1)
-
-    waiting_thread = threading.Thread(
-        target=_waiting_message,
-        daemon=True,
-    )
-    waiting_thread.start()
-
-    try:
-        result = exec_remote(client, command)
-    finally:
-        stop_waiting.set()
-        waiting_thread.join()
-        sys.stderr.write("\r" + " " * 80 + "\r")  # Clear the waiting message
-        sys.stderr.flush()
-
-    if not result.ok:
-        # Strip \r so tqdm progress bars don't overwrite the traceback.
-        clean_stderr = result.stderr.replace("\r", "\n")
-        raise RuntimeError(
-            "filtering terms extraction failed.\n"
-            f"Command: {result.command}\n"
-            f"STDERR: {clean_stderr}"
-        )
-
-    LOGGER.info("Filtering terms extraction completed successfully.")
-
-
 def list_old_variant_backups(
     database,
     dataset_id: str,
@@ -1221,16 +1127,19 @@ def apply_variants_to_remote(
         mongo_rename_dataset_id,
         mongo_reindex,
     )
-    from impact_tools.beacon.remote import (
-        managed_ssh,
-        restart_beacon_api,
-    )
 
 
     process_start = start_process_metrics()
 
     validate_dataset_id(config.dataset_id)
     validate_reference_genome(config.reference_genome)
+
+    if not config.skip_filtering_terms:
+        raise RuntimeError(
+            "Filtering terms extraction through SSH/container exec has been removed. "
+            "Use --skip-filtering-terms for now, or implement filtering-terms extraction "
+            "as a local PyMongo/API operation before running variants without that flag."
+        )
 
     vcf_files = resolve_variant_inputs(config)
 
@@ -1437,32 +1346,9 @@ def apply_variants_to_remote(
     with managed_mongo(deployment.mongo) as database:
         mongo_reindex(database)
 
-    # Filtering terms extraction and API restart still require SSH.
-    with managed_ssh(deployment.remote) as client:
-        if config.skip_filtering_terms:
-            LOGGER.info(
-                "Skipping filtering terms extraction "
-                "(--skip-filtering-terms)."
-            )
-        else:
-            try:
-                run_filtering_terms_remote(
-                    client,
-                    deployment.containers,
-                )
-            except RuntimeError as exc:
-                # Filtering terms is non-fatal: the variants are already
-                # swapped and the API must still restart. Log the failure
-                # so the operator can re-run manually if needed.
-                LOGGER.warning(
-                    "Filtering terms extraction failed (non-fatal): %s",
-                    exc,
-                )
-
-        restart_beacon_api(
-            client,
-            deployment.remote,
-        )
+    LOGGER.info(
+        "Skipping filtering terms extraction (--skip-filtering-terms)."
+    )
 
     # Verify the final state directly through the Beacon HTTP API.
     with managed_beacon_api(deployment.api) as api_client:

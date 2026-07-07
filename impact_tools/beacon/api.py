@@ -101,13 +101,7 @@ def verify_dataset_via_api(
         dataset_id,
     )
 
-    response = client.get(
-        "/api/datasets",
-        params={
-            "requestedGranularity": "record",
-            "limit": 1000,
-        },
-    )
+    response = client.get("/api/datasets")
 
     payload = _read_json_object(response)
     found = _contains_id(payload, dataset_id)
