@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
@@ -1502,7 +1503,8 @@ def liftover_cmd(
     "--output-dir", "-o",
     type=click.Path(path_type=Path, file_okay=False),
     default=None,
-    help="Root output directory (pgx_runs/ is created inside). Overrides beacon.pgx.output_dir in config.",
+    help="Root output directory. Defaults to current dir."
+         "(pgx_runs/ is created inside). Overrides beacon.pgx.output_dir in config.",
 )
 @click.option(
     "--ref-fasta", "ref_fasta",
@@ -1597,7 +1599,9 @@ def pgx_cmd(
         ref_fasta.expanduser().resolve() if ref_fasta is not None else _pgx_path("ref_fasta")
     )
     output_dir = (
-        output_dir.expanduser().resolve() if output_dir is not None else _pgx_path("output_dir")
+        output_dir.expanduser().resolve()
+        if output_dir is not None
+        else _pgx_path("output_dir") or Path.cwd().resolve()
     )
     pgx_image_raw = (
         pgx_image
@@ -1646,8 +1650,6 @@ def pgx_cmd(
     missing: list[str] = []
     if ref_fasta is None:
         missing.append("--ref-fasta / beacon.pgx.ref_fasta")
-    if output_dir is None:
-        missing.append("--output-dir / beacon.pgx.output_dir")
     if pgx_image is None:
         missing.append("--pgx-image / beacon.pgx.pgx_image")
     if missing:
@@ -1714,7 +1716,7 @@ def pgx_cmd(
                 log.info("  %s  sex=%s  country=%s", s.sample_id, s.sex, s.country_code)
             log.info("[dry-run] No files written.")
             return
-
+        
         batch, execution_script_path = beacon_pgx.plan_batch(config)
         status = "planned"
 
@@ -1723,10 +1725,44 @@ def pgx_cmd(
 
         if prepare:
             if resolved_executor == "hpc":
-                log.info("--prepare: workspace ready. Submit with: sbatch %s", execution_script_path)
+                log.info(
+                    "--prepare: workspace ready. Submit with: sbatch %s",
+                    execution_script_path,
+                )
             else:
-                log.info("--prepare: workspace ready. Run with: bash %s", execution_script_path)
+                log.info(
+                    "--prepare: workspace ready. Run with: bash %s",
+                    execution_script_path,
+                )
             return
+
+        if resolved_executor == "hpc":
+            log.info(
+                "HPC execution script generated. Submit with: sbatch %s",
+                execution_script_path,
+            )
+            return
+
+        log.info("Running PGx pipeline locally...")
+        log.info("Command: bash %s", execution_script_path)
+
+        status = "running"
+        completed = subprocess.run(
+            ["bash", str(execution_script_path)],
+            cwd=str(batch.workspace),
+            check=False,
+        )
+
+        if completed.returncode != 0:
+            status = "af_failed"
+            raise click.ClickException(
+                "Local PGx pipeline failed with exit code "
+                f"{completed.returncode}. Check logs in: {batch.workspace / 'logs'}"
+            )
+
+        status = "completed"
+        log.info("Local PGx pipeline completed successfully.")
+
 
     except beacon_pgx.ValidationError as exc:
         status = "planned"
@@ -1802,6 +1838,13 @@ def beacon_ingest_group(
     help="Dataset description. If omitted, you will be prompted.",
 )
 @click.option(
+    "--duo-code",
+    "duo_codes",
+    multiple=True,
+    help="Data Use Ontology code for dataUseConditions, e.g. DUO:0000042. "
+         "Repeatable. Optional. Labels resolved automatically.",
+)
+@click.option(
     "--ref-genome",
     "reference_genome",
     type=click.Choice(["GRCh37", "GRCh38"]),
@@ -1875,6 +1918,7 @@ def ingest_dataset_cmd(
     reference_genome: str | None,
     permissions_level: str | None,
     permissions_email: str | None,
+    duo_codes: tuple[str, ...],
     is_test: str | None,
     is_synthetic: bool | None,
     base_dir: Path,
@@ -1901,6 +1945,13 @@ def ingest_dataset_cmd(
             description = click.prompt("Please write a description")
         else:
             description = ""
+
+    for code in duo_codes:
+        if code not in beacon_ingest.DUO_LABELS:
+            raise click.UsageError(
+                f"Unrecognized DUO code: {code}. "
+                "See https://github.com/EBISPOT/DUO for valid codes."
+            )
 
     if reference_genome is None:
         reference_genome = click.prompt(
@@ -1939,6 +1990,7 @@ def ingest_dataset_cmd(
         granularity=granularity,
         permissions_level=permissions_level,
         permissions_email=permissions_email,
+        duo_codes=duo_codes,
         output_dir=output_dir.resolve() if output_dir is not None else None,
         dry_run=dry_run,
         generate_report=not no_report,

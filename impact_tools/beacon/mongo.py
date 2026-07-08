@@ -7,7 +7,7 @@ import logging
 import re
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal
 
 from pymongo import MongoClient, UpdateOne
 from pymongo.database import Database
@@ -16,7 +16,7 @@ from impact_tools.beacon.config import BeaconMongoConfig
 
 
 LOGGER = logging.getLogger(__name__)
-
+MongoApplyStatus = Literal["created", "updated", "unchanged"]
 
 @contextmanager
 def managed_mongo(
@@ -308,34 +308,6 @@ def mongo_list_old_backups(
     return rows
 
 
-def mongo_set_dataset_flags(
-    database: Database,
-    dataset_id: str,
-    *,
-    is_test: bool,
-    is_synthetic: bool | None = None,
-) -> bool:
-    """Set Beacon dataset flags stored in db.datasets."""
-
-    update: dict[str, Any] = {
-        "isTest": is_test,
-    }
-
-    if is_synthetic is not None:
-        update["isSynthetic"] = is_synthetic
-
-    result = database.datasets.update_one(
-        {"id": dataset_id},
-        {"$set": update},
-        upsert=False,
-    )
-
-    if result.matched_count == 0:
-        raise ValueError(f"Dataset not found in db.datasets: {dataset_id}")
-
-    return result.modified_count > 0
-
-
 def _validate_dataset_permission_level(level: str) -> None:
     """Validate supported Beacon dataset permission levels."""
 
@@ -422,33 +394,39 @@ def mongo_set_dataset_flags(
     *,
     is_test: bool,
     is_synthetic: bool | None = None,
-) -> bool:
-    """Set dataset-level flags in db.datasets.
+) -> MongoApplyStatus:
+    """Set dataset conf flags in db.datasetsConf.
 
-    These fields replace the datasets_conf.yml source:
-
-    DATASET_ID:
-      isTest: true|false
-      isSynthetic: true|false
+    Returns "created" if the conf document did not exist, "updated" if it
+    existed and changed, "unchanged" if it was already identical.
     """
 
-    update: dict[str, Any] = {
+    document: dict[str, Any] = {
+        "_id": dataset_id,
         "isTest": bool(is_test),
     }
 
     if is_synthetic is not None:
-        update["isSynthetic"] = bool(is_synthetic)
+        document["isSynthetic"] = bool(is_synthetic)
 
-    result = database.datasets.update_one(
-        {"id": dataset_id},
-        {"$set": update},
-        upsert=False,
+    result = database.datasetsConf.replace_one(
+        {"_id": dataset_id},
+        document,
+        upsert=True,
     )
 
-    if result.matched_count == 0:
-        raise ValueError(f"Dataset not found in db.datasets: {dataset_id}")
+    if result.upserted_id is not None:
+        return "created"
 
-    return result.modified_count > 0
+    if result.modified_count > 0:
+        return "updated"
+
+    if result.matched_count > 0:
+        return "unchanged"
+
+    raise RuntimeError(
+        f"Unexpected MongoDB result while setting flags for {dataset_id}"
+    )
 
 
 def mongo_set_dataset_permissions(
@@ -458,25 +436,8 @@ def mongo_set_dataset_permissions(
     level: str,
     granularity: str = "record",
     user_list: list[dict[str, Any]] | None = None,
-) -> bool:
-    """Set dataset permissions in db.datasetPermissions.
-
-    Please keep the stored document as datasets_permissions.yml shape as closely
-    as possible, but one dataset per Mongo document.
-
-    Examples
-    --------
-    public:
-      default_entry_types_granularity: record
-
-    registered:
-      default_entry_types_granularity: record
-
-    controlled:
-      user-list:
-        - user_e-mail: jane.smith@beacon.ga4gh
-          default_entry_types_granularity: record
-    """
+) -> MongoApplyStatus:
+    """Set dataset permissions in db.datasetsPermissions."""
 
     _validate_dataset_permission_level(level)
     _validate_dataset_granularity(granularity)
@@ -500,26 +461,38 @@ def mongo_set_dataset_permissions(
 
     document = {
         "_id": dataset_id,
-        "datasetId": dataset_id,
-        level: permission_block,
+        "permissions": {
+            level: permission_block,
+        },
     }
 
-    result = database.datasetPermissions.replace_one(
+    result = database.datasetsPermissions.replace_one(
         {"_id": dataset_id},
         document,
         upsert=True,
     )
 
-    return result.modified_count > 0 or result.upserted_id is not None
+    if result.upserted_id is not None:
+        return "created"
+
+    if result.modified_count > 0:
+        return "updated"
+
+    if result.matched_count > 0:
+        return "unchanged"
+
+    raise RuntimeError(
+        f"Unexpected MongoDB result while setting permissions for {dataset_id}"
+    )
 
 
 def mongo_get_dataset_permissions(
     database: Database,
     dataset_id: str,
 ) -> dict[str, Any] | None:
-    """Return the dataset permission document from db.datasetPermissions."""
+    """Return the dataset permission document from db.datasetsPermissions."""
 
-    return database.datasetPermissions.find_one(
+    return database.datasetsPermissions.find_one(
         {"_id": dataset_id},
         {"_id": 0},
     )
@@ -529,9 +502,9 @@ def mongo_delete_dataset_permissions(
     database: Database,
     dataset_id: str,
 ) -> int:
-    """Delete one dataset permission document from db.datasetPermissions."""
+    """Delete one dataset permission document from db.datasetsPermissions."""
 
-    result = database.datasetPermissions.delete_one(
+    result = database.datasetsPermissions.delete_one(
         {"_id": dataset_id}
     )
 

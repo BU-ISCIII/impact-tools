@@ -31,6 +31,36 @@ from impact_tools.ega.execution import (
 
 
 LOGGER = logging.getLogger(__name__)
+# Data Use Ontology labels — DUO release 2022-09-15, EBISPOT/DUO (CC-BY)
+# https://github.com/EBISPOT/DUO — copied verbatim from duo-basic.owl rdfs:label
+DUO_LABELS: dict[str, str] = {
+    "DUO:0000001": "data use permission",
+    "DUO:0000004": "no restriction",
+    "DUO:0000006": "health or medical or biomedical research",
+    "DUO:0000007": "disease specific research",
+    "DUO:0000011": "population origins or ancestry research only",
+    "DUO:0000042": "general research use",
+    "DUO:0000012": "research specific restrictions",
+    "DUO:0000015": "no general methods research",
+    "DUO:0000016": "genetic studies only",
+    "DUO:0000018": "not for profit, non commercial use only",
+    "DUO:0000019": "publication required",
+    "DUO:0000020": "collaboration required",
+    "DUO:0000021": "ethics approval required",
+    "DUO:0000022": "geographical restriction",
+    "DUO:0000024": "publication moratorium",
+    "DUO:0000025": "time limit on use",
+    "DUO:0000026": "user specific restriction",
+    "DUO:0000027": "project specific restriction",
+    "DUO:0000028": "institution specific restriction",
+    "DUO:0000029": "return to database or resource",
+    "DUO:0000043": "clinical care use",
+    "DUO:0000044": "population origins or ancestry research prohibited",
+    "DUO:0000045": "not for profit organisation use only",
+    "DUO:0000046": "non-commercial use only",
+}
+# DUO ontology release version (matches DUO_LABELS source)
+DUO_VERSION = "2022-09-15"
 
 DATASET_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
 
@@ -49,6 +79,7 @@ class DatasetIngestConfig:
     granularity: str = "record"
     permissions_level: str = "public"
     permissions_email: str | None = None
+    duo_codes: tuple[str, ...] = ()
     output_dir: Path | None = None
     dry_run: bool = False
     generate_report: bool = True
@@ -194,6 +225,37 @@ def prepare_dataset_artifacts(config: DatasetIngestConfig) -> DatasetIngestResul
     )
 
 
+def _inject_duo_into_datasets_json(
+    datasets_json: Path,
+    duo_codes: tuple[str, ...],
+) -> None:
+    """Inject dataUseConditions.duoDataUse into the generated datasets.json.
+
+    csv_to_bff generates the base document; DUO is added here because a
+    single CSV row cannot express a list of DUO objects (ri-tools emits one
+    document per row). Labels come from the embedded DUO_LABELS table.
+    """
+    documents = json.loads(datasets_json.read_text(encoding="utf-8"))
+
+    duo_block = {
+        "duoDataUse": [
+            {"id": code, "label": DUO_LABELS[code], "version": DUO_VERSION}
+            for code in duo_codes
+        ]
+    }
+
+    if isinstance(documents, list):
+        for doc in documents:
+            doc["dataUseConditions"] = duo_block
+    else:
+        documents["dataUseConditions"] = duo_block
+
+    datasets_json.write_text(
+        json.dumps(documents, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
 def generate_datasets_json(
     config: DatasetIngestConfig,
     paths: BeaconIngestPaths,
@@ -206,6 +268,8 @@ def generate_datasets_json(
         dataset_id=config.dataset_id,
     )
     ritools.run_csv_to_bff(csv_to_bff_cfg)
+    if config.duo_codes:
+        _inject_duo_into_datasets_json(paths.datasets_json, config.duo_codes)
     ritools.validate_datasets_json(paths.datasets_json, config.dataset_id)
 
 
@@ -395,7 +459,7 @@ def apply_dataset_to_remote(
                 f"after import (imported={imported})."
             )
 
-        mongo_set_dataset_flags(
+        flags_status = mongo_set_dataset_flags(
             database,
             config.dataset_id,
             is_test=config.is_test,
@@ -411,6 +475,20 @@ def apply_dataset_to_remote(
                     "default_entry_types_granularity": config.granularity,
                 }
             ]
+
+        perms_status = mongo_set_dataset_permissions(
+            database,
+            config.dataset_id,
+            level=config.permissions_level,
+            granularity=config.granularity,
+            user_list=user_list,
+        )
+        LOGGER.info(
+            "Dataset '%s': flags %s, permissions %s",
+            config.dataset_id,
+            flags_status,
+            perms_status,
+        )
 
         mongo_set_dataset_permissions(
             database,
