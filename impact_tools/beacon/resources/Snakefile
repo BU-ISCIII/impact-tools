@@ -69,9 +69,15 @@ rule prepare_reference:
 
 rule download_reference_source:
     output: "resources/downloaded_GRCh38.fa.gz"
-    params: url=config["resources"]["ref_fasta_url"]
+    params:
+        url=lambda w: config.get("resources", {}).get("ref_fasta_url", "")
     shell:
         """
+        if [ -z "{params.url}" ]; then
+            echo "ERROR: resources.ref_fasta_url is not set and local_resources.ref_fasta was not available." >&2
+            exit 1
+        fi
+
         echo "WARNING: downloading reference from internet. Compute nodes should use local_resources.ref_fasta." >&2
         wget --tries=3 -O {output} {params.url}
         """

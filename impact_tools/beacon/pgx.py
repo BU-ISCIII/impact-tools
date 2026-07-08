@@ -48,6 +48,7 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Literal
 
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -829,7 +830,11 @@ def _container_exec_lines(
             mount = f"{src}:{dest}:ro" if ro else f"{src}:{dest}"
             lines.append(f"  --bind {shlex.quote(mount)} \\")
     else:
-        lines = ["docker run --rm \\"]
+        lines = [
+            "docker run --rm \\",
+            '  --user "$(id -u):$(id -g)" \\',
+            "  -e HOME=/tmp \\",
+        ]
         for src, dest, ro in binds:
             mount = f"{src}:{dest}:ro" if ro else f"{src}:{dest}"
             lines.append(f"  -v {shlex.quote(mount)} \\")
@@ -867,6 +872,7 @@ def _pipeline_body_lines(
     config: PgxPipelineConfig,
     *,
     cpus_assignment: str,
+    log_to_file: bool = False,
 ) -> list[str]:
     """Generate the pipeline body shared by local and HPC launchers."""
     ws = batch.workspace
@@ -887,6 +893,19 @@ def _pipeline_body_lines(
         cpus_assignment,
         "",
     ]
+
+    if log_to_file:
+        lines += [
+            'LOG_DIR="$WORKSPACE/logs"',
+            'mkdir -p "$LOG_DIR"',
+            'RUN_LOG="$LOG_DIR/pgx_${RELEASE_ID}.run.log"',
+            'echo "Local PGx execution log: $RUN_LOG"',
+            'exec > "$RUN_LOG" 2>&1',
+            'echo "Started local PGx pipeline at $(date)"',
+            'echo "Workspace: $WORKSPACE"',
+            'echo "Release ID: $RELEASE_ID"',
+            "",
+        ]
 
     # Step 1: Joint genotyping with GLnexus
     lines += _glnexus_lines(batch, config)
@@ -997,6 +1016,7 @@ def write_local_script(
         batch,
         config,
         cpus_assignment=f"CPUS={config.snakemake_jobs}",
+        log_to_file=True
     )
 
     script_path = config.execution_script_path
@@ -1049,12 +1069,14 @@ def _glnexus_lines(batch: PgxBatch, config: PgxPipelineConfig) -> list[str]:
     container_joint_vcf = f"/workspace/data/{batch.release_id}.joint.vcf.gz"
     container_glnexus_inputs = "/workspace/manifests/glnexus_inputs.list"
     container_glnexus_work = "/workspace/data/glnexus_work"
+    container_glnexus_bed = "/workspace/resources/targets.bed"
 
     inner_cmd = (
         f"set -euo pipefail && "
         f"glnexus_cli "
         f"--config {shlex.quote(config.glnexus_config)} "
         f"--dir {shlex.quote(container_glnexus_work)} "
+        f"--bed {shlex.quote(container_glnexus_bed)} "
         f"--list {shlex.quote(container_glnexus_inputs)} "
         f"| bcftools view -O z -o {shlex.quote(container_joint_vcf)} && "
         f"bcftools index -t {shlex.quote(container_joint_vcf)}"
@@ -1071,6 +1093,7 @@ def _glnexus_lines(batch: PgxBatch, config: PgxPipelineConfig) -> list[str]:
         "else",
         '  echo "Running GLnexus joint genotyping..."',
         f'  rm -rf {shlex.quote(str(ws / "data" / "glnexus_work"))}',
+        '  rm -f "$JOINT_VCF" "${JOINT_VCF}.tbi"',
     ]
     for line in exec_lines:
         lines.append("  " + line)
