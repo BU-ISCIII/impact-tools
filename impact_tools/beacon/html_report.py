@@ -480,56 +480,48 @@ def write_pgx_report(
     payload: dict,
     include_charts: bool = True,
 ) -> None:
-    """Write one visual report for a Beacon PGx run."""
+    """Write one visual report for a Beacon PGx batch run."""
     config = payload.get("config") or {}
     environment = payload.get("environment") or {}
     summary = payload.get("summary") or {}
-    samples = payload.get("samples") or []
+    outputs = payload.get("outputs") or {}
+    warnings = payload.get("warnings") or []
+
+    pypgx_enabled = not config.get("no_pypgx", True)
+
+    output_rows = [
+        ("Sites PASS VCF", outputs.get("sites_pass")),
+        ("Sites all VCF", outputs.get("sites_all")),
+        ("Intermediate full sample VCF", outputs.get("intermediate")),
+    ]
+
+    if pypgx_enabled:
+        output_rows.extend(
+            [
+                ("PyPGx alleles", outputs.get("pgx_alleles")),
+                ("PyPGx genotypes", outputs.get("pgx_genotypes")),
+                ("PyPGx phenotypes", outputs.get("pgx_phenotypes")),
+            ]
+        )
 
     performance_charts = []
 
     if include_charts:
         performance_charts.append(
             _chart(
-                "Pipeline step status",
-                "steps",
-                ["Successful", "Warnings", "Failed"],
+                "PGx batch summary",
+                "count",
+                ["Samples", "Warnings"],
                 [
-                    summary.get("succeeded") or 0,
-                    summary.get("warned") or 0,
-                    summary.get("failed") or 0,
-                ],
-            )
-        )
-
-    run_samples = [
-        sample
-        for sample in samples
-        if sample.get("pgx_run") is not None
-    ]
-
-    if include_charts and run_samples:
-        performance_charts.append(
-            _chart(
-                "PGx runtime per sample",
-                "seconds",
-                [
-                    sample.get("sample_id") or "unknown"
-                    for sample in run_samples
-                ],
-                [
-                    (sample.get("pgx_run") or {}).get(
-                        "duration_seconds"
-                    )
-                    or 0
-                    for sample in run_samples
+                    summary.get("sample_count") or 0,
+                    len(warnings),
                 ],
             )
         )
 
     context = _base_context(
         page_title="Beacon PGx report",
-        report_title="Beacon pharmacogenomics workflow",
+        report_title="Beacon PGx batch workflow",
         badge=payload.get("status", "unknown"),
         summary_cards=[
             _card(
@@ -538,44 +530,39 @@ def write_pgx_report(
                 "workflow result",
             ),
             _card(
-                "Execution mode",
+                "Executor",
                 config.get("executor"),
-                "execution mode",
+                "execution backend",
             ),
             _card(
-                "Lifted VCFs",
-                summary.get("lifted_vcfs"),
-                "source files",
+                "Runtime",
+                config.get("container_runtime"),
+                "container runtime",
+            ),
+            _card(
+                "Input mode",
+                config.get("input_mode"),
+                "gVCF source",
             ),
             _card(
                 "Samples",
-                summary.get("samples_discovered"),
-                "discovered samples",
+                summary.get("sample_count"),
+                "batch samples",
             ),
             _card(
-                "New samples",
-                summary.get("new_samples"),
-                "added to samples.tsv",
+                "AF/QC",
+                "enabled",
+                "sites-only VCF workflow",
             ),
             _card(
-                "Sex failures",
-                summary.get("sex_inference_failed"),
-                "unresolved samples",
-            ),
-            _card(
-                "Successful",
-                summary.get("succeeded"),
-                "completed steps",
+                "PyPGx",
+                "enabled" if pypgx_enabled else "disabled",
+                "optional pharmacogenomics workflow",
             ),
             _card(
                 "Warnings",
-                summary.get("warned"),
-                "steps requiring review",
-            ),
-            _card(
-                "Failed",
-                summary.get("failed"),
-                "failed steps",
+                len(warnings),
+                "pre-run warnings",
             ),
             _card(
                 "Runtime",
@@ -589,23 +576,20 @@ def write_pgx_report(
     context.update(
         run_details=_items(
             [
-                ("Base directory", config.get("base_dir")),
+                ("Release ID", payload.get("release_id")),
+                ("Status", payload.get("status")),
                 ("Executor", config.get("executor")),
                 ("Container runtime", config.get("container_runtime")),
-                ("Country code", config.get("country_code")),
-                (
-                    "Sex ambiguous minimum",
-                    config.get("sex_ambiguous_min"),
-                ),
-                (
-                    "Sex ambiguous maximum",
-                    config.get("sex_ambiguous_max"),
-                ),
-                ("bcftools image", config.get("bcftools_image")),
+                ("Input mode", config.get("input_mode")),
+                ("Output directory", config.get("output_dir")),
+                ("Reference FASTA", config.get("ref_fasta")),
                 ("PGx image", config.get("pgx_image")),
-                ("PGx repository", config.get("pgx_repo")),
-                ("Snakemake jobs", config.get("snakemake_jobs")),
-                ("Workers", config.get("workers")),
+                ("GLnexus image", config.get("glnexus_image")),
+                ("GLnexus config", config.get("glnexus_config")),
+                ("PyPGx enabled", pypgx_enabled),
+                ("PGx pilot commit", config.get("pgx_pilot_commit")),
+                ("Execution script", payload.get("execution_script")),
+                ("SLURM job ID", payload.get("job_id")),
                 ("Started at", payload.get("started_at")),
                 ("Ended at", payload.get("ended_at")),
                 ("Command", payload.get("command")),
@@ -617,63 +601,36 @@ def write_pgx_report(
                 ("Host", environment.get("hostname")),
                 ("Platform", environment.get("platform")),
                 ("Python", environment.get("python")),
-                ("Working directory", environment.get("cwd")),
             ]
         ),
         sample_headers=[
-            "Sample",
-            "Source VCF",
-            "Sex",
-            "Sex resolution",
-            "chrY variants",
-            "Workspace",
-            "Prepare status",
-            "PGx status",
-            "Runtime",
-            "PASS output",
-            "Error",
+            "Sample ID",
         ],
         sample_rows=[
+            _table_row([sample_id])
+            for sample_id in summary.get("sample_ids") or []
+        ],
+        output_headers=[
+            "Output",
+            "Path",
+        ],
+        output_rows=[
             _table_row(
                 [
-                    sample.get("sample_id"),
-                    sample.get("vcf_basename"),
-                    sample.get("sex"),
-                    (
-                        sample.get("sex_inference") or {}
-                    ).get("status"),
-                    (
-                        sample.get("sex_inference") or {}
-                    ).get("n_chry"),
-                    (
-                        sample.get("workspace") or {}
-                    ).get("path"),
-                    (
-                        sample.get("workspace") or {}
-                    ).get("status"),
-                    (
-                        sample.get("pgx_run") or {}
-                    ).get("status"),
-                    _duration(
-                        (
-                            sample.get("pgx_run") or {}
-                        ).get("duration_seconds")
-                    ),
-                    (
-                        (
-                            sample.get("pgx_run") or {}
-                        ).get("output_pass")
-                        or {}
-                    ).get("path"),
-                    (
-                        (sample.get("pgx_run") or {}).get("error")
-                        or (sample.get("workspace") or {}).get("error")
-                    ),
+                    label,
+                    path_value,
                 ],
-                path_columns={1, 5, 9},
-                status_column=7,
+                path_columns={1},
             )
-            for sample in samples
+            for label, path_value in output_rows
+            if path_value
+        ],
+        warning_headers=[
+            "Warning",
+        ],
+        warning_rows=[
+            _table_row([warning])
+            for warning in warnings
         ],
         artifacts=[
             {"label": label, "path": target}
@@ -690,7 +647,6 @@ def write_pgx_report(
         template_name="pgx_report.html",
         context=context,
     )
-
 
 def write_variant_ingest_report(
     path: Path,

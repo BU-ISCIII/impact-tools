@@ -12,7 +12,15 @@
 
 {{ details("Execution environment", environment) }}
 
-{{ table("Sample results", sample_headers, sample_rows) }}
+{{ table("Batch samples", sample_headers, sample_rows) }}
+
+{% if output_rows %}
+{{ table("Generated outputs", output_headers, output_rows) }}
+{% endif %}
+
+{% if warning_rows %}
+{{ table("Warnings", warning_headers, warning_rows) }}
+{% endif %}
 
 <section class="panel">
   <h2>Machine-readable artifacts</h2>
