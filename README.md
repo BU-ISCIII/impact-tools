@@ -68,6 +68,7 @@ logs:
     ega_encrypt: /impact_data/logs/impact-tools/ega/encrypt
     ega_upload_inbox: /impact_data/logs/impact-tools/ega/upload-inbox
     beacon_ingest_dataset: /impact_data/logs/impact-tools/beacon/ingest-dataset
+    beacon_ingest_variants: /impact_data/logs/impact-tools/beacon/ingest-variants
 
 ega:
   encryption:
@@ -80,26 +81,30 @@ ega:
     identity_file: ~/.ssh/localega_inbox
 
 beacon:
-  remote:
-    host: 172.20.10.47
-    user: bioinfo
-    port: 22
-    password: null # Use either password-based authentication or an SSH identity file.
-    identity_file: ~/.ssh/beacon_remote
-    beacon_dir: /opt/beacon/beacon2-pi-api-isciii
-    input_dir: /impact_data/lega_data/beacon/inputs
-    log_dir: /var/log/local/beacon/apps/ri-tools
+  execution:
+    profile: local
 
-  containers:
-    mongo: mongoprod
-    api: beaconprod
+  mongo:
+    host: dcontainers00
+    port: 27017
+    user: root
+    password: null
+    auth_source: admin
+    database: beacon
+    direct: true
+    tls: false
+    tls_ca: null
+    tls_cert: null
+    tls_allow_invalid: false
+    server_timeout_ms: 10000
+    connect_timeout_ms: 10000
+    socket_timeout_ms: 30000
 
-  runtime:
-    remote_container_runtime: podman
+  api:
+    base_url: http://beaconaf-isciiiciber.isciiides.es:8443
+    timeout_seconds: 30
+    verify_tls: true
 
-  ri_tools:
-    variants_command_template: >-
-      echo dataset={dataset_id} vcf={remote_vcf}
 ```
 
 Install it for the current user:
@@ -128,9 +133,9 @@ Current focus:
 6. Prepare per-sample pgx_pilot workspaces (symlinks, config, samples.tsv).
 7. Run the pgx_pilot Snakemake pipeline via Docker to produce sites-only VCFs.
 8. Register Beacon datasets end-to-end: generate dataset artifacts locally,
-   upload the per-dataset RI-tools configuration to the Beacon VM, import
-   dataset metadata into MongoDB, update the Beacon deployment YAML files,
-   restart the Beacon API and verify dataset visibility via `/api/datasets`.
+   import dataset metadata into MongoDB, store dataset flags and permissions in
+   MongoDB, register dataset-scoped DUO filtering terms, and verify dataset
+   visibility via `/api/datasets`.
 
 ### Workflow Overview
 
@@ -154,22 +159,23 @@ impact-tools beacon pgx
 impact-tools beacon ingest dataset
         |
         |  datasets.csv                (dataset metadata)
-        |  datasets.json               (BFF for mongoimport)
-        |  conf.py                     (per-dataset RI-tools config)
-        |  datasets_conf.yml block     (registered on the Beacon VM)
-        |  datasets_permissions.yml    (registered on the Beacon VM)
+        |  datasets.json               (BFF for MongoDB import)
+        |  db.datasets                 (dataset metadata)
+        |  db.datasetsConf             (isTest / isSynthetic flags)
+        |  db.datasetsPermissions      (access level and granularity)
+        |  db.filtering_terms          (dataset-scoped DUO terms)
         v
 Beacon dataset registered (visible via /api/datasets)
         |
         v
 impact-tools beacon ingest variants
         |
-        |  Verify variants in staging
-        |  Promote to active dataset
-        |  Ingestion report
+        |  Run RI-tools locally against a staging dataset ID
+        |  Verify staging counts in MongoDB
+        |  Promote staging variants to active dataset ID
+        |  Verify dataset and variant count via Beacon API
         v
-Beacon v2 serves variants from dataset
-  (dataset searchable via /api/beacon/v2/)
+Beacon v2 serves variants from dataset (dataset searchable via /api/g_variants)
 ```
 
 ### Liftover VCFs
@@ -362,11 +368,21 @@ successful run (prompts for confirmation unless `--force` is given).
 ### Register Beacon Datasets into MongoDB
 
 The `beacon ingest dataset` command registers dataset metadata in the Beacon v2
-deployment. It prepares the required dataset artifacts locally, uploads the
-dataset-specific RI-tools configuration to the Beacon VM, imports the dataset
-metadata into MongoDB, updates the Beacon dataset configuration and permissions
-YAML files, restarts the Beacon API container and verifies that the dataset is
-visible through the `/api/datasets` endpoint.
+deployment using direct MongoDB and Beacon API access.
+
+The command:
+
+1. Generates local `datasets.csv` and `datasets.json` artifacts.
+2. Imports the dataset document into `db.datasets`.
+3. Stores dataset flags in `db.datasetsConf`.
+4. Stores dataset permissions in `db.datasetsPermissions`.
+5. Injects DUO data-use conditions into `dataUseConditions.duoDataUse` when
+   `--duo-code` is provided.
+6. Upserts dataset-scoped DUO terms into `db.filtering_terms`.
+7. Verifies that the dataset is visible through `/api/datasets`.
+
+It does not require SSH access, remote `podman exec`, remote YAML edits, or an
+API container restart.
 
 The command can be run interactively:
 
@@ -381,18 +397,25 @@ The same information can also be provided directly through CLI options:
 
 ```bash
 impact-tools beacon ingest dataset \
+  --base-dir /path/to/beacon_work \
   --dataset-id ISCIII_ES_IMPACT_1 \
   --name "Go-IMPaCT Spain WGS cohort" \
   --description "" \
   --ref-genome GRCh38 \
-  --no-test \
-  --no-synthetic
+  --granularity record \
+  --is-test y \
+  --set-permissions public \
+  --duo-code DUO:0000042
 ```
+`--duo-code` is repeatable when more than one DUO term applies.
 
 The command writes dataset-specific working files under `<base-dir>/config/`,
 `<base-dir>/work/` and `<base-dir>/inputs/`. It also writes a metrics JSON file
 under `<base-dir>/logs/` (or `<output-dir>/logs/` if `-o/--output-dir` is set).
 Use `--no-report` to skip HTML report generation.
+
+Use `--dry-run` to validate inputs and build the execution plan without writing
+files, metrics, reports or MongoDB records.
 
 Remote Beacon deployment settings are resolved through the standard
 impact-tools configuration hierarchy: explicit CLI arguments, an
@@ -402,12 +425,11 @@ finally the package defaults.
 ### Ingest Genomic Variants into Beacon
 
 The `beacon ingest variants` command applies genomic variants to an already
-registered Beacon dataset.
+registered Beacon dataset using direct MongoDB and Beacon API access.
 
-The target dataset must exist in the MongoDB `datasets` collection before the
-variant workflow starts. When an unknown dataset ID is supplied, the command
-stops before uploading any VCF and reports the IDs and names of the datasets
-currently available.
+The target dataset must already exist in the MongoDB `datasets` collection.
+When an unknown dataset ID is supplied, the command stops before running
+RI-tools.
 
 Exactly one input mode must be selected:
 
@@ -423,7 +445,7 @@ impact-tools beacon ingest \
   variants \
   --dataset-id ISCIII_ES_IMPACT_1 \
   --vcf-dir /home/user/beacon_work/pgx_ingest \
-  --reference-genome GRCh38 # default
+  --ref-genome GRCh38 # default
 ```
 
 Input files are selected in deterministic filename order. RI-tools is run once
@@ -438,7 +460,7 @@ impact-tools beacon ingest \
   variants \
   --dataset-id ISCIII_ES_IMPACT_1 \
   --vcf /home/user/beacon_work/sample.sites.pass.vcf.gz \
-  --reference-genome GRCh38 # default
+  --ref-genome GRCh38
 ```
 
 #### Safe verify-and-swap workflow
@@ -453,11 +475,8 @@ For a normal, non-dry-run execution, the command:
    RI-tools.
 6. Renames existing active variants to a timestamped backup dataset ID.
 7. Promotes the staging variants to the active dataset ID.
-8. Reindexes the Beacon MongoDB collections.
-9. Extracts filtering terms unless `--skip-filtering-terms` is supplied.
-10. Restarts the Beacon API.
-11. Verifies dataset visibility and variant count through the API.
-12. Optionally removes the newly created backup with `--cleanup-old`.
+8. Verifies dataset visibility and variant count through the API.
+9. Optionally removes the newly created backup with `--cleanup-old`.
 
 Older timestamped backups can also be reviewed and removed interactively after
 a successful run.
@@ -470,7 +489,7 @@ impact-tools beacon ingest \
   variants \
   --dataset-id ISCIII_ES_IMPACT_1 \
   --vcf-dir /home/user/beacon_work/pgx_ingest \
-  --reference-genome GRCh38 \
+  --ref-genome GRCh38 \
   --dry-run
 ```
 
@@ -478,14 +497,13 @@ A variant-ingestion dry run still uploads the selected VCF files and executes
 RI-tools using the temporary staging dataset ID. It stops before validating and
 promoting the staging data to the active dataset.
 
-Therefore, this mode is intended to test RI-tools processing and is not a
-read-only MongoDB preview.
+Therefore, this mode is intended to validate RI-tools processing and cleanup
+without changing the active dataset.
 
 #### Optional controls
 
 ```text
 --cleanup-old            Delete the backup created during the current swap.
---skip-filtering-terms   Skip the potentially slow filtering-term extraction.
 --no-report              Skip HTML report generation (metrics JSON always written).
 -o, --output-dir         Write logs and metrics here instead of ./logs/.
 --run-profile            Record the execution environment as local, ws or hpc.
@@ -927,7 +945,6 @@ python3 -m py_compile \
   impact_tools/beacon/pgx.py \
   impact_tools/beacon/mongo.py \
   impact_tools/beacon/ingest.py \
-  impact_tools/beacon/remote.py \
   impact_tools/beacon/ritools.py \
   impact_tools/beacon/html_report.py \
   impact_tools/ega/encrypt.py \
