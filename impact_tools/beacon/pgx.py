@@ -1278,6 +1278,60 @@ def _derive_batch_id(samples_tsv: Path) -> str:
     return (safe or "batch")[:63]
 
 
+# Batch suffix appended to every release_id, e.g. GOE-IMPACT -> GOE-IMPACT_BATCH001.
+# The base part is capped so base + "_BATCHNNN" stays within the 63-char limit
+# enforced by is_safe_release_id.
+_BATCH_SUFFIX_RE = re.compile(r"^(?P<base>.+)_BATCH(?P<num>\d+)$")
+_BATCH_SUFFIX_LEN = len("_BATCH001")
+_MAX_BASE_LEN = 63 - _BATCH_SUFFIX_LEN
+
+
+def strip_batch_suffix(release_id: str) -> str:
+    """Return release_id without a trailing _BATCHNNN suffix, if present.
+
+    Lets a caller re-use the full id from a previous run (GOE-IMPACT_BATCH001)
+    and still get the next number rather than a doubled suffix.
+    """
+    match = _BATCH_SUFFIX_RE.match(release_id)
+    return match.group("base") if match else release_id
+
+
+def next_release_id(output_dir: Path, base_id: str) -> str:
+    """Append an auto-incrementing _BATCHNNN suffix to base_id.
+
+    Scans <output_dir>/pgx_runs for existing runs named <base_id>_BATCH<NNN>
+    and returns <base_id>_BATCH<NNN+1>, zero-padded to 3 digits. The first run
+    for a given base_id is _BATCH001.
+    """
+    base_id = strip_batch_suffix(base_id.strip())
+    base_id = base_id[:_MAX_BASE_LEN]
+
+    if not base_id:
+        base_id = "samples"
+
+    runs_dir = output_dir / "pgx_runs"
+    prefix = f"{base_id}_BATCH"
+
+    highest = 0
+
+    if runs_dir.is_dir():
+        for entry in runs_dir.iterdir():
+            if not entry.is_dir() or not entry.name.startswith(prefix):
+                continue
+
+            suffix = entry.name[len(prefix):]
+
+            if suffix.isdigit():
+                highest = max(highest, int(suffix))
+
+    release_id = f"{base_id}_BATCH{highest + 1:03d}"
+
+    if not is_safe_release_id(release_id):
+        raise ValidationError(f"Unsafe release_id {release_id!r}.")
+
+    return release_id
+
+
 def build_batch(config: PgxPipelineConfig) -> PgxBatch:
     """Validate inputs and build a PgxBatch from the pipeline config."""
     assert config.samples_tsv is not None  # validated by validate_pre_job

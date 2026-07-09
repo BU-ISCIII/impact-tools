@@ -1582,9 +1582,6 @@ def pgx_cmd(
         )
 
     resolved_samples_tsv = samples_tsv.resolve()
-    if not release_id:
-        release_id = beacon_pgx._derive_batch_id(resolved_samples_tsv)
-        log.info("release_id auto-derived: %s", release_id)
 
     configuration = ctx.obj["configuration"]
 
@@ -1659,6 +1656,13 @@ def pgx_cmd(
             + "\n".join(f"  {k}" for k in missing)
         )
     assert ref_fasta is not None and output_dir is not None and pgx_image is not None
+
+    # Resolve the final release_id: <base>_BATCHNNN, where NNN auto-increments
+    # against existing runs under <output_dir>/pgx_runs. The base is the given
+    # --release-id or, if omitted, one derived from --samples-tsv.
+    release_base = release_id or beacon_pgx._derive_batch_id(resolved_samples_tsv)
+    release_id = beacon_pgx.next_release_id(output_dir, release_base)
+    log.info("release_id resolved: %s", release_id)
 
     slurm_conf = pgx_conf.get("slurm") or get_config_value(configuration, "beacon.pgx.slurm", {}) or {}
     slurm = beacon_pgx.SlurmConfig(
