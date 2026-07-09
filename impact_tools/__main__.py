@@ -1946,6 +1946,11 @@ def ingest_dataset_cmd(
         else:
             description = ""
 
+    duo_codes = tuple(
+        code.strip().upper()
+        for code in duo_codes
+    )
+
     for code in duo_codes:
         if code not in beacon_ingest.DUO_LABELS:
             raise click.UsageError(
@@ -1993,7 +1998,7 @@ def ingest_dataset_cmd(
         duo_codes=duo_codes,
         output_dir=output_dir.resolve() if output_dir is not None else None,
         dry_run=dry_run,
-        generate_report=not no_report,
+        generate_report=(not no_report and not dry_run),
     )
 
     try:
@@ -2077,14 +2082,6 @@ def ingest_dataset_cmd(
     ),
 )
 @click.option(
-    "--skip-filtering-terms",
-    is_flag=True,
-    help=(
-        "Skip filtering terms extraction (slow). Useful for batched "
-        "ingestions where you run it once at the end."
-    ),
-)
-@click.option(
     "--no-report",
     is_flag=True,
     help="Skip HTML report generation. Metrics JSON is always written.",
@@ -2106,7 +2103,6 @@ def ingest_variants_cmd(
     reference_genome: str,
     output_dir: Path | None,
     cleanup_old: bool,
-    skip_filtering_terms: bool,
     no_report: bool,
     dry_run: bool,
 ) -> None:
@@ -2127,10 +2123,9 @@ def ingest_variants_cmd(
         reference_genome=reference_genome,
         output_dir=output_dir.resolve() if output_dir is not None else None,
         cleanup_old=cleanup_old,
-        skip_filtering_terms=skip_filtering_terms,
         dry_run=dry_run,
         run_profile=run_profile,
-        generate_report=not no_report,
+        generate_report=(not no_report and not dry_run),
     )
 
     try:

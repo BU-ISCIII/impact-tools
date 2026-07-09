@@ -56,26 +56,12 @@
     "execution": {
       "profile": "local"
     },
-    "remote": {
-      "host": "172.20.10.47",
-      "user": "bioinfo",
-      "port": 22,
-      "password": null,
-      "identity_file": null,
-      "beacon_dir": "/opt/beacon/beacon2-pi-api-isciii",
-      "input_dir": "/impact_data/lega_data/beacon/inputs",
-      "log_dir": "/var/log/local/beacon/apps/ri-tools"
-    },
-    "containers": {
-      "mongo": "mongoprod",
-      "api": "beaconprod"
-    },
     "mongo": {
       "user": "root",
       "password": null,
       "auth_source": "admin",
       "database": "beacon",
-      "host": "172.20.10.47",
+      "host": null, 
       "port": 8085,
       "direct": true,
       "tls": false,
@@ -91,11 +77,22 @@
       "timeout_seconds": 30,
       "verify_tls": false
     },
-    "runtime": {
-      "remote_container_runtime": "podman"
-    },
     "pgx": {
-      "repo": null
+      "executor": "local",
+      "output_dir": null,
+      "ref_fasta": null,
+      "pgx_image": null,
+      "glnexus_image": null,
+      "glnexus_config": "gatk",
+      "snakemake_jobs": 8,
+      "pypgx_snakefile": null,
+      "slurm": {
+        "time_limit": "24:00:00",
+        "memory": "32G",
+        "cpus": 8,
+        "job_name": null,
+        "extra_args": []
+      }
     }
   }
 }

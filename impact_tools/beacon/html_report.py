@@ -538,8 +538,8 @@ def write_pgx_report(
                 "workflow result",
             ),
             _card(
-                "Mode",
-                config.get("mode"),
+                "Execution mode",
+                config.get("executor"),
                 "execution mode",
             ),
             _card(
@@ -590,6 +590,8 @@ def write_pgx_report(
         run_details=_items(
             [
                 ("Base directory", config.get("base_dir")),
+                ("Executor", config.get("executor")),
+                ("Container runtime", config.get("container_runtime")),
                 ("Country code", config.get("country_code")),
                 (
                     "Sex ambiguous minimum",
@@ -757,7 +759,6 @@ def write_variant_ingest_report(
                 ("Reference genome", run.get("reference_genome")),
                 ("Run profile", run.get("run_profile")),
                 ("Dry run", run.get("dry_run")),
-                ("Skip filtering terms", run.get("skip_filtering_terms")),
                 ("Cleanup old", run.get("cleanup_old")),
                 ("Input mode", run.get("input_mode")),
                 ("VCF directory", run.get("vcf_dir")),

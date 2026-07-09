@@ -24,6 +24,8 @@ logs:
     ega_encrypt_upload: /impact_data/logs/impact-tools/ega/encrypt-upload
     beacon_liftover: /impact_data/logs/impact-tools/beacon/liftover
     beacon_pgx: /impact_data/logs/impact-tools/beacon/pgx
+    beacon_ingest_dataset: /impact_data/logs/impact-tools/beacon/ingest-dataset
+    beacon_ingest_variants: /impact_data/logs/impact-tools/beacon/ingest-variants
 
 ega:
   # Shared SQLite registry for successful encryption and Inbox upload events.
@@ -156,29 +158,77 @@ ega:
     # Stop processing the current task after its first failed file.
     fail_fast: true
 
-beacon: 
-  remote:
-    host: 172.20.10.47
-    user: bioinfo
-    port: 22
+beacon:
+  execution:
+    # Execution environment label used by Beacon liftover and Beacon ingest.
+    # Current accepted CLI values are: local, ws, hpc.
+    # This is metadata for metrics/manifests; it does not change the backend.
+    profile: local
 
-    # Set this only in your local ~/.config/impact-tools/config.yaml if needed.
-    password: null 
+  mongo:
+    # Direct MongoDB connection used by Beacon dataset and variant ingestion.
+    host: null # hostname or IP address of the MongoDB server
+    port: 8085
+    user: root
 
-    # Alternative to password-based login.
-    identity_file: null # Example: ~/.ssh/id_rsa
+    # Keep null in the template. Prefer IMPACT_TOOLS_BEACON_MONGO_PASSWORD
+    # or a private local extra config for the real password.
+    password: null
 
-    beacon_dir: /opt/beacon/beacon2-pi-api-isciii
-    input_dir: /impact_data/lega_data/beacon/inputs
-    log_dir: /var/log/local/beacon/apps/ri-tools
+    auth_source: admin
+    database: beacon
+    direct: true
 
-  containers:
-    mongo: mongoprod
-    api: beaconprod
+    # TLS options for MongoDB. Leave tls=false for the current ISCIII-CIBER setup.
+    tls: false
+    tls_ca: /etc/mongo/certs/ca.crt
+    tls_cert: /etc/mongo/certs/server.pem
+    tls_allow_invalid: false
 
-  runtime:
-    remote_container_runtime: podman
+    server_timeout_ms: 10000
+    connect_timeout_ms: 10000
+    socket_timeout_ms: 30000
 
-  ri_tools:
-    variants_command_template: >-
-      echo dataset={dataset_id} vcf={remote_vcf}
+  api:
+    # Beacon API base URL used for post-ingest validation.
+    # Keep it without /api because the API client appends the API path.
+    base_url: http://beaconaf-isciiiciber.isciiides.es:8443
+    timeout_seconds: 30
+    verify_tls: false
+
+  pgx:
+    # Execution backend for `impact-tools beacon pgx`.
+    # Accepted values: local, hpc.
+    # local uses Docker; hpc generates an sbatch/Singularity launcher.
+    executor: local
+
+    # Root output directory. When null, PGx uses the current directory.
+    output_dir: null
+
+    # Required unless passed with --ref-fasta.
+    ref_fasta: null
+
+    # Required unless passed with --pgx-image.
+    # Use a Docker image name for executor=local or a .sif path for executor=hpc.
+    pgx_image: null
+
+    # Optional GLnexus image. When null, the PGx code uses its built-in default.
+    glnexus_image: null
+
+    # GLnexus preset. "gatk" is the default used for DRAGEN gVCFs.
+    glnexus_config: gatk
+
+    # Number of Snakemake jobs used inside the generated PGx launcher.
+    snakemake_jobs: 8
+
+    # Optional PyPGx Snakefile path. Leave null unless the offline PyPGx resources
+    # are configured and --pypgx is used.
+    pypgx_snakefile: null
+
+    slurm:
+      # Used only when executor=hpc.
+      time_limit: "24:00:00"
+      memory: 32G
+      cpus: 8
+      job_name: null
+      extra_args: []

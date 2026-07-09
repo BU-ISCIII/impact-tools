@@ -10,7 +10,6 @@ import json
 import logging
 import platform
 import re
-import shlex
 import socket
 import sys
 import time
@@ -198,9 +197,7 @@ def prepare_dataset_artifacts(config: DatasetIngestConfig) -> DatasetIngestResul
 
     paths = build_dataset_paths(config.base_dir, config.dataset_id)
 
-    generated_files = [
-        paths.datasets_csv,
-    ]
+    generated_files: list[Path] = []
 
     if config.dry_run:
         return DatasetIngestResult(
@@ -214,6 +211,7 @@ def prepare_dataset_artifacts(config: DatasetIngestConfig) -> DatasetIngestResul
     paths.dataset_input_dir.mkdir(parents=True, exist_ok=True)
 
     paths.datasets_csv.write_text(render_datasets_csv(config), encoding="utf-8")
+    generated_files.append(paths.datasets_csv)
 
     generate_datasets_json(config, paths)
     generated_files.append(paths.datasets_json)
@@ -254,6 +252,21 @@ def _inject_duo_into_datasets_json(
         json.dumps(documents, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+
+
+def build_duo_filtering_terms(
+    duo_codes: tuple[str, ...],
+) -> list[dict[str, str]]:
+    """Build dataset-scoped DUO filtering terms for db.filtering_terms."""
+
+    return [
+        {
+            "id": code,
+            "label": DUO_LABELS[code],
+            "version": DUO_VERSION,
+        }
+        for code in duo_codes
+    ]
 
 
 def generate_datasets_json(
@@ -330,6 +343,9 @@ def write_dataset_ingest_metrics(
             "is_test": config.is_test,
             "is_synthetic": config.is_synthetic,
             "granularity": config.granularity,
+            "permissions_level": config.permissions_level,
+            "permissions_email": config.permissions_email,
+            "duo_codes": list(config.duo_codes),
             "dry_run": config.dry_run,
         },
         "environment": {
@@ -426,8 +442,10 @@ def apply_dataset_to_remote(
     local datasets.json file already exists.
 
     MongoDB is the only write path:
-    - db.datasets stores dataset metadata plus isTest/isSynthetic.
-    - db.datasetPermissions stores access permissions.
+    - db.datasets stores dataset metadata.
+    - db.datasetsConf stores isTest/isSynthetic.
+    - db.datasetsPermissions stores access permissions.
+    - db.filtering_terms stores dataset-scoped DUO filtering terms.
     """
 
     from impact_tools.beacon.api import (
@@ -440,6 +458,7 @@ def apply_dataset_to_remote(
         mongo_import_datasets,
         mongo_set_dataset_flags,
         mongo_set_dataset_permissions,
+        mongo_upsert_duo_filtering_terms,
     )
 
     with managed_mongo(deployment.mongo) as database:
@@ -490,13 +509,20 @@ def apply_dataset_to_remote(
             perms_status,
         )
 
-        mongo_set_dataset_permissions(
-            database,
+        duo_terms_changed = 0
+
+        if config.duo_codes:
+            duo_terms_changed = mongo_upsert_duo_filtering_terms(
+                database,
+                build_duo_filtering_terms(config.duo_codes),
+            )
+
+        LOGGER.info(
+            "Dataset '%s': DUO filtering terms changed=%d",
             config.dataset_id,
-            level=config.permissions_level,
-            granularity=config.granularity,
-            user_list=user_list,
+            duo_terms_changed,
         )
+
 
     with managed_beacon_api(deployment.api) as api_client:
         api_visible = verify_dataset_via_api(
@@ -541,7 +567,8 @@ def ingest_dataset(
     2. apply_dataset_to_remote(config, paths): apply them to the running
        Beacon deployment (skipped if config.dry_run is True).
 
-    A metrics JSON file and an HTML report is always written under <base-dir>/logs/.
+    A metrics JSON file and an HTML report are written for real executions.
+    Dry runs do not write files, metrics, reports, or MongoDB records.
     """
     started_at = _utc_now_iso()
     started_perf = time.perf_counter()
@@ -578,42 +605,47 @@ def ingest_dataset(
         ended_at = _utc_now_iso()
         duration_seconds = time.perf_counter() - started_perf
 
-        try:
-            metrics_file = write_dataset_ingest_metrics(
-                config=config,
-                result=result,
-                apply_result=apply_result,
-                started_at=started_at,
-                ended_at=ended_at,
-                duration_seconds=duration_seconds,
-                status=status,
-                error=error_message,
+        if config.dry_run:
+            LOGGER.info(
+                "Dry run enabled. Skipping metrics and HTML report generation."
             )
-            LOGGER.info("Metrics written: %s", metrics_file)
-
-            if result is not None:
-                result.metrics_file = metrics_file
-            if config.generate_report:
-                try:
-                    report_file = write_dataset_ingest_html_report(
-                        metrics_file=metrics_file,
-                    )
-                    LOGGER.info("HTML report written: %s", report_file)
-
-                    if result is not None:
-                        result.report_file = report_file
-
-                except Exception as report_exc:  # noqa: BLE001
-                    LOGGER.warning(
-                        "Could not write dataset ingest HTML report: %s",
-                        report_exc,
+        else:
+            try:
+                metrics_file = write_dataset_ingest_metrics(
+                    config=config,
+                    result=result,
+                    apply_result=apply_result,
+                    started_at=started_at,
+                    ended_at=ended_at,
+                    duration_seconds=duration_seconds,
+                    status=status,
+                    error=error_message,
                 )
+                LOGGER.info("Metrics written: %s", metrics_file)
 
-        except Exception as metrics_exc:  # noqa: BLE001
-            LOGGER.warning(
-                "Could not write dataset ingest metrics: %s",
-                metrics_exc,
-            )
+                if result is not None:
+                    result.metrics_file = metrics_file
+                if config.generate_report:
+                    try:
+                        report_file = write_dataset_ingest_html_report(
+                            metrics_file=metrics_file,
+                        )
+                        LOGGER.info("HTML report written: %s", report_file)
+
+                        if result is not None:
+                            result.report_file = report_file
+
+                    except Exception as report_exc:  # noqa: BLE001
+                        LOGGER.warning(
+                            "Could not write dataset ingest HTML report: %s",
+                            report_exc,
+                        )
+
+            except Exception as metrics_exc:  # noqa: BLE001
+                LOGGER.warning(
+                    "Could not write dataset ingest metrics: %s",
+                    metrics_exc,
+                )
 
     if result is None:
         raise RuntimeError("Dataset ingest failed before producing a result.")
@@ -636,7 +668,6 @@ class VariantsIngestConfig:
     vcf: Path | None = None
     vcf_dir: Path | None = None
     cleanup_old: bool = False
-    skip_filtering_terms: bool = False
     dry_run: bool = True
     run_profile: str = "local"
     generate_report: bool = True
@@ -744,7 +775,6 @@ def build_variant_ingest_payload(
             "reference_genome": config.reference_genome,
             "output_dir": str(config.output_dir.resolve()) if config.output_dir else None,
             "cleanup_old": config.cleanup_old,
-            "skip_filtering_terms": config.skip_filtering_terms,
             "dry_run": config.dry_run,
             "run_profile": config.run_profile,
         },
@@ -1176,8 +1206,11 @@ def apply_variants_to_remote(
 ) -> ApplyVariantsResult:
     """Apply genomic variants to the Beacon deployment.
 
-    MongoDB operations use direct PyMongo connections. SSH is retained
-    for filtering-term extraction (container exec) and API restart.
+    MongoDB operations use direct PyMongo connections. This workflow does not
+    execute SSH, container commands, or filtering-terms extraction.
+
+    DUO filtering terms are registered only by `ingest dataset`, when DUO codes
+    are explicitly provided.
 
     Safe verify-and-swap workflow:
 
@@ -1187,7 +1220,7 @@ def apply_variants_to_remote(
     4. If dry_run=True, stop after RI-tools.
     5. Count and verify staging variants through PyMongo.
     6. Swap active dataset_id through old_id/staging_id renames.
-    7. Reindex through PyMongo; extract filtering terms and restart via SSH.
+    7. Reindex through PyMongo.
     8. Verify API visibility and variant count through HTTP.
     9. Optionally delete old_id variants through PyMongo.
     """
@@ -1206,18 +1239,10 @@ def apply_variants_to_remote(
         mongo_reindex,
     )
 
-
     process_start = start_process_metrics()
 
     validate_dataset_id(config.dataset_id)
     validate_reference_genome(config.reference_genome)
-
-    if not config.skip_filtering_terms:
-        raise RuntimeError(
-            "Filtering terms extraction through SSH/container exec has been removed. "
-            "Use --skip-filtering-terms for now, or implement filtering-terms extraction "
-            "as a local PyMongo/API operation before running variants without that flag."
-        )
 
     vcf_files = resolve_variant_inputs(config)
 
@@ -1358,6 +1383,18 @@ def apply_variants_to_remote(
             staging_id,
         )
 
+        with managed_mongo(deployment.mongo) as database:
+            deleted_staging_variants = mongo_delete_dataset_variants(
+                database,
+                staging_id,
+            )
+
+        LOGGER.info(
+            "Dry run cleanup completed: deleted %d staging variants from dataset %s.",
+            deleted_staging_variants,
+            staging_id,
+        )
+
         process_metrics = finish_process_metrics(
             process_start
         )
@@ -1381,10 +1418,15 @@ def apply_variants_to_remote(
             execution=execution,
         )
 
-        write_variant_ingest_artifacts(
-            config=config,
-            result=result,
-        )
+        if config.generate_report:
+            write_variant_ingest_artifacts(
+                config=config,
+                result=result,
+            )
+        else:
+            LOGGER.info(
+                "Dry run enabled. Skipping manifest and HTML report generation."
+            )
 
         return result
 
@@ -1423,10 +1465,6 @@ def apply_variants_to_remote(
     # Reindex through direct PyMongo — no SSH or container exec needed.
     with managed_mongo(deployment.mongo) as database:
         mongo_reindex(database)
-
-    LOGGER.info(
-        "Skipping filtering terms extraction (--skip-filtering-terms)."
-    )
 
     # Verify the final state directly through the Beacon HTTP API.
     with managed_beacon_api(deployment.api) as api_client:
