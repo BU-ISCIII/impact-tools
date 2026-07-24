@@ -46,7 +46,41 @@ from impact_tools.ega.submission import (
 from impact_tools.ega.upload_inbox import InboxUploadConfig, run_inbox_upload
 from impact_tools.ega.workflow import EncryptUploadConfig, run_encrypt_upload
 
+from impact_tools.utils import rich_force_colors
+
 log = logging.getLogger(__name__)
+
+
+def print_banner(console: Console) -> None:
+    """Print the IMPaCT Cohorte ASCII banner."""
+    console.print(
+        r"[blue]                o   o   o",
+        highlight=False,
+    )
+    console.print(
+        r"[blue]                 ___   _    _   ___           ___    ___ ",
+        highlight=False,
+    )
+    console.print(
+        r"[blue]   \    |-[grey39]-|  [blue]    |   | \  / | |   \         |        |  ",
+        highlight=False,
+    )
+    console.print(
+        r"[blue]    \   \  [grey39]/ [blue]     |   |  \/  | |___/   ___   |        |  ",
+        highlight=False,
+    )
+    console.print(
+        r"[blue]    /  [grey39] / [blue] \      |   |      | |       ___|  |        |  ",
+        highlight=False,
+    )
+    console.print(
+        r"[blue]   /   [grey39] |-[blue]-|     _|_  |      | |      |___|  |___     |  ",
+        highlight=False,
+    )
+    console.print(
+        f"[grey39]    impact-tools version {__version__}",
+        highlight=False,
+    )
 
 
 def _configured_path(
@@ -2446,6 +2480,7 @@ ega.add_command(encrypt_slurm_cmd, "plan-encryption-slurm")
 
 def main() -> None:
     """Console entry point."""
+    print_banner(Console(stderr=True, force_terminal=rich_force_colors()))
     cli()
 
 
