@@ -32,6 +32,7 @@ where possible.
 - Adds EGA submission support for submitting to the FEGA Submitter Portal API [#16](https://github.com/BU-ISCIII/impact-tools/pull/16)
 - Reworked the Beacon `pgx` command into a batch release pipeline with GLnexus joint genotyping, Snakemake AF/QC, optional PyPGx and `--cleanup`. [#17](https://github.com/BU-ISCIII/impact-tools/pull/17)
 - Migrated Beacon dataset and variant ingestion from SSH/container-based operations to direct MongoDB and Beacon API access, including MongoDB-backed dataset flags, permissions and DUO terms. [#18](https://github.com/BU-ISCIII/impact-tools/pull/18)
+- Added ASCII banner with IMPaCT branding printed on CLI startup. [#19](https://github.com/BU-ISCIII/impact-tools/pull/19)
 
 ## [0.1.0] - 2026-05-21
 
