@@ -21,6 +21,7 @@ from impact_tools.ega.execution import (
 )
 from impact_tools.ega.html_report import write_encryption_report
 from impact_tools.ega.registry import DEFAULT_REGISTRY_PATH, EgaRegistry
+from impact_tools.ega.sample_files import discover_sample_files
 
 
 LOGGER = logging.getLogger(__name__)
@@ -31,6 +32,7 @@ BYTES_IN_GIB = 1024**3
 METRIC_FIELDS = [
     "run_id",
     "sample_id",
+    "input_role",
     "input_file",
     "output_file",
     "input_size_bytes",
@@ -59,6 +61,7 @@ class EncryptionConfig:
     output_dir: Path | None = None
     crypt4gh_bin: Path | None = None
     input_list: Path | None = None
+    sample_list: Path | None = None
     pattern: str = "*.fastq.gz"
     sample_id: str | None = None
     force: bool = False
@@ -77,6 +80,7 @@ class FileMetric:
 
     run_id: str
     sample_id: str
+    input_role: str
     input_file: str
     output_file: str
     input_size_bytes: int
@@ -121,6 +125,7 @@ class EncryptionResult:
 def run_encryption(config: EncryptionConfig) -> EncryptionResult:
     """Encrypt all matching files and write metrics, summary and optional plots."""
     process_start = start_process_metrics()
+    _validate_selection_options(config)
     input_dir = config.input_dir.expanduser().resolve()
     recipient_pubkey = config.recipient_pubkey.expanduser().resolve()
     output_dir = (
@@ -136,23 +141,39 @@ def run_encryption(config: EncryptionConfig) -> EncryptionResult:
     try:
         _validate_config(input_dir, recipient_pubkey)
         crypt4gh_bin = _resolve_crypt4gh(config.crypt4gh_bin)
-        files = _collect_input_files(
-            input_dir=input_dir,
-            output_dir=output_dir,
-            pattern=config.pattern,
-            input_list=config.input_list,
-        )
-        if not files:
-            raise ValueError(
-                f"No input files found under {input_dir} with pattern {config.pattern}"
+        sample_files = (
+            discover_sample_files(
+                input_dir=input_dir,
+                output_dir=output_dir,
+                sample_list=config.sample_list,
             )
+            if config.sample_list is not None
+            else []
+        )
+        files = (
+            [selected.path for selected in sample_files]
+            if sample_files
+            else _collect_input_files(
+                input_dir=input_dir,
+                output_dir=output_dir,
+                pattern=config.pattern,
+                input_list=config.input_list,
+            )
+        )
+        sample_ids_by_file = {
+            selected.path.resolve(): selected.sample_id
+            for selected in sample_files
+        }
+        if not files:
+            raise ValueError(f"No input files found under {input_dir}")
 
         LOGGER.info("Starting Crypt4GH batch encryption")
         LOGGER.info("Run ID: %s", run_id)
         LOGGER.info("Input directory: %s", input_dir)
         LOGGER.info("Output directory: %s", output_dir)
         LOGGER.info("Recipient public key: %s", recipient_pubkey)
-        LOGGER.info("Pattern: %s", config.pattern)
+        if config.sample_list is None:
+            LOGGER.info("Pattern: %s", config.pattern)
         LOGGER.info(
             "Processing registry: %s",
             config.registry_file.expanduser().resolve()
@@ -166,6 +187,9 @@ def run_encryption(config: EncryptionConfig) -> EncryptionResult:
             )
         if config.input_list is not None:
             LOGGER.info("Input list: %s", config.input_list.expanduser().resolve())
+        if config.sample_list is not None:
+            LOGGER.info("Sample list: %s", config.sample_list.expanduser().resolve())
+            LOGGER.info("Samples selected: %s", len(sample_files) // 2)
         LOGGER.info("Files discovered: %s", len(files))
 
         metrics: list[FileMetric] = []
@@ -187,6 +211,9 @@ def run_encryption(config: EncryptionConfig) -> EncryptionResult:
                     crypt4gh_bin=crypt4gh_bin,
                     config=config,
                     registry=registry,
+                    selected_sample_id=sample_ids_by_file.get(
+                        input_file.resolve()
+                    ),
                 )
                 metrics.append(metric)
                 if metric.status == "failed" and config.fail_fast:
@@ -271,6 +298,13 @@ def _validate_config(input_dir: Path, recipient_pubkey: Path) -> None:
         raise FileNotFoundError(f"Recipient public key does not exist: {recipient_pubkey}")
     if not recipient_pubkey.stat().st_size:
         raise ValueError(f"Recipient public key is empty: {recipient_pubkey}")
+
+
+def _validate_selection_options(config: EncryptionConfig) -> None:
+    if config.input_list is not None and config.sample_list is not None:
+        raise ValueError("--input-list and --sample-list are mutually exclusive")
+    if config.sample_id is not None and config.sample_list is not None:
+        raise ValueError("--sample-id and --sample-list are mutually exclusive")
 
 
 def _resolve_crypt4gh(crypt4gh_bin: Path | None) -> str:
@@ -372,6 +406,7 @@ def _process_file(
     crypt4gh_bin: str,
     config: EncryptionConfig,
     registry: EgaRegistry | None,
+    selected_sample_id: str | None = None,
 ) -> FileMetric:
     if config.dry_run or registry is None:
         return _process_file_claimed(
@@ -385,13 +420,16 @@ def _process_file(
             config=config,
             registry=registry,
             source_sha256="",
+            selected_sample_id=selected_sample_id,
         )
 
     source_sha256 = _sha256(input_file)
     claim_key = f"{source_sha256}:{recipient_sha256}"
     claim_owner = registry.try_claim("encrypted", claim_key)
     if claim_owner is None:
-        sample_id = _sample_id_for_file(input_file, input_dir, config.sample_id)
+        sample_id = selected_sample_id or _sample_id_for_file(
+            input_file, input_dir, config.sample_id
+        )
         output_file = output_dir / sample_id / f"{input_file.name}.c4gh"
         input_size = input_file.stat().st_size
         LOGGER.warning("Skipping content currently being encrypted: %s", input_file)
@@ -422,6 +460,7 @@ def _process_file(
             config=config,
             registry=registry,
             source_sha256=source_sha256,
+            selected_sample_id=selected_sample_id,
         )
     finally:
         registry.release_claim("encrypted", claim_key, claim_owner)
@@ -438,8 +477,11 @@ def _process_file_claimed(
     config: EncryptionConfig,
     registry: EgaRegistry | None,
     source_sha256: str,
+    selected_sample_id: str | None = None,
 ) -> FileMetric:
-    sample_id = _sample_id_for_file(input_file, input_dir, config.sample_id)
+    sample_id = selected_sample_id or _sample_id_for_file(
+        input_file, input_dir, config.sample_id
+    )
     relative_input = input_file.relative_to(input_dir)
     output_file = output_dir / sample_id / f"{input_file.name}.c4gh"
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -690,6 +732,7 @@ def _metric(
     return FileMetric(
         run_id=run_id,
         sample_id=sample_id,
+        input_role=_input_role(input_file),
         input_file=str(input_file),
         output_file=str(output_file),
         input_size_bytes=input_size,
@@ -707,6 +750,17 @@ def _metric(
         status=status,
         error=error,
     )
+
+
+def _input_role(input_file: Path) -> str:
+    name = input_file.name.lower()
+    if name.endswith(".cram"):
+        return "cram"
+    if name.endswith(".vcf.gz") or name.endswith(".vcf"):
+        return "vcf"
+    if name.endswith(".fastq.gz") or name.endswith(".fq.gz"):
+        return "fastq"
+    return "other"
 
 
 def _throughput(input_size: int, seconds: float) -> float | None:
@@ -795,6 +849,7 @@ def _write_summary(
         f"Run profile: {config.run_profile}",
         f"Pattern: {config.pattern}",
         f"Input list: {config.input_list.expanduser().resolve() if config.input_list else 'NA'}",
+        f"Sample list: {config.sample_list.expanduser().resolve() if config.sample_list else 'NA'}",
         f"Dry-run: {config.dry_run}",
         f"Checksums: {config.compute_checksums}",
         f"Registry: {config.registry_file or 'disabled'}",
@@ -847,6 +902,11 @@ def _write_manifest(
             "input_list": (
                 str(config.input_list.expanduser().resolve())
                 if config.input_list is not None
+                else None
+            ),
+            "sample_list": (
+                str(config.sample_list.expanduser().resolve())
+                if config.sample_list is not None
                 else None
             ),
             "dry_run": config.dry_run,

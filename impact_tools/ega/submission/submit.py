@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
 
 
 @dataclass(frozen=True)
@@ -21,7 +21,6 @@ class SubmitSubmissionConfig:
     resume_state_file: Path | None = None
     submission_id: str | None = None
     execute: bool = False
-    finalise: bool = False
     timeout_seconds: float = 60.0
     verify_tls: bool = True
 
@@ -46,6 +45,8 @@ class SubmissionStep:
     path: str
     payload: dict[str, Any]
     enabled: bool = True
+    entity: str | None = None
+    entity_key: str | None = None
 
 
 def submit_submission(config: SubmitSubmissionConfig) -> SubmitSubmissionResult:
@@ -55,6 +56,7 @@ def submit_submission(config: SubmitSubmissionConfig) -> SubmitSubmissionResult:
         raise FileNotFoundError(f"Draft file does not exist: {draft_path}")
 
     draft = _read_mapping_file(draft_path)
+    draft_sha256 = hashlib.sha256(draft_path.read_bytes()).hexdigest()
     output_dir = config.output_dir.expanduser().resolve()
     payload_dir = output_dir / "payloads"
     response_dir = output_dir / "responses"
@@ -73,6 +75,7 @@ def submit_submission(config: SubmitSubmissionConfig) -> SubmitSubmissionResult:
         "mode": "execute" if config.execute else "dry-run",
         "api_base": config.api_base,
         "draft_file": str(draft_path),
+        "draft_sha256": draft_sha256,
         "ids": {},
         "files": {},
         "steps": [],
@@ -81,7 +84,7 @@ def submit_submission(config: SubmitSubmissionConfig) -> SubmitSubmissionResult:
     if config.submission_id:
         state.setdefault("ids", {})["submission"] = str(config.submission_id)
 
-    steps = _build_steps(draft, state, include_finalise=config.finalise)
+    steps = _build_steps(draft, state)
     _write_payloads(payload_dir, steps, state)
     _write_plan(output_dir / "submission_plan.json", steps, state)
 
@@ -104,41 +107,129 @@ def submit_submission(config: SubmitSubmissionConfig) -> SubmitSubmissionResult:
     )
 
 
-def _build_steps(draft: dict[str, Any], state: dict[str, Any], include_finalise: bool) -> list[SubmissionStep]:
+def _build_steps(draft: dict[str, Any], state: dict[str, Any]) -> list[SubmissionStep]:
     submission = _clean_payload(draft.get("submission") or {})
     study = _clean_payload(draft.get("study") or {})
-    sample = _clean_payload(draft.get("sample") or {})
-    experiment = _clean_payload(draft.get("experiment") or {})
-    run = _clean_payload(draft.get("run") or {})
+    samples = _draft_entities(draft, "sample", "samples")
+    experiments = _draft_entities(draft, "experiment", "experiments")
+    runs = _draft_entities(draft, "run", "runs")
+    analyses = _draft_entities(draft, "analysis", "analyses", required=False)
+    analyses = [(key, payload) for key, payload in analyses if payload.get("files")]
+    _validate_entity_keys(samples, experiments, runs, analyses)
     dataset = _clean_payload(draft.get("dataset") or {})
-    finalise = _clean_payload(draft.get("finalise") or {})
 
     submission_id = _state_id(state, "submission", "{submission_provisional_id}")
     study_id = _state_id(state, "study", "{study_provisional_id}")
-    sample_id = _state_id(state, "sample", "{sample_provisional_id}")
-    experiment_id = _state_id(state, "experiment", "{experiment_provisional_id}")
-    run_id = _state_id(state, "run", "{run_provisional_id}")
-
     existing_ids = state.get("ids", {})
+    expected_files: list[dict[str, Any]] = []
 
-    expected_files = _expected_run_files(run)
+    sample_steps = []
+    for index, (key, sample) in enumerate(samples, start=1):
+        state_key = _entity_state_key("sample", key)
+        sample_steps.append(
+            SubmissionStep(
+                _entity_step_name("03_sample", index, len(samples)),
+                "POST",
+                f"/submissions/{submission_id}/samples",
+                sample,
+                enabled=bool(sample) and state_key not in existing_ids,
+                entity="sample",
+                entity_key=key,
+            )
+        )
+
+    experiment_steps = []
+    for index, (key, experiment) in enumerate(experiments, start=1):
+        if "study_accession_id" not in experiment and "study_provisional_id" not in experiment:
+            experiment["study_provisional_id"] = study_id
+        state_key = _entity_state_key("experiment", key)
+        experiment_steps.append(
+            SubmissionStep(
+                _entity_step_name("04_experiment", index, len(experiments)),
+                "POST",
+                f"/submissions/{submission_id}/experiments",
+                experiment,
+                enabled=bool(experiment) and state_key not in existing_ids,
+                entity="experiment",
+                entity_key=key,
+            )
+        )
+
+    run_steps = []
+    run_ids = []
+    for index, (key, run) in enumerate(runs, start=1):
+        run_expected = _expected_entity_files(run, entity="run", entity_key=key)
+        expected_files.extend(run_expected)
+        run["files"] = [_file_placeholder(item["lookup_name"]) for item in run_expected]
+        if "experiment_accession_id" not in run and "experiment_provisional_id" not in run:
+            run["experiment_provisional_id"] = _entity_placeholder("experiment", key)
+        if "sample_accession_id" not in run and "sample_provisional_id" not in run:
+            run["sample_provisional_id"] = _entity_placeholder("sample", key)
+        state_key = _entity_state_key("run", key)
+        run_ids.append(_entity_placeholder("run", key))
+        run_steps.append(
+            SubmissionStep(
+                _entity_step_name("06_run", index, len(runs)),
+                "POST",
+                f"/submissions/{submission_id}/runs",
+                run,
+                enabled=bool(run) and state_key not in existing_ids,
+                entity="run",
+                entity_key=key,
+            )
+        )
+
+    analysis_steps = []
+    analysis_ids = []
+    for index, (key, analysis) in enumerate(analyses, start=1):
+        analysis_expected = _expected_entity_files(analysis, entity="analysis", entity_key=key)
+        expected_files.extend(analysis_expected)
+        analysis["files"] = [_file_placeholder(item["lookup_name"]) for item in analysis_expected]
+        if "study_accession_id" not in analysis and "study_provisional_id" not in analysis:
+            analysis["study_provisional_id"] = study_id
+        if "experiment_accession_ids" not in analysis and "experiment_provisional_ids" not in analysis:
+            analysis["experiment_provisional_ids"] = [_entity_placeholder("experiment", key)]
+        if "sample_accession_ids" not in analysis and "sample_provisional_ids" not in analysis:
+            analysis["sample_provisional_ids"] = [_entity_placeholder("sample", key)]
+        state_key = _entity_state_key("analysis", key)
+        analysis_ids.append(_entity_placeholder("analysis", key))
+        analysis_steps.append(
+            SubmissionStep(
+                _entity_step_name("07_analysis", index, len(analyses)),
+                "POST",
+                f"/submissions/{submission_id}/analyses",
+                analysis,
+                enabled=bool(analysis) and state_key not in existing_ids,
+                entity="analysis",
+                entity_key=key,
+            )
+        )
+
     state["expected_files"] = expected_files
-    run["files"] = [_file_placeholder(item["lookup_name"]) for item in expected_files]
-
-    if "study_accession_id" not in experiment and "study_provisional_id" not in experiment:
-        experiment["study_provisional_id"] = study_id
-    if "experiment_accession_id" not in run and "experiment_provisional_id" not in run:
-        run["experiment_provisional_id"] = experiment_id
-    if "sample_accession_id" not in run and "sample_provisional_id" not in run:
-        run["sample_provisional_id"] = sample_id
     if "run_accession_ids" not in dataset and "run_provisional_ids" not in dataset:
-        dataset["run_provisional_ids"] = [run_id]
+        dataset["run_provisional_ids"] = run_ids
+    if analysis_ids and "analysis_accession_ids" not in dataset and "analysis_provisional_ids" not in dataset:
+        dataset["analysis_provisional_ids"] = analysis_ids
 
     return [
-        SubmissionStep("01_submission", "POST", "/submissions", submission, enabled=bool(submission) and "submission" not in existing_ids),
-        SubmissionStep("02_study", "POST", f"/submissions/{submission_id}/studies", study, enabled=bool(study) and "study" not in existing_ids),
-        SubmissionStep("03_sample", "POST", f"/submissions/{submission_id}/samples", sample, enabled=bool(sample) and "sample" not in existing_ids),
-        SubmissionStep("04_experiment", "POST", f"/submissions/{submission_id}/experiments", experiment, enabled=bool(experiment) and "experiment" not in existing_ids),
+        SubmissionStep(
+            "01_submission",
+            "POST",
+            "/submissions",
+            submission,
+            enabled=bool(submission) and "submission" not in existing_ids,
+            entity="submission",
+        ),
+        SubmissionStep(
+            "02_study",
+            "POST",
+            f"/submissions/{submission_id}/studies",
+            study,
+            enabled=bool(study) and "study" not in existing_ids,
+            entity="study",
+        ),
+        *sample_steps,
+        *experiment_steps,
         SubmissionStep(
             "05_resolve_files",
             "GET",
@@ -146,20 +237,87 @@ def _build_steps(draft: dict[str, Any], state: dict[str, Any], include_finalise:
             {"expected_files": expected_files, "status": "inbox"},
             enabled=bool(expected_files) and not _expected_files_already_resolved(expected_files, state),
         ),
-        SubmissionStep("06_run", "POST", f"/submissions/{submission_id}/runs", run, enabled=bool(run) and "run" not in existing_ids),
-        SubmissionStep("07_dataset", "POST", f"/submissions/{submission_id}/datasets", dataset, enabled=bool(dataset) and "dataset" not in existing_ids),
+        *run_steps,
+        *analysis_steps,
         SubmissionStep(
-            "08_finalise",
+            "08_dataset",
             "POST",
-            f"/submissions/{submission_id}/finalise",
-            finalise,
-            enabled=include_finalise and bool(finalise),
+            f"/submissions/{submission_id}/datasets",
+            dataset,
+            enabled=bool(dataset) and "dataset" not in existing_ids,
+            entity="dataset",
         ),
     ]
 
 
+def _draft_entities(
+    draft: dict[str, Any],
+    singular: str,
+    plural: str,
+    *,
+    required: bool = True,
+) -> list[tuple[str | None, dict[str, Any]]]:
+    is_batch = plural in draft
+    raw_items = draft.get(plural) if is_batch else [draft.get(singular)]
+    if raw_items is None:
+        raw_items = []
+    if not isinstance(raw_items, list):
+        raise ValueError(f"Draft field {plural!r} must be a list")
+    entities = []
+    seen = set()
+    for index, raw_item in enumerate(raw_items, start=1):
+        if raw_item is None and not is_batch:
+            raw_item = {}
+        if not isinstance(raw_item, dict):
+            raise ValueError(f"Draft field {plural}[{index}] must be a mapping")
+        item = _clean_payload(raw_item)
+        key_value = item.pop("_key", None)
+        key = str(key_value) if key_value is not None else None
+        if is_batch and not key:
+            raise ValueError(f"Draft field {plural}[{index}] requires a non-empty _key")
+        if key in seen:
+            raise ValueError(f"Draft field {plural} contains duplicate _key {key!r}")
+        seen.add(key)
+        if item or required:
+            entities.append((key, item))
+    if required and not entities:
+        raise ValueError(f"Draft field {plural!r} must contain at least one item")
+    return entities
+
+
 def _expected_run_files(run: dict[str, Any]) -> list[dict[str, Any]]:
-    files = run.get("files")
+    """Backward-compatible alias for callers using the original helper."""
+    return _expected_entity_files(run, entity="run", entity_key=None)
+
+
+def _validate_entity_keys(
+    samples: list[tuple[str | None, dict[str, Any]]],
+    experiments: list[tuple[str | None, dict[str, Any]]],
+    runs: list[tuple[str | None, dict[str, Any]]],
+    analyses: list[tuple[str | None, dict[str, Any]]],
+) -> None:
+    sample_keys = {key for key, _ in samples}
+    for label, entities in (
+        ("experiments", experiments),
+        ("runs", runs),
+        ("analyses", analyses),
+    ):
+        keys = {key for key, _ in entities}
+        if keys and keys != sample_keys:
+            raise ValueError(
+                f"Draft {label} _key values must match samples exactly; "
+                f"samples={sorted(str(key) for key in sample_keys)}, "
+                f"{label}={sorted(str(key) for key in keys)}"
+            )
+
+
+def _expected_entity_files(
+    payload: dict[str, Any],
+    *,
+    entity: str,
+    entity_key: str | None,
+) -> list[dict[str, Any]]:
+    files = payload.get("files")
     if not isinstance(files, list):
         return []
     expected = []
@@ -178,9 +336,24 @@ def _expected_run_files(run: dict[str, Any]) -> list[dict[str, Any]]:
                 "lookup_name": encrypted_name,
                 "unencrypted_md5": item.get("md5"),
                 "extension": item.get("extension"),
+                "entity": entity,
+                "entity_key": entity_key,
             }
         )
     return expected
+
+
+def _entity_step_name(prefix: str, index: int, count: int) -> str:
+    return prefix if count == 1 else f"{prefix}_{index:03d}"
+
+
+def _entity_state_key(entity: str, key: str | None) -> str:
+    return entity if key is None else f"{entity}:{key}"
+
+
+def _entity_placeholder(entity: str, key: str | None) -> str:
+    suffix = "" if key is None else f":{key}"
+    return f"{{{entity}_provisional_id{suffix}}}"
 
 
 def _file_placeholder(name: str) -> str:
@@ -193,24 +366,18 @@ def _expected_files_already_resolved(expected_files: list[dict[str, Any]], state
 
 
 def _validate_execute_plan(steps: list[SubmissionStep], state: dict[str, Any]) -> None:
-    entity_by_step = {
-        "01_submission": "submission",
-        "02_study": "study",
-        "03_sample": "sample",
-        "04_experiment": "experiment",
-        "06_run": "run",
-        "07_dataset": "dataset",
-    }
-    required_steps = ["01_submission", "02_study", "03_sample", "04_experiment", "05_resolve_files", "06_run", "07_dataset"]
     existing_ids = state.get("ids", {})
     disabled = []
     for step in steps:
-        if step.name not in required_steps or step.enabled:
+        if step.enabled:
             continue
-        if step.name == "05_resolve_files" and _expected_files_already_resolved(state.get("expected_files") or [], state):
+        if step.name == "05_resolve_files" and _expected_files_already_resolved(
+            state.get("expected_files") or [],
+            state,
+        ):
             continue
-        entity = entity_by_step.get(step.name)
-        if entity and entity in existing_ids:
+        state_key = _entity_state_key(step.entity, step.entity_key) if step.entity else None
+        if state_key and state_key in existing_ids:
             continue
         disabled.append(step.name)
     if disabled:
@@ -228,9 +395,11 @@ def _validate_execute_payloads(steps: list[SubmissionStep], state: dict[str, Any
         for path, value in _walk_payload(payload):
             if isinstance(value, str) and value.startswith("EXAMPLE:"):
                 errors.append(f"{step.name}.{path} contains placeholder example value: {value!r}")
-        if step.name == "04_experiment":
+        if step.name.startswith("04_experiment"):
             errors.extend(_validate_experiment_payload(payload))
-        if step.name == "07_dataset":
+        if step.name.startswith("07_analysis"):
+            errors.extend(_validate_analysis_payload(payload, step.name))
+        if step.name == "08_dataset":
             errors.extend(_validate_dataset_payload(payload))
     if errors:
         raise ValueError("Cannot execute submission because payload validation failed:\n- " + "\n- ".join(errors))
@@ -252,28 +421,114 @@ def _validate_experiment_payload(payload: dict[str, Any]) -> list[str]:
             errors.append(f"04_experiment.{key} is required")
     if "instrument_model_id" in payload and not isinstance(payload["instrument_model_id"], int):
         errors.append("04_experiment.instrument_model_id must be an integer platform model id")
-    if "study_provisional_id" in payload and not isinstance(payload["study_provisional_id"], int):
+    if "study_provisional_id" in payload and not _is_integer_reference(payload["study_provisional_id"]):
         errors.append("04_experiment.study_provisional_id must be an integer")
     return errors
+
+
+def _validate_analysis_payload(payload: dict[str, Any], step_name: str) -> list[str]:
+    errors = []
+    for key in (
+        "title",
+        "description",
+        "analysis_type",
+        "files",
+        "experiment_types",
+        "genome_id",
+        "chromosomes",
+        "study_provisional_id",
+        "experiment_provisional_ids",
+        "sample_provisional_ids",
+    ):
+        if key not in payload:
+            errors.append(f"{step_name}.{key} is required")
+    for key in ("files", "experiment_provisional_ids", "sample_provisional_ids"):
+        values = payload.get(key)
+        if values is not None and not (
+            isinstance(values, list)
+            and bool(values)
+            and all(_is_integer_reference(item) for item in values)
+        ):
+            errors.append(f"{step_name}.{key} must be a non-empty list of integers")
+    if "genome_id" in payload and not isinstance(payload["genome_id"], int):
+        errors.append(f"{step_name}.genome_id must be an integer genome id")
+    if "analysis_type" in payload and not isinstance(payload["analysis_type"], str):
+        errors.append(f"{step_name}.analysis_type must be a string enum value")
+    if "description" in payload and not isinstance(payload["description"], str):
+        errors.append(f"{step_name}.description must be a string")
+    experiment_types = payload.get("experiment_types")
+    if experiment_types is not None and not (
+        isinstance(experiment_types, list)
+        and bool(experiment_types)
+        and all(isinstance(item, str) for item in experiment_types)
+    ):
+        errors.append(f"{step_name}.experiment_types must be a non-empty list of strings")
+    chromosomes = payload.get("chromosomes")
+    if chromosomes is not None and not (
+        isinstance(chromosomes, list)
+        and bool(chromosomes)
+        and all(_is_id_label_pair(item) for item in chromosomes)
+    ):
+        errors.append(
+            f"{step_name}.chromosomes must be a non-empty list of "
+            "[id, label] pairs or id/label mappings"
+        )
+    return errors
+
+
+def _is_id_label_pair(value: Any) -> bool:
+    if isinstance(value, (list, tuple)):
+        return (
+            len(value) == 2
+            and isinstance(value[0], int)
+            and isinstance(value[1], str)
+            and bool(value[1].strip())
+        )
+    if isinstance(value, dict):
+        return (
+            isinstance(value.get("id"), int)
+            and isinstance(value.get("label"), str)
+            and bool(value["label"].strip())
+        )
+    return False
 
 
 def _validate_dataset_payload(payload: dict[str, Any]) -> list[str]:
     errors = []
     for key in ("title", "description", "dataset_types", "policy_accession_id"):
         if key not in payload:
-            errors.append(f"07_dataset.{key} is required")
+            errors.append(f"08_dataset.{key} is required")
     dataset_types = payload.get("dataset_types")
     if "dataset_types" in payload and not (
         isinstance(dataset_types, list) and all(isinstance(item, str) for item in dataset_types)
     ):
-        errors.append("07_dataset.dataset_types must be a list of strings")
+        errors.append("08_dataset.dataset_types must be a list of strings")
     run_ids = payload.get("run_provisional_ids")
-    if run_ids is not None and not (isinstance(run_ids, list) and all(isinstance(item, int) for item in run_ids)):
-        errors.append("07_dataset.run_provisional_ids must be a list of integers")
+    if run_ids is not None and not (
+        isinstance(run_ids, list) and all(_is_integer_reference(item) for item in run_ids)
+    ):
+        errors.append("08_dataset.run_provisional_ids must be a list of integers")
+    analysis_ids = payload.get("analysis_provisional_ids")
+    if analysis_ids is not None and not (
+        isinstance(analysis_ids, list) and all(_is_integer_reference(item) for item in analysis_ids)
+    ):
+        errors.append("08_dataset.analysis_provisional_ids must be a list of integers")
     policy_id = payload.get("policy_accession_id")
     if isinstance(policy_id, str) and not policy_id.startswith("EGAP"):
-        errors.append("07_dataset.policy_accession_id must be an EGAP accession")
+        errors.append("08_dataset.policy_accession_id must be an EGAP accession")
     return errors
+
+
+def _is_integer_reference(value: Any) -> bool:
+    return isinstance(value, int) or (
+        isinstance(value, str)
+        and value.startswith("{")
+        and value.endswith("_provisional_id}")
+    ) or (
+        isinstance(value, str)
+        and "_provisional_id:" in value
+        and value.endswith("}")
+    )
 
 
 def _walk_payload(value: Any, prefix: str = "") -> list[tuple[str, Any]]:
@@ -305,19 +560,33 @@ def _resolve_files(client: Any, payload: dict[str, Any], state: dict[str, Any]) 
             continue
         file_id = match.get("provisional_id")
         if file_id is None:
-            missing.append({"expected": expected, "candidates": candidates, "reason": "matched file has no provisional_id"})
+            missing.append(
+                {
+                    "expected": expected,
+                    "candidates": candidates,
+                    "reason": "matched file has no provisional_id",
+                }
+            )
             continue
         state.setdefault("files", {})[lookup_name] = file_id
         resolved.append({"expected": expected, "file": match, "provisional_id": file_id})
     if missing:
-        raise RuntimeError("Could not resolve all Inbox files for RunRequest.files: " + json.dumps(missing, ensure_ascii=False)[:2000])
+        raise RuntimeError(
+            "Could not resolve all Inbox files required by Runs and Analyses: "
+            + json.dumps(missing, ensure_ascii=False)[:2000]
+        )
     return {"resolved_files": resolved}
 
 
 def _fetch_file_candidates(client: Any, lookup_name: str) -> list[dict[str, Any]]:
-    prefixes = [lookup_name]
+    normalized_name = lookup_name.lstrip("/")
+    basename = Path(normalized_name).name
+    prefixes = [f"/{normalized_name}", normalized_name]
+    if basename != normalized_name:
+        prefixes.extend([f"/{basename}", basename])
     if lookup_name.endswith(".c4gh"):
-        prefixes.append(lookup_name.removesuffix(".c4gh"))
+        unencrypted_name = normalized_name.removesuffix(".c4gh")
+        prefixes.extend([f"/{unencrypted_name}", unencrypted_name])
     candidates: list[dict[str, Any]] = []
     seen = set()
     for prefix in prefixes:
@@ -325,6 +594,16 @@ def _fetch_file_candidates(client: Any, lookup_name: str) -> list[dict[str, Any]
         response_payload = _read_response_json(response)
         response.raise_for_status()
         _extend_unique_candidates(candidates, seen, _extract_records(response_payload))
+        exact_path_matches = [
+            candidate
+            for candidate in candidates
+            if any(
+                str(candidate.get(field) or "").lstrip("/") == normalized_name
+                for field in ("relative_path", "display_name", "name")
+            )
+        ]
+        if len(exact_path_matches) == 1:
+            return exact_path_matches
     if not candidates:
         response = client.get("/files", params={"status": "inbox"})
         response_payload = _read_response_json(response)
@@ -339,7 +618,11 @@ def _fetch_file_candidates(client: Any, lookup_name: str) -> list[dict[str, Any]
 
 
 def _extract_records(response_payload: dict[str, Any]) -> list[dict[str, Any]]:
-    records = response_payload.get("response") if isinstance(response_payload.get("response"), list) else response_payload
+    records = (
+        response_payload.get("response")
+        if isinstance(response_payload.get("response"), list)
+        else response_payload
+    )
     if isinstance(records, dict):
         records = records.get("items") or records.get("results") or records.get("data") or []
     if not isinstance(records, list):
@@ -357,6 +640,7 @@ def _extend_unique_candidates(candidates: list[dict[str, Any]], seen: set[str], 
 
 
 def _file_candidate_matches_lookup(candidate: dict[str, Any], lookup_name: str) -> bool:
+    lookup_basename = Path(lookup_name).name
     names = [
         candidate.get("relative_path"),
         candidate.get("display_name"),
@@ -366,7 +650,11 @@ def _file_candidate_matches_lookup(candidate: dict[str, Any], lookup_name: str) 
         if not name:
             continue
         name_text = str(name)
-        if name_text == lookup_name or name_text.endswith(f"/{lookup_name}") or Path(name_text).name == lookup_name:
+        if (
+            name_text == lookup_name
+            or name_text.endswith(f"/{lookup_name}")
+            or Path(name_text).name == lookup_basename
+        ):
             return True
     return False
 
@@ -375,6 +663,8 @@ def _select_file_candidate(candidates: list[dict[str, Any]], expected: dict[str,
     lookup_name = expected["lookup_name"]
     source_name = expected.get("source_name")
     unencrypted_md5 = expected.get("unencrypted_md5")
+    lookup_basename = Path(lookup_name).name
+    source_basename = Path(str(source_name)).name if source_name else None
     exact_name_matches = []
     for candidate in candidates:
         names = [
@@ -383,7 +673,12 @@ def _select_file_candidate(candidates: list[dict[str, Any]], expected: dict[str,
             candidate.get("name"),
         ]
         basenames = [Path(str(name)).name for name in names if name]
-        if lookup_name in names or lookup_name in basenames or source_name in names or source_name in basenames:
+        if (
+            lookup_name in names
+            or lookup_basename in basenames
+            or source_name in names
+            or source_basename in basenames
+        ):
             exact_name_matches.append(candidate)
     if unencrypted_md5:
         checksum_matches = [
@@ -444,43 +739,37 @@ def _execute_steps(
                 encoding="utf-8",
             )
             response.raise_for_status()
-            _update_state_ids(state, step.name, response_payload)
+            _update_state_ids(state, step, response_payload)
             _record_step(state, step, path=path, status_code=response.status_code)
 
 
 def _apply_dry_run_ids(steps: list[SubmissionStep], state: dict[str, Any]) -> None:
-    dry_ids = {
-        "submission": "DRY_RUN_SUBMISSION_PROVISIONAL_ID",
-        "study": "DRY_RUN_STUDY_PROVISIONAL_ID",
-        "sample": "DRY_RUN_SAMPLE_PROVISIONAL_ID",
-        "experiment": "DRY_RUN_EXPERIMENT_PROVISIONAL_ID",
-        "run": "DRY_RUN_RUN_PROVISIONAL_ID",
-        "dataset": "DRY_RUN_DATASET_PROVISIONAL_ID",
-    }
-    state.setdefault("ids", {}).update(dry_ids)
+    for step in steps:
+        if not step.entity:
+            continue
+        state_key = _entity_state_key(step.entity, step.entity_key)
+        state.setdefault("ids", {}).setdefault(
+            state_key,
+            f"DRY_RUN_{state_key.upper().replace(':', '_')}_PROVISIONAL_ID",
+        )
     expected_files = state.get("expected_files") or []
     state.setdefault("files", {}).update(
-        {item["lookup_name"]: f"DRY_RUN_FILE_PROVISIONAL_ID_{index}" for index, item in enumerate(expected_files, start=1)}
+        {
+            item["lookup_name"]: f"DRY_RUN_FILE_PROVISIONAL_ID_{index}"
+            for index, item in enumerate(expected_files, start=1)
+        }
     )
     for step in steps:
         _record_step(state, step, path=_resolve_path(step.path, state), skipped=not step.enabled)
 
 
-def _update_state_ids(state: dict[str, Any], step_name: str, payload: dict[str, Any]) -> None:
-    entity_by_step = {
-        "01_submission": "submission",
-        "02_study": "study",
-        "03_sample": "sample",
-        "04_experiment": "experiment",
-        "06_run": "run",
-        "07_dataset": "dataset",
-    }
-    entity = entity_by_step.get(step_name)
-    if not entity:
+def _update_state_ids(state: dict[str, Any], step: SubmissionStep, payload: dict[str, Any]) -> None:
+    if not step.entity:
         return
     identifier = _extract_identifier(payload)
     if identifier:
-        state.setdefault("ids", {})[entity] = identifier
+        state_key = _entity_state_key(step.entity, step.entity_key)
+        state.setdefault("ids", {})[state_key] = identifier
 
 
 def _extract_identifier(payload: Any) -> str | None:
@@ -585,11 +874,15 @@ def _resolve_placeholders(value: Any, state: dict[str, Any]) -> Any:
     replacements = {
         "{submission_provisional_id}": ids.get("submission", "{submission_provisional_id}"),
         "{study_provisional_id}": ids.get("study", "{study_provisional_id}"),
-        "{sample_provisional_id}": ids.get("sample", "{sample_provisional_id}"),
-        "{experiment_provisional_id}": ids.get("experiment", "{experiment_provisional_id}"),
-        "{run_provisional_id}": ids.get("run", "{run_provisional_id}"),
     }
     if isinstance(value, str):
+        entity_match = _entity_placeholder_pattern(value)
+        if entity_match is not None:
+            state_key, original = entity_match
+            replacement = ids.get(state_key, original)
+            if isinstance(replacement, str) and replacement.isdigit():
+                return int(replacement)
+            return replacement
         if value in replacements:
             replacement = replacements[value]
             if isinstance(replacement, str) and replacement.isdigit():
@@ -613,6 +906,20 @@ def _file_placeholder_pattern(value: str) -> str | None:
     if value.startswith(prefix) and value.endswith("}"):
         return value[len(prefix):-1]
     return None
+
+
+def _entity_placeholder_pattern(value: str) -> tuple[str, str] | None:
+    if not (value.startswith("{") and value.endswith("}")):
+        return None
+    content = value[1:-1]
+    marker = "_provisional_id"
+    if marker not in content:
+        return None
+    entity, suffix = content.split(marker, 1)
+    if entity not in {"sample", "experiment", "run", "analysis"}:
+        return None
+    key = suffix.removeprefix(":") or None
+    return _entity_state_key(entity, key), value
 
 
 def _read_token(token: str | None, token_file: Path | None) -> str | None:
@@ -643,6 +950,34 @@ def _apply_resume_state(state: dict[str, Any], resume_state_file: Path | None) -
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(f"Resume state must contain a mapping: {path}")
+    if payload.get("mode") != "execute":
+        raise ValueError(
+            f"Resume state was not produced by an executed submission: {path}"
+        )
+    resumed_digest = payload.get("draft_sha256")
+    current_digest = state.get("draft_sha256")
+    if resumed_digest is not None:
+        if resumed_digest != current_digest:
+            raise ValueError(
+                "Resume state belongs to a different submission draft: "
+                f"{path}"
+            )
+    else:
+        resumed_draft = payload.get("draft_file")
+        if not resumed_draft or Path(resumed_draft).expanduser().resolve() != Path(
+            state["draft_file"]
+        ).resolve():
+            raise ValueError(
+                "Legacy resume state cannot be verified against this draft: "
+                f"{path}"
+            )
+    resumed_api = str(payload.get("api_base") or "").rstrip("/")
+    current_api = str(state.get("api_base") or "").rstrip("/")
+    if resumed_api and current_api and resumed_api != current_api:
+        raise ValueError(
+            "Resume state belongs to a different Submitter Portal API: "
+            f"{resumed_api}"
+        )
     ids = payload.get("ids")
     if isinstance(ids, dict):
         state.setdefault("ids", {}).update({key: str(value) for key, value in ids.items() if value is not None})

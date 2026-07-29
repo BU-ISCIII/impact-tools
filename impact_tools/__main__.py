@@ -308,6 +308,14 @@ def ega() -> None:
     help="Sample identifier. Defaults to the input directory name.",
 )
 @click.option(
+    "--sample-list",
+    type=click.Path(path_type=Path, dir_okay=False, exists=True),
+    help=(
+        "Text file of sample identifiers; prepares one shared dataset "
+        "containing every sample's CRAM run and VCF analysis."
+    ),
+)
+@click.option(
     "--metadata-file",
     type=click.Path(path_type=Path, dir_okay=False, exists=True),
     help="Optional provider/cohort metadata CSV, TSV or JSON file.",
@@ -329,6 +337,7 @@ def prepare_submission_cmd(
     input_dir: Path,
     output_dir: Path,
     sample_id: str | None,
+    sample_list: Path | None,
     metadata_file: Path | None,
     profile_file: Path | None,
     include_examples: bool,
@@ -342,6 +351,7 @@ def prepare_submission_cmd(
                 input_dir=input_dir,
                 output_dir=output_dir,
                 sample_id=sample_id,
+                sample_list=sample_list,
                 metadata_file=metadata_file,
                 profile_file=profile_file,
                 include_examples=include_examples,
@@ -399,12 +409,6 @@ def prepare_submission_cmd(
     help="Execute API calls. Default dry-run only writes payloads and plan.",
 )
 @click.option(
-    "--finalise/--no-finalise",
-    default=False,
-    show_default=True,
-    help="Include finalise step. Keep disabled until metadata has been reviewed.",
-)
-@click.option(
     "--timeout-seconds",
     default=60.0,
     show_default=True,
@@ -427,7 +431,6 @@ def submit_submission_cmd(
     resume_state_file: Path | None,
     submission_id: str | None,
     execute: bool,
-    finalise: bool,
     timeout_seconds: float,
     no_verify_tls: bool,
 ) -> None:
@@ -444,7 +447,6 @@ def submit_submission_cmd(
                 resume_state_file=resume_state_file,
                 submission_id=submission_id,
                 execute=execute,
-                finalise=finalise,
                 timeout_seconds=timeout_seconds,
                 verify_tls=not no_verify_tls,
             )
@@ -490,6 +492,15 @@ def submit_submission_cmd(
     help=(
         "Text file with one input file path per line. Empty lines and lines "
         "starting with # are ignored. Relative paths are resolved from input-dir."
+    ),
+)
+@click.option(
+    "--sample-list",
+    type=click.Path(path_type=Path, dir_okay=False, exists=True),
+    help=(
+        "Text file with one sample identifier per line. For each sample, "
+        "discover exactly one CRAM and one VCF under input-dir. Mutually "
+        "exclusive with --input-list and --sample-id."
     ),
 )
 @click.option(
@@ -558,6 +569,7 @@ def encrypt_cmd(
     recipient_pubkey: Path | None,
     crypt4gh_bin: Path | None,
     input_list: Path | None,
+    sample_list: Path | None,
     pattern: str,
     sample_id: str | None,
     force: bool,
@@ -606,6 +618,7 @@ def encrypt_cmd(
         recipient_pubkey=recipient_pubkey,
         crypt4gh_bin=crypt4gh_bin,
         input_list=input_list,
+        sample_list=sample_list,
         pattern=pattern,
         sample_id=sample_id,
         force=force,
@@ -861,6 +874,14 @@ def upload_inbox_cmd(
     type=click.Path(path_type=Path, dir_okay=False),
     help="crypt4gh executable. Defaults to configuration or PATH.",
 )
+@click.option(
+    "--sample-list",
+    type=click.Path(path_type=Path, dir_okay=False, exists=True),
+    help=(
+        "Text file with one sample identifier per line. Encrypt and upload "
+        "exactly one CRAM and one VCF discovered for every sample."
+    ),
+)
 @click.option("--pattern", default="*.fastq.gz", show_default=True)
 @click.option("--host", help="Inbox SFTP host.")
 @click.option("--port", type=int, help="Inbox SFTP port.")
@@ -904,6 +925,7 @@ def encrypt_upload_cmd(
     output_dir: Path | None,
     recipient_pubkey: Path | None,
     crypt4gh_bin: Path | None,
+    sample_list: Path | None,
     pattern: str,
     host: str | None,
     port: int | None,
@@ -977,6 +999,7 @@ def encrypt_upload_cmd(
             output_dir=encrypted_dir,
             recipient_pubkey=recipient_pubkey,
             crypt4gh_bin=crypt4gh_bin,
+            sample_list=sample_list,
             pattern=pattern,
             force=force,
             compute_checksums=not no_checksums,

@@ -72,6 +72,7 @@ def run_encrypt_upload(config: EncryptUploadConfig) -> EncryptUploadResult:
     )
     if not upload_files:
         raise RuntimeError("Encryption did not produce any uploadable files")
+    _validate_upload_layout(upload_files, config.upload.remote_layout)
 
     upload_input_list = output_dir / f"upload_inputs_{run_id}.txt"
     upload_input_list.write_text(
@@ -144,6 +145,31 @@ def _prepare_upload_sources(manifest_file: Path, source_dir: Path) -> list[Path]
         staged_output.symlink_to(output)
         outputs.append(staged_output.absolute())
     return outputs
+
+
+def _validate_upload_layout(upload_files: list[Path], remote_layout: str) -> None:
+    """Prevent different sample files from colliding in a flat Inbox."""
+    if remote_layout != "flat":
+        return
+    by_name: dict[str, list[Path]] = {}
+    for path in upload_files:
+        by_name.setdefault(path.name, []).append(path)
+    collisions = {
+        name: paths
+        for name, paths in by_name.items()
+        if len(paths) > 1
+    }
+    if not collisions:
+        return
+    details = "; ".join(
+        f"{name}: {', '.join(str(path) for path in paths)}"
+        for name, paths in sorted(collisions.items())
+    )
+    raise ValueError(
+        "Flat Inbox layout would overwrite files with the same basename. "
+        "Use --remote-layout relative or unique per-sample filenames. "
+        f"Collisions: {details}"
+    )
 
 
 def _result_payload(result) -> dict:

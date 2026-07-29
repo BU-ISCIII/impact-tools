@@ -91,7 +91,10 @@ class CliConfigTests(unittest.TestCase):
 
             with patch(
                 "impact_tools.__main__.run_encryption",
-                return_value=SimpleNamespace(failed=0),
+                return_value=SimpleNamespace(
+                    failed=0,
+                    report_file=base / "report.html",
+                ),
             ) as run_encryption:
                 result = CliRunner().invoke(
                     cli,
@@ -108,6 +111,118 @@ class CliConfigTests(unittest.TestCase):
             encryption_config = run_encryption.call_args.args[0]
             self.assertEqual(encryption_config.input_dir, input_dir)
             self.assertEqual(encryption_config.recipient_pubkey, public_key)
+
+    def test_encrypt_passes_sample_list_to_encryption(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            input_dir = base / "raw"
+            input_dir.mkdir()
+            public_key = base / "service.key.pub"
+            public_key.write_text("test-key\n", encoding="utf-8")
+            sample_list = base / "samples.txt"
+            sample_list.write_text("S1\nS2\n", encoding="utf-8")
+
+            with patch(
+                "impact_tools.__main__.run_encryption",
+                return_value=SimpleNamespace(
+                    failed=0,
+                    report_file=base / "report.html",
+                ),
+            ) as run_encryption:
+                result = CliRunner().invoke(
+                    cli,
+                    [
+                        "ega",
+                        "encrypt",
+                        "--input-dir",
+                        str(input_dir),
+                        "--recipient-pubkey",
+                        str(public_key),
+                        "--sample-list",
+                        str(sample_list),
+                        "--dry-run",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            encryption_config = run_encryption.call_args.args[0]
+            self.assertEqual(encryption_config.sample_list, sample_list)
+
+    def test_encrypt_upload_passes_sample_list_to_encryption_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            input_dir = base / "raw"
+            input_dir.mkdir()
+            public_key = base / "service.key.pub"
+            public_key.write_text("test-key\n", encoding="utf-8")
+            sample_list = base / "samples.txt"
+            sample_list.write_text("S1\nS2\n", encoding="utf-8")
+
+            with patch(
+                "impact_tools.__main__.run_encrypt_upload",
+                return_value=SimpleNamespace(
+                    manifest_file=base / "manifest.json",
+                    report_file=base / "report.html",
+                    upload=SimpleNamespace(failed=0),
+                ),
+            ) as run_encrypt_upload:
+                result = CliRunner().invoke(
+                    cli,
+                    [
+                        "ega",
+                        "encrypt-upload",
+                        "--input-dir",
+                        str(input_dir),
+                        "--recipient-pubkey",
+                        str(public_key),
+                        "--sample-list",
+                        str(sample_list),
+                        "--host",
+                        "inbox.example.org",
+                        "--username",
+                        "user@example.org",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            workflow_config = run_encrypt_upload.call_args.args[0]
+            self.assertEqual(workflow_config.encryption.sample_list, sample_list)
+
+    def test_prepare_submission_passes_sample_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            input_dir = base / "delivery"
+            input_dir.mkdir()
+            sample_list = base / "samples.txt"
+            sample_list.write_text("S1\nS2\n", encoding="utf-8")
+
+            result_payload = SimpleNamespace(
+                evidence_file=base / "evidence.md",
+                evidence_json=base / "evidence.json",
+                draft_file=base / "draft.yaml",
+                missing_file=base / "missing.yaml",
+                inventory_file=base / "inventory.tsv",
+            )
+            with patch(
+                "impact_tools.__main__.prepare_submission",
+                return_value=result_payload,
+            ) as prepare:
+                result = CliRunner().invoke(
+                    cli,
+                    [
+                        "ega",
+                        "prepare-submission",
+                        "--input-dir",
+                        str(input_dir),
+                        "--output-dir",
+                        str(base / "prepared"),
+                        "--sample-list",
+                        str(sample_list),
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertEqual(prepare.call_args.args[0].sample_list, sample_list)
 
 
 if __name__ == "__main__":

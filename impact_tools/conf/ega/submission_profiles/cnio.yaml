@@ -27,15 +27,20 @@ defaults:
     library_source: GENOMIC
     library_selection: RANDOM
     library_construction_protocol:
+  analysis:
+    description: Variant calls generated from whole genome sequencing data.
+    analysis_type: SEQUENCE VARIATION
+    experiment_types:
+      - Whole genome sequencing
+    genome_id: 15
+    chromosomes:
+    platform:
   dataset:
     title:
     description:
     dataset_types:
       - Whole genome sequencing
     policy_accession_id:
-  finalise:
-    expected_release_date:
-    dataset_changelogs:
 
 extra_attributes:
   study:
@@ -99,6 +104,14 @@ examples:
     library_construction_protocol: "EXAMPLE: Library preparation protocol/kit name."
     sequencing_run_ids: "EXAMPLE: LH00248:106:23HTFCLT4; LH00248:107:23HTG5LT4"
     flowcell_id: "EXAMPLE: 23HTFCLT4; 23HTG5LT4"
+  analysis:
+    description: "EXAMPLE: Variant calls generated from the sample WGS data."
+    analysis_type: "EXAMPLE: value from /enums/analysis_types"
+    experiment_types:
+      - "EXAMPLE: value from /enums/experiment_types"
+    genome_id: "EXAMPLE: integer id from /enums/genomes"
+    chromosomes:
+      - [0, "EXAMPLE: chromosome accession from /enums/chromosomes"]
   run:
     run_center: "EXAMPLE: CNIO"
   dataset:
@@ -108,7 +121,3 @@ examples:
     cohortType: "EXAMPLE: study-defined"
     inclusionCriteria: "EXAMPLE: Inclusion criteria for this cohort/dataset."
     exclusionCriteria: "EXAMPLE: Exclusion criteria for this cohort/dataset."
-  finalise:
-    expected_release_date: "EXAMPLE: 2030-01-01"
-    dataset_changelogs:
-      - "EXAMPLE: Initial dataset release."

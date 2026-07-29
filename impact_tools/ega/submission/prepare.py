@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from impact_tools.config import user_submission_profile_path
+from impact_tools.ega.sample_files import discover_sample_files
 
 
 DIRECT = "directly_extracted"
@@ -32,6 +33,7 @@ class PrepareSubmissionConfig:
     output_dir: Path
     provider: str = "cnio"
     sample_id: str | None = None
+    sample_list: Path | None = None
     metadata_file: Path | None = None
     profile_file: Path | None = None
     include_examples: bool = False
@@ -86,17 +88,41 @@ def prepare_submission(config: PrepareSubmissionConfig) -> PrepareSubmissionResu
     output_dir = config.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    sample_id = config.sample_id or input_dir.name
-    files = _cnio_files(input_dir, sample_id)
     profile_defaults = _read_profile_defaults(provider, config.profile_file)
-    provider_metadata = _read_provider_metadata(config.metadata_file, sample_id)
-    evidence = _cnio_evidence(input_dir, sample_id, files, provider_metadata)
-    evidence = _merge_profile_default_evidence(evidence, profile_defaults)
-    if config.include_examples:
-        evidence = _merge_profile_example_evidence(evidence, profile_defaults)
-    draft = _draft_from_evidence(sample_id, evidence, profile_defaults)
-    missing = _missing_required_fields(evidence)
-    inventory = _file_inventory(input_dir)
+    if config.sample_list is not None:
+        if config.sample_id is not None:
+            raise ValueError("--sample-id and --sample-list are mutually exclusive")
+        prepared = _prepare_sample_batch(config, input_dir, output_dir, profile_defaults)
+        evidence_payload = [
+            {
+                "sample_id": sample_id,
+                "evidence": [item.as_dict() for item in evidence],
+            }
+            for sample_id, _, evidence, _ in prepared
+        ]
+        draft = _batch_draft(prepared)
+        missing = {
+            sample_id: _missing_required_fields(evidence)
+            for sample_id, _, evidence, _ in prepared
+        }
+        evidence_markdown = "\n\n".join(
+            _render_evidence_markdown(sample_dir, sample_id, evidence)
+            for sample_id, sample_dir, evidence, _ in prepared
+        )
+        inventory = _file_inventory_recursive(input_dir, output_dir)
+    else:
+        sample_id = config.sample_id or input_dir.name
+        sample_dir, evidence, draft = _prepare_one_sample(
+            input_dir,
+            sample_id,
+            config.metadata_file,
+            profile_defaults,
+            config.include_examples,
+        )
+        evidence_payload = [item.as_dict() for item in evidence]
+        missing = _missing_required_fields(evidence)
+        evidence_markdown = _render_evidence_markdown(sample_dir, sample_id, evidence)
+        inventory = _file_inventory(input_dir)
 
     evidence_json = output_dir / "evidence.json"
     evidence_file = output_dir / "evidence.md"
@@ -105,10 +131,10 @@ def prepare_submission(config: PrepareSubmissionConfig) -> PrepareSubmissionResu
     inventory_file = output_dir / "file_inventory.tsv"
 
     evidence_json.write_text(
-        json.dumps([item.as_dict() for item in evidence], indent=2, ensure_ascii=False),
+        json.dumps(evidence_payload, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    evidence_file.write_text(_render_evidence_markdown(input_dir, sample_id, evidence), encoding="utf-8")
+    evidence_file.write_text(evidence_markdown, encoding="utf-8")
     draft_file.write_text(_render_yaml(draft), encoding="utf-8")
     missing_file.write_text(_render_yaml(missing), encoding="utf-8")
     inventory_file.write_text(_render_inventory(inventory), encoding="utf-8")
@@ -123,10 +149,107 @@ def prepare_submission(config: PrepareSubmissionConfig) -> PrepareSubmissionResu
     )
 
 
+def _prepare_sample_batch(
+    config: PrepareSubmissionConfig,
+    input_dir: Path,
+    output_dir: Path,
+    profile_defaults: dict[str, Any],
+) -> list[tuple[str, Path, list[Evidence], dict[str, Any]]]:
+    selected = discover_sample_files(
+        input_dir=input_dir,
+        output_dir=output_dir,
+        sample_list=config.sample_list,
+    )
+    by_sample: dict[str, dict[str, Path]] = {}
+    for item in selected:
+        by_sample.setdefault(item.sample_id, {})[item.role] = item.path
+
+    prepared = []
+    for sample_id, selected_files in by_sample.items():
+        sample_dir = selected_files["cram"].parent
+        prepared_sample_dir, evidence, draft = _prepare_one_sample(
+            sample_dir,
+            sample_id,
+            config.metadata_file,
+            profile_defaults,
+            config.include_examples,
+            selected_files=selected_files,
+        )
+        # The sample-list workflow intentionally encrypts and uploads the CRAM
+        # and VCF only. Keep an optional CRAI in single-sample legacy drafts,
+        # but do not create an Inbox dependency that the batch did not upload.
+        draft["run"]["files"] = draft["run"]["files"][:1]
+        draft["run"]["extra_attributes"] = [
+            item
+            for item in (draft["run"].get("extra_attributes") or [])
+            if item.get("tag") not in {"index_file_name", "unencrypted_crai_md5"}
+        ] or None
+        for section in ("run", "analysis"):
+            for file_item in draft[section].get("files") or []:
+                name = file_item.get("name")
+                if name and Path(str(name)).parent == Path("."):
+                    file_item["name"] = f"{sample_id}/{name}"
+        prepared.append((sample_id, prepared_sample_dir, evidence, draft))
+    return prepared
+
+
+def _prepare_one_sample(
+    input_dir: Path,
+    sample_id: str,
+    metadata_file: Path | None,
+    profile_defaults: dict[str, Any],
+    include_examples: bool,
+    *,
+    selected_files: dict[str, Path] | None = None,
+) -> tuple[Path, list[Evidence], dict[str, Any]]:
+    files = _cnio_files(input_dir, sample_id)
+    if selected_files:
+        files.update(selected_files)
+        cram = files["cram"]
+        files["crai"] = _find_cram_index(cram)
+    else:
+        files["vcf"] = _find_vcf(input_dir, sample_id)
+    provider_metadata = _read_provider_metadata(metadata_file, sample_id)
+    evidence = _cnio_evidence(input_dir, sample_id, files, provider_metadata)
+    evidence = _merge_profile_default_evidence(evidence, profile_defaults)
+    if include_examples:
+        evidence = _merge_profile_example_evidence(evidence, profile_defaults)
+    draft = _draft_from_evidence(
+        sample_id,
+        evidence,
+        profile_defaults,
+        vcf_file=files.get("vcf"),
+    )
+    return input_dir, evidence, draft
+
+
+def _find_cram_index(cram: Path) -> Path:
+    candidates = [
+        Path(f"{cram}.crai"),
+        cram.with_suffix(".crai"),
+    ]
+    return next((path for path in candidates if path.is_file()), candidates[0])
+
+
+def _find_vcf(input_dir: Path, sample_id: str) -> Path:
+    candidates = [
+        input_dir / f"{sample_id}.vcf.gz",
+        input_dir / f"{sample_id}.vcf",
+    ]
+    existing = [path for path in candidates if path.is_file()]
+    if len(existing) > 1:
+        raise ValueError(
+            f"Sample {sample_id!r}: multiple VCF files found: "
+            + ", ".join(str(path) for path in existing)
+        )
+    return existing[0] if existing else candidates[0]
+
+
 def _cnio_files(input_dir: Path, sample_id: str) -> dict[str, Path]:
     names = {
         "cram": f"{sample_id}.cram",
         "crai": f"{sample_id}.cram.crai",
+        "vcf": f"{sample_id}.vcf.gz",
         "cram_header": f"{sample_id}.cram.header.sam",
         "cram_md5": f"{sample_id}.cram.md5sum",
         "checksum_md5": "checksum.md5",
@@ -182,6 +305,7 @@ def _cnio_evidence(
     evidence.append(_paired_nominal_length(mapping_rows, insert_rows, files["mapping_metrics"], files["insert_stats"]))
     evidence.append(_paired_nominal_sdev(mapping_rows, insert_rows, files["mapping_metrics"], files["insert_stats"]))
     evidence.extend(_run_files(files, checksums))
+    evidence.append(_analysis_file_evidence(files.get("vcf")))
     evidence.append(_reference(metrics, targeted, pg, files["metrics_json"], files["targeted_json"], files["cram_header"]))
     evidence.extend(_pipeline(metrics, replay, pg, files["metrics_json"], files["replay_json"], files["cram_header"]))
     evidence.append(_sequencing_run_ids(provider_metadata, rg, files["cram_header"], input_dir))
@@ -210,6 +334,12 @@ def _provider_metadata_evidence(metadata: dict[str, Any]) -> list[Evidence]:
         "SampleRequest.description": ("sample_description",),
         "SampleRequest.organism_part": ("organism_part",),
         "ExperimentRequest.design_description": ("design_description",),
+        "AnalysisRequest.description": ("analysis_description",),
+        "AnalysisRequest.analysis_type": ("analysis_type",),
+        "AnalysisRequest.experiment_types": ("analysis_experiment_types", "experiment_types"),
+        "AnalysisRequest.genome_id": ("analysis_genome_id", "genome_id"),
+        "AnalysisRequest.chromosomes": ("analysis_chromosomes", "chromosomes"),
+        "AnalysisRequest.platform": ("analysis_platform",),
         "DatasetRequest.title": ("dataset_title",),
         "DatasetRequest.description": ("dataset_description",),
         "DatasetRequest.dataset_types": ("dataset_types",),
@@ -341,9 +471,17 @@ def _submission_profile_field_map() -> dict[tuple[str, str], str]:
         ("sample", "phenotype"): "SampleRequest.phenotype",
         ("experiment", "design_description"): "ExperimentRequest.design_description",
         ("experiment", "instrument_model_id"): "ExperimentRequest.instrument_model_id",
+        ("experiment", "library_layout"): "ExperimentRequest.library_layout",
+        ("experiment", "library_strategy"): "ExperimentRequest.library_strategy",
         ("experiment", "library_source"): "ExperimentRequest.library_source",
         ("experiment", "library_selection"): "ExperimentRequest.library_selection",
         ("experiment", "library_construction_protocol"): "ExperimentRequest.library_construction_protocol",
+        ("analysis", "description"): "AnalysisRequest.description",
+        ("analysis", "analysis_type"): "AnalysisRequest.analysis_type",
+        ("analysis", "experiment_types"): "AnalysisRequest.experiment_types",
+        ("analysis", "genome_id"): "AnalysisRequest.genome_id",
+        ("analysis", "chromosomes"): "AnalysisRequest.chromosomes",
+        ("analysis", "platform"): "AnalysisRequest.platform",
         ("submission", "title"): "SubmissionRequest.title",
         ("submission", "description"): "SubmissionRequest.description",
         ("submission", "collaborators"): "SubmissionRequest.collaborators",
@@ -360,8 +498,6 @@ def _submission_profile_field_map() -> dict[tuple[str, str], str]:
         ("dataset", "description"): "DatasetRequest.description",
         ("dataset", "dataset_types"): "DatasetRequest.dataset_types",
         ("dataset", "policy_accession_id"): "DatasetRequest.policy_accession_id",
-        ("finalise", "expected_release_date"): "SubmissionFinaliseRequest.expected_release_date",
-        ("finalise", "dataset_changelogs"): "SubmissionFinaliseRequest.dataset_changelogs",
     }
 
 
@@ -608,6 +744,18 @@ def _run_files(files: dict[str, Path], checksums: dict[str, str]) -> list[Eviden
         status = DIRECT if path.exists() or value["md5"] else NOT_FOUND
         items.append(Evidence(field, value, status, "high", path.name if path.exists() else "checksum.md5", "file inventory/checksum"))
     return items
+
+
+def _analysis_file_evidence(path: Path | None) -> Evidence:
+    value = _analysis_file(path) if path is not None else None
+    return Evidence(
+        "AnalysisRequest.files",
+        value,
+        DIRECT if path is not None and path.is_file() else NOT_FOUND,
+        "high",
+        path.name if path is not None else "file inventory",
+        "VCF selected for sample",
+    )
 
 
 def _reference(metrics: dict[str, Any], targeted: dict[str, Any], pg: list[dict[str, str]], metrics_file: Path, targeted_file: Path, header: Path) -> Evidence:
@@ -1038,6 +1186,24 @@ def _file_inventory(input_dir: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _file_inventory_recursive(input_dir: Path, output_dir: Path) -> list[dict[str, Any]]:
+    rows = []
+    for path in sorted(input_dir.rglob("*")):
+        if not path.is_file() or (
+            path.absolute().is_relative_to(output_dir.absolute())
+            or path.resolve(strict=False).is_relative_to(output_dir.resolve(strict=False))
+        ):
+            continue
+        rows.append(
+            {
+                "name": str(path.relative_to(input_dir)),
+                "size_bytes": path.stat().st_size,
+                "md5": _md5(path) if path.stat().st_size < 100_000_000 else None,
+            }
+        )
+    return rows
+
+
 def _md5(path: Path) -> str:
     digest = hashlib.md5()  # noqa: S324 - file inventory compatibility with FEGA metadata.
     with path.open("rb") as handle:
@@ -1046,7 +1212,13 @@ def _md5(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _draft_from_evidence(sample_id: str, evidence: list[Evidence], profile_defaults: dict[str, Any]) -> dict[str, Any]:
+def _draft_from_evidence(
+    sample_id: str,
+    evidence: list[Evidence],
+    profile_defaults: dict[str, Any],
+    *,
+    vcf_file: Path | None = None,
+) -> dict[str, Any]:
     values = {item.field: item for item in evidence}
 
     def submission_value(field: str) -> Any:
@@ -1113,6 +1285,23 @@ def _draft_from_evidence(sample_id: str, evidence: list[Evidence], profile_defau
             ],
             "extra_attributes": _extra_attributes("RunRequest", evidence),
         },
+        "analysis": {
+            "title": f"{sample_id} variant analysis",
+            "description": submission_value("AnalysisRequest.description"),
+            "analysis_type": submission_value("AnalysisRequest.analysis_type"),
+            "experiment_types": submission_value("AnalysisRequest.experiment_types"),
+            "genome_id": submission_value("AnalysisRequest.genome_id"),
+            "chromosomes": submission_value("AnalysisRequest.chromosomes"),
+            "platform": submission_value("AnalysisRequest.platform"),
+            "study_accession_id": submission_value("AnalysisRequest.study_accession_id"),
+            "study_provisional_id": submission_value("AnalysisRequest.study_provisional_id"),
+            "experiment_accession_ids": submission_value("AnalysisRequest.experiment_accession_ids"),
+            "experiment_provisional_ids": submission_value("AnalysisRequest.experiment_provisional_ids"),
+            "sample_accession_ids": submission_value("AnalysisRequest.sample_accession_ids"),
+            "sample_provisional_ids": submission_value("AnalysisRequest.sample_provisional_ids"),
+            "files": [_analysis_file(vcf_file)] if vcf_file is not None else [],
+            "extra_attributes": _extra_attributes("AnalysisRequest", evidence),
+        },
         "dataset": {
             "title": submission_value("DatasetRequest.title"),
             "description": submission_value("DatasetRequest.description"),
@@ -1124,12 +1313,53 @@ def _draft_from_evidence(sample_id: str, evidence: list[Evidence], profile_defau
             "analysis_provisional_ids": submission_value("DatasetRequest.analysis_provisional_ids"),
             "extra_attributes": _extra_attributes("DatasetRequest", evidence),
         },
-        "finalise": {
-            "expected_release_date": submission_value("SubmissionFinaliseRequest.expected_release_date"),
-            "dataset_changelogs": submission_value("SubmissionFinaliseRequest.dataset_changelogs"),
-        },
     }
     return _apply_profile_defaults(draft, profile_defaults)
+
+
+def _analysis_file(path: Path) -> dict[str, Any]:
+    return {
+        "name": path.name,
+        "extension": ".vcf.gz" if path.name.endswith(".vcf.gz") else path.suffix,
+        "exists": path.is_file(),
+        "size_bytes": path.stat().st_size if path.is_file() else None,
+    }
+
+
+def _batch_draft(
+    prepared: list[tuple[str, Path, list[Evidence], dict[str, Any]]],
+) -> dict[str, Any]:
+    if not prepared:
+        raise ValueError("Cannot prepare an empty submission batch")
+
+    first = prepared[0][3]
+    batch = {
+        "submission": first["submission"],
+        "study": first["study"],
+        "samples": [],
+        "experiments": [],
+        "runs": [],
+        "analyses": [],
+        "dataset": first["dataset"],
+    }
+    for sample_id, _, _, draft in prepared:
+        for section in ("submission", "study", "dataset"):
+            if draft[section] != first[section]:
+                raise ValueError(
+                    f"Sample {sample_id!r} defines a different shared "
+                    f"{section!r} payload; all samples in one batch must use "
+                    "the same Submission, Study and Dataset metadata"
+                )
+        for plural, singular in (
+            ("samples", "sample"),
+            ("experiments", "experiment"),
+            ("runs", "run"),
+            ("analyses", "analysis"),
+        ):
+            payload = dict(draft[singular])
+            payload["_key"] = sample_id
+            batch[plural].append(payload)
+    return batch
 
 
 def _extra_attributes(prefix: str, evidence: list[Evidence]) -> list[dict[str, str]]:
@@ -1176,19 +1406,28 @@ def _missing_required_fields(evidence: list[Evidence]) -> dict[str, Any]:
         "ExperimentRequest.library_strategy": "CNIO_FILE / SEQ validation",
         "ExperimentRequest.library_source": "SEQ / CONFIG",
         "ExperimentRequest.library_selection": "SEQ / CONFIG",
-        "ExperimentRequest.study_provisional_id": "TMP-API",
         "RunRequest.files": "CNIO_FILE",
         "RunRequest.run_file_type": "CNIO_FILE",
+        "AnalysisRequest.description": "ANALYSIS / CONFIG",
+        "AnalysisRequest.analysis_type": "ANALYSIS / CONFIG",
+        "AnalysisRequest.experiment_types": "ANALYSIS / CONFIG",
+        "AnalysisRequest.genome_id": "REFERENCE / CONFIG",
+        "AnalysisRequest.chromosomes": "REFERENCE / CONFIG",
+        "AnalysisRequest.files": "CNIO_FILE",
         "DatasetRequest.title": "COHORT / CONFIG",
         "DatasetRequest.description": "COHORT",
         "DatasetRequest.dataset_types": "SEQ / CONFIG",
         "DatasetRequest.policy_accession_id": "COHORT / DAC",
-        "SubmissionFinaliseRequest.expected_release_date": "COHORT / CONFIG",
     }
     practical_links = {
+        "ExperimentRequest.study_provisional_id": "TMP-API",
         "RunRequest.experiment_provisional_id": "TMP-API",
         "RunRequest.sample_provisional_id": "TMP-API",
+        "AnalysisRequest.study_provisional_id": "TMP-API",
+        "AnalysisRequest.experiment_provisional_ids": "TMP-API",
+        "AnalysisRequest.sample_provisional_ids": "TMP-API",
         "DatasetRequest.run_provisional_ids": "TMP-API",
+        "DatasetRequest.analysis_provisional_ids": "TMP-API",
     }
     by_field = {item.field: item for item in evidence}
     missing_by_source: dict[str, dict[str, Any]] = {}
@@ -1239,8 +1478,7 @@ def _has_value(value: Any) -> bool:
 def _field_is_satisfied(field: str, by_field: dict[str, Evidence]) -> bool:
     if field == "RunRequest.files":
         primary = by_field.get("Run.files.primary")
-        index = by_field.get("Run.files.index")
-        return bool(primary and primary.status == DIRECT and primary.value and index and index.status == DIRECT and index.value)
+        return bool(primary and primary.status == DIRECT and primary.value)
     if field == "RunRequest.run_file_type":
         return True
     item = by_field.get(field)
@@ -1293,15 +1531,25 @@ def _render_yaml(value: Any, indent: int = 0) -> str:
     if isinstance(value, dict):
         for key, item in value.items():
             if isinstance(item, (dict, list)):
-                lines.append(f"{prefix}{key}:")
-                lines.append(_render_yaml(item, indent + 2).rstrip())
+                if not item:
+                    lines.append(
+                        f"{prefix}{key}: {'{}' if isinstance(item, dict) else '[]'}"
+                    )
+                else:
+                    lines.append(f"{prefix}{key}:")
+                    lines.append(_render_yaml(item, indent + 2).rstrip())
             else:
                 lines.append(f"{prefix}{key}: {_yaml_scalar(item)}")
     elif isinstance(value, list):
         for item in value:
             if isinstance(item, (dict, list)):
-                lines.append(f"{prefix}-")
-                lines.append(_render_yaml(item, indent + 2).rstrip())
+                if not item:
+                    lines.append(
+                        f"{prefix}- {'{}' if isinstance(item, dict) else '[]'}"
+                    )
+                else:
+                    lines.append(f"{prefix}-")
+                    lines.append(_render_yaml(item, indent + 2).rstrip())
             else:
                 lines.append(f"{prefix}- {_yaml_scalar(item)}")
     else:

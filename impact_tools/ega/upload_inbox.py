@@ -348,7 +348,10 @@ def _open_sftp(config: InboxUploadConfig):
         "username": config.username,
         "timeout": config.connect_timeout,
         "look_for_keys": config.identity_file is None and password is None,
-        "allow_agent": config.identity_file is None,
+        # Supplying a password is an explicit authentication choice. Trying
+        # every key from ssh-agent first can exhaust MaxAuthTries before PAM's
+        # keyboard-interactive challenge is reached.
+        "allow_agent": config.identity_file is None and password is None,
     }
     if config.identity_file is not None:
         kwargs["key_filename"] = str(config.identity_file.expanduser().resolve())
@@ -377,27 +380,57 @@ def _keyboard_interactive_client(paramiko, config: InboxUploadConfig, password: 
 
     sock = socket.create_connection((config.host, config.port), timeout=config.connect_timeout)
     transport = paramiko.Transport(sock)
-    transport.start_client(timeout=config.connect_timeout)
+    try:
+        transport.start_client(timeout=config.connect_timeout)
 
-    if config.host_key_policy == "reject":
-        host_key = transport.get_remote_server_key()
-        host_keys = client.get_host_keys()
-        expected = host_keys.lookup(config.host)
-        if expected is None or host_key.get_name() not in expected:
-            raise paramiko.ssh_exception.SSHException(
-                f"Server host key for {config.host} is not known"
+        if config.host_key_policy == "reject":
+            host_key = transport.get_remote_server_key()
+            host_key_name = (
+                config.host
+                if config.port == 22
+                else f"[{config.host}]:{config.port}"
             )
+            expected_key = _lookup_host_key(
+                client,
+                host_key_name,
+                host_key.get_name(),
+            )
+            if expected_key is None:
+                raise paramiko.ssh_exception.SSHException(
+                    f"Server host key for {host_key_name} is not known"
+                )
+            if expected_key != host_key:
+                raise paramiko.ssh_exception.SSHException(
+                    f"Server host key for {host_key_name} does not match"
+                )
 
-    def handler(_title, _instructions, prompts):
-        return [password for _prompt, _echo in prompts]
+        def handler(_title, _instructions, prompts):
+            return [password for _prompt, _echo in prompts]
 
-    transport.auth_interactive(config.username, handler)
-    if not transport.is_authenticated():
-        raise paramiko.ssh_exception.AuthenticationException(
-            f"Could not authenticate {config.username}@{config.host}"
-        )
+        transport.auth_interactive(config.username, handler)
+        if not transport.is_authenticated():
+            raise paramiko.ssh_exception.AuthenticationException(
+                f"Could not authenticate {config.username}@{config.host}"
+            )
+    except BaseException:
+        transport.close()
+        raise
     client._transport = transport  # noqa: SLF001 - Paramiko exposes no public setter.
     return client
+
+
+def _lookup_host_key(client, hostname: str, key_type: str):
+    """Return a matching key from Paramiko's user and system key stores."""
+    for host_keys in (
+        client.get_host_keys(),
+        getattr(client, "_system_host_keys", None),
+    ):
+        if host_keys is None:
+            continue
+        expected = host_keys.lookup(hostname)
+        if expected is not None and key_type in expected:
+            return expected[key_type]
+    return None
 
 
 class _ManagedSFTPClient:
