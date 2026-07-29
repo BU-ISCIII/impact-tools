@@ -578,6 +578,52 @@ the encrypted directory are not included accidentally. Registered encrypted
 outputs can be reused without copying their payload and still retain the sample
 layout selected for the Inbox upload.
 
+To process a known set of samples, pass a text file containing one sample
+identifier per line. For every identifier, the workflow discovers exactly one
+CRAM and one VCF, validates the complete batch before encryption, and uploads
+only the resulting encrypted files:
+
+```text
+# samples.txt
+ND1911
+ND1912
+ND1913
+```
+
+```bash
+impact-tools ega encrypt-upload \
+  --sample-list samples.txt \
+  --input-dir /impact_data/provider_delivery \
+  --encrypted-dir /impact_data/encrypted_c4gh \
+  --output-dir /impact_data/reports \
+  --recipient-pubkey /secure/localega/service.key.pub \
+  --host dcontainers00 \
+  --username user@example.org \
+  --ask-password
+```
+
+The preferred input layout is one directory per sample:
+
+```text
+provider_delivery/
+├── ND1911/
+│   ├── ND1911.cram
+│   └── ND1911.vcf.gz
+└── ND1912/
+    ├── ND1912.cram
+    └── ND1912.vcf.gz
+```
+
+Nested directories named after the sample are supported. A flat directory is
+also supported when files are named exactly `<sample>.cram` and
+`<sample>.vcf.gz` (or `<sample>.vcf`). The command stops before encrypting
+anything if a requested sample is missing either file, has multiple CRAM/VCF
+candidates, contains an empty selected file, or appears more than once in the
+sample list. `--sample-list` is therefore a batch validation mechanism, not a
+new workflow profile. With `--remote-layout flat`, encrypted basenames must
+also be unique across samples; otherwise the workflow stops and recommends
+`--remote-layout relative` to prevent Inbox overwrites.
+
 ```bash
 impact-tools ega encrypt-upload \
   --run-profile ws \
@@ -692,6 +738,20 @@ are ignored. Relative paths are resolved from `--input-dir`.
 ND1772/ND1772_S19_R1_001.fastq.gz
 /impact_data/raw_data/lega/ND1772/ND1772_S19_R2_001.fastq.gz
 ```
+
+Select CRAM and VCF inputs from sample identifiers instead of listing every
+file explicitly:
+
+```bash
+impact-tools ega encrypt \
+  --input-dir /path/to/provider_delivery \
+  --sample-list samples.txt \
+  --recipient-pubkey /path/to/service.key.pub
+```
+
+`--sample-list` is mutually exclusive with `--input-list` and `--sample-id`.
+The normal `--pattern` behaviour remains unchanged when no sample list is
+provided.
 
 By default, encrypted files are written to:
 
@@ -913,6 +973,51 @@ Per-file statuses distinguish `ok`, `skipped_registered`,
 `skipped_in_progress`, `skipped_duplicate_batch`, `skipped_existing` and
 `failed`.
 
+### Prepare CRAM and VCF metadata for the Submitter Portal
+
+The same sample list used by `encrypt-upload` can prepare one metadata
+submission for the whole cohort:
+
+```bash
+impact-tools ega prepare-submission \
+  --input-dir /impact_data/provider_delivery \
+  --sample-list samples.txt \
+  --metadata-file cohort.tsv \
+  --profile-file go_impact_cnio.yaml \
+  --output-dir /impact_data/submission_draft
+```
+
+This produces one Submission and Study, one Sample, Experiment, CRAM Run and
+VCF Analysis per requested sample, and exactly one Dataset containing all Runs
+and Analyses. The complete sample list is validated before writing the draft.
+The existing single-sample `--sample-id` workflow remains available; the two
+selection options are mutually exclusive.
+
+Analysis enum values are deployment data, not inferred from filenames. Set
+`defaults.analysis.analysis_type`, `experiment_types`, `genome_id` and
+`chromosomes` in the existing submission profile using values returned by the
+target Submitter Portal API. Each chromosome is an `[id, label]` pair from
+`/enums/chromosomes` (for example, `[<id>, "CM000663.2"]` for chromosome 1 in
+GRCh38). No separate VCF profile is required.
+
+Review the generated draft, then create a dry-run API plan:
+
+```bash
+impact-tools ega submit-submission \
+  --draft-file /impact_data/submission_draft/draft_submission.yaml \
+  --output-dir /impact_data/submission_plan
+```
+
+`submit-submission` deliberately stops after creating the Dataset. Dataset
+finalisation and release-date confirmation are always performed manually in
+the Submitter Portal.
+
+During execution, Inbox files are resolved using their encrypted `.c4gh`
+names. VCF provisional IDs are sent to `/analyses`, CRAM provisional IDs to
+`/runs`, and both entity groups are linked to the shared Dataset. State is
+stored per sample so an interrupted batch can be resumed safely with
+`--resume-state-file`.
+
 ## Operational Notes
 
 ### Crypt4GH
@@ -948,6 +1053,7 @@ python3 -m py_compile \
   impact_tools/beacon/ritools.py \
   impact_tools/beacon/html_report.py \
   impact_tools/ega/encrypt.py \
+  impact_tools/ega/sample_files.py \
   impact_tools/ega/slurm.py \
   impact_tools/ega/upload_inbox.py
 ```

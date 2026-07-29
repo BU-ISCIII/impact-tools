@@ -15,6 +15,9 @@ where possible.
 
 ### Added
 
+- Added sample-list CRAM/VCF discovery, encryption and Inbox upload, plus
+  per-sample VCF Analysis creation and one shared Dataset in Submitter Portal
+  submissions, with resumable execution and manual Dataset finalisation.
 - Added SLURM encryption execution support to generate chunk files, task
   manifests, reusable `sbatch` array scripts and optional job submission for
   large Affiliated EGA encryption batches.
