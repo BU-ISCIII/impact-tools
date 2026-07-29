@@ -15,12 +15,9 @@ where possible.
 
 ### Added
 
-- Added sample-list CRAM/VCF discovery, encryption and Inbox upload, plus
-  per-sample VCF Analysis creation and one shared Dataset in Submitter Portal
-  submissions, with resumable execution and manual Dataset finalisation.
-- Added SLURM encryption execution support to generate chunk files, task
-  manifests, reusable `sbatch` array scripts and optional job submission for
-  large Affiliated EGA encryption batches.
+- Added sample-list CRAM/VCF discovery, encryption and Inbox upload, plus per-sample VCF Analysis creation and one shared Dataset in Submitter Portal   submissions, with resumable execution and manual Dataset finalisation. [#20](https://github.com/BU-ISCIII/impact-tools/pull/20)
+- Added SLURM encryption execution support to generate chunk files, task manifests, reusable `sbatch` array scripts and optional job submission for
+  large Affiliated EGA encryption batches. [#20](https://github.com/BU-ISCIII/impact-tools/pull/20)
 - Added automatic SLURM array aggregation with one logical HTML, TSV and JSON report for the complete encryption run, while retaining per-task artifacts. [#15](https://github.com/BU-ISCIII/impact-tools/pull/8)
 - Added persistent user configuration through `~/.impact_tools/extra_config.json`
   for logs, EGA encryption, Inbox uploads and SLURM defaults.
