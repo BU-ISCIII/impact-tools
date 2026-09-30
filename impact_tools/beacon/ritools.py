@@ -171,6 +171,13 @@ def run_genomic_variations_vcf(
             f"STDERR: {completed.stderr}"
         )
 
+    if "being processed without AF reads" in completed.stdout:
+        raise RuntimeError(
+            "RI-tools could not load populations.json and would ingest "
+            "variants without allele frequencies.\n"
+            f"Input VCF: {input_vcf}"
+        )
+
     inserted_match = re.search(
         r"Successfully inserted\s+(\d+)\s+records into beacon",
         completed.stdout,

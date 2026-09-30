@@ -957,6 +957,34 @@ def check_variant_counts(
     )
 
 
+def check_ritools_result(
+    result: ritools.GenomicVariationsResult,
+    *,
+    vcf_count: int,
+) -> None:
+    """Refuse RI-tools runs that would leave the dataset empty or truncated.
+
+    RI-tools exits 0 even when every variant is skipped (e.g. no INFO/AF)
+    or when it stops at its numRows limit, so these must be checked here
+    before the staging data is swapped into the active dataset.
+    """
+    if result.processed != vcf_count:
+        raise RuntimeError(
+            "RI-tools did not process every VCF record.\n"
+            f"Input VCF:   {result.input_vcf}\n"
+            f"VCF records: {vcf_count}\n"
+            f"Processed:   {result.processed}"
+        )
+
+    if result.inserted == 0:
+        raise RuntimeError(
+            "RI-tools inserted 0 variants; refusing to continue.\n"
+            f"Input VCF: {result.input_vcf}\n"
+            f"Processed: {result.processed}\n"
+            f"Skipped:   {result.skipped}"
+        )
+
+
 def list_old_variant_backups(
     database,
     dataset_id: str,
@@ -1364,6 +1392,11 @@ def apply_variants_to_remote(
             dataset_id=staging_id,
             input_vcf=local_vcf,
             reference_genome=config.reference_genome,
+        )
+
+        check_ritools_result(
+            ritools_result,
+            vcf_count=vcf_counts[local_vcf],
         )
 
         ritools_results.append(ritools_result)
