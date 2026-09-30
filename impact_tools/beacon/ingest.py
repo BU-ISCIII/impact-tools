@@ -76,7 +76,7 @@ class DatasetIngestConfig:
     is_synthetic: bool = False
     base_dir: Path = Path(".")
     granularity: str = "record"
-    permissions_level: str = "public"
+    permissions_level: str | None = None
     permissions_email: str | None = None
     duo_codes: tuple[str, ...] = ()
     output_dir: Path | None = None
@@ -455,6 +455,7 @@ def apply_dataset_to_remote(
     from impact_tools.beacon.mongo import (
         managed_mongo,
         mongo_count_dataset,
+        mongo_get_dataset_permissions,
         mongo_import_datasets,
         mongo_set_dataset_flags,
         mongo_set_dataset_permissions,
@@ -485,23 +486,37 @@ def apply_dataset_to_remote(
             is_synthetic=config.is_synthetic,
         )
 
-        user_list = None
-
-        if config.permissions_level == "controlled" and config.permissions_email:
-            user_list = [
-                {
-                    "user_e-mail": config.permissions_email,
-                    "default_entry_types_granularity": config.granularity,
-                }
-            ]
-
-        perms_status = mongo_set_dataset_permissions(
+        permissions_level = config.permissions_level
+        existing_permissions = mongo_get_dataset_permissions(
             database,
             config.dataset_id,
-            level=config.permissions_level,
-            granularity=config.granularity,
-            user_list=user_list,
         )
+
+        if permissions_level is None and existing_permissions is not None:
+            # Never overwrite permissions managed elsewhere (e.g. admin-ui)
+            # unless --set-permissions is given explicitly.
+            perms_status = "kept"
+        else:
+            if permissions_level is None:
+                permissions_level = "public"
+
+            user_list = None
+
+            if permissions_level == "controlled" and config.permissions_email:
+                user_list = [
+                    {
+                        "user_e-mail": config.permissions_email,
+                        "default_entry_types_granularity": config.granularity,
+                    }
+                ]
+
+            perms_status = mongo_set_dataset_permissions(
+                database,
+                config.dataset_id,
+                level=permissions_level,
+                granularity=config.granularity,
+                user_list=user_list,
+            )
         LOGGER.info(
             "Dataset '%s': flags %s, permissions %s",
             config.dataset_id,

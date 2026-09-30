@@ -1918,7 +1918,10 @@ def beacon_ingest_group(
     "permissions_level",
     type=click.Choice(["public", "registered", "controlled"]),
     default=None,
-    help="Initial dataset permissions level.",
+    help=(
+        "Dataset permissions level. New datasets default to public; "
+        "existing permissions are kept unless this option is given."
+    ),
 )
 @click.option(
     "--set-email",
@@ -2028,8 +2031,10 @@ def ingest_dataset_cmd(
             show_default=True,
         )
 
-    if permissions_level is None:
-        permissions_level = "public"
+    if permissions_email is not None and permissions_level != "controlled":
+        raise click.UsageError(
+            "--set-email is only valid with --set-permissions controlled."
+        )
 
     if permissions_level == "controlled" and permissions_email is None:
         if click.get_text_stream("stdin").isatty():
