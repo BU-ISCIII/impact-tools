@@ -526,6 +526,10 @@ validation therefore use the accumulated RI-tools inserted count.
 
 ## Affiliated EGA Workstream
 
+For the operator-facing, step-by-step CRAM/VCF workflow, see the
+[EGA guides](docs/ega/README.md). They cover encryption, Inbox upload,
+submission planning and execution, and the manual finalisation boundary.
+
 The Affiliated EGA tooling covers the operational steps needed before data can
 be managed through the LocalEGA / Federated EGA Affiliate workflow.
 
