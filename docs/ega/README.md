@@ -1,50 +1,48 @@
-# EGA: de los ficheros a la submission
+# EGA: from input files to submission
 
-Estas guías explican el recorrido de un lote CRAM + VCF desde la estación de
-trabajo o el HPC hasta el Submitter Portal. No son un manual de instalación de
-LocalEGA.
+These guides take a CRAM + VCF batch from a workstation or HPC environment to
+the Submitter Portal. They are not LocalEGA deployment instructions.
 
-Antes de empezar, instala el entorno según el [Quick Start](../../README.md#quick-start)
-y comprueba `impact-tools ega --help` y `crypt4gh --help` **en ese mismo
-entorno**. El envío a la API necesita también `httpx`, incluido entre las
-dependencias del paquete; invocar otro Python puede dejarlo sin instalar.
+First, install the environment as described in the [Quick Start](../../README.md#quick-start).
+Run `impact-tools ega --help` and `crypt4gh --help` **in that same environment**.
+API submission also requires `httpx`, which is a package dependency; a
+different Python environment may not have it installed.
 
-1. [Cifrado y subida al Inbox](encryption-and-upload.md): selección de muestras,
-   clave pública, transferencia y evidencias.
-2. [Submission al Submitter Portal](submitter-portal.md): perfil de metadatos,
-   borrador, revisión, plan, envío y reanudación.
+1. [Encryption and Inbox upload](encryption-and-upload.md): sample selection,
+   recipient public key, transfer, and per-file evidence.
+2. [Submitter Portal submission](submitter-portal.md): metadata profile, draft,
+   review, plan, execution, and resumption.
 
 ```mermaid
 flowchart LR
-    A["CRAM + VCF y lista de muestras"] --> B["encrypt-upload"]
-    B --> C["Inbox: ficheros .c4gh"]
+    A["CRAM + VCF and sample list"] --> B["encrypt-upload"]
+    B --> C["Inbox: .c4gh files"]
     A --> D["prepare-submission"]
-    M["Metadatos y perfil revisados"] --> D
-    D --> E["Borrador de submission"]
-    C --> F["Comprobar ficheros en la API"]
-    E --> G["Revisar plan"]
+    M["Reviewed metadata and profile"] --> D
+    D --> E["Submission draft"]
+    C --> F["Verify files through the API"]
+    E --> G["Review submission plan"]
     F --> H["submit-submission --execute"]
     G --> H
-    H --> I["Dataset abierto"]
-    I -.-> J["Finalización manual en el portal"]
-    J --> K["Ingestión y distribución"]
+    H --> I["Open Dataset"]
+    I -.-> J["Manual finalisation in the portal"]
+    J --> K["Ingestion and distribution"]
 ```
 
-**Límite de la herramienta:** `submit-submission` crea los metadatos y deja el
-Dataset abierto. No finaliza la submission, no libera el Dataset, no concede
-permisos de descarga ni verifica por sí solo la ingestión en el Vault.
+**Tool boundary:** `submit-submission` creates metadata objects and leaves the
+Dataset open. It does not finalise the submission, release the Dataset, grant
+download permissions, or verify ingestion into the Vault.
 
-Los nombres `SAMPLE_001`, las rutas `/data/...`, el usuario y los endpoints de
-las guías son ilustrativos. Sustitúyelos por valores aprobados para tu entorno;
-nunca copies credenciales, tokens, claves privadas o metadatos sensibles al
-repositorio.
+Names such as `SAMPLE_001`, `/data/...` paths, usernames, and endpoints in
+these guides are illustrative. Replace them with approved values for your
+environment. Never commit credentials, tokens, private keys, or sensitive
+metadata to this repository.
 
-| Situación | Herramientas |
+| Use case | Tools |
 | --- | --- |
-| Lote CRAM + VCF | `encrypt-upload` → `prepare-submission` → `submit-submission` |
-| Cifrado y subida por separado | `encrypt` y `upload-inbox` |
-| FASTQ de prueba | Cifrado/subida y borrador de metadatos preparado aparte |
+| CRAM + VCF batch | `encrypt-upload` → `prepare-submission` → `submit-submission` |
+| Separate encryption and upload | `encrypt` and `upload-inbox` |
+| FASTQ test | Encrypt/upload, then prepare a separate metadata draft |
 
-`prepare-submission` está especializado en CRAM + VCF; no infiere metadatos de
-un FASTQ. Para las opciones disponibles, ejecuta
-`impact-tools ega <comando> --help`.
+`prepare-submission` is specialised for CRAM + VCF; it does not infer metadata
+from a FASTQ. For command options, run `impact-tools ega <command> --help`.

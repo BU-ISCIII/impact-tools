@@ -1,19 +1,19 @@
-# Cifrado y subida al Inbox
+# Encryption and Inbox upload
 
-[Mapa EGA](README.md) · [Continuar con la submission](submitter-portal.md)
+[EGA workflow map](README.md) · [Continue to submission](submitter-portal.md)
 
-Este recorrido usa un lote CRAM + VCF. Los comandos se ejecutan donde están
-los originales (estación de trabajo o HPC), con acceso SFTP al Inbox; **no**
-dentro del contenedor LocalEGA.
+This walkthrough uses a CRAM + VCF batch. Run the commands where the original
+files reside (a workstation or HPC environment) with SFTP access to the Inbox,
+**not** inside a LocalEGA container.
 
-## 1. Preparar el lote
+## 1. Prepare the batch
 
-Necesitas `impact-tools`, un ejecutable `crypt4gh` funcional, una cuenta de
-Inbox y la **clave pública Crypt4GH vigente del servicio receptor**. Verifica
-su huella con el administrador: una clave antigua puede permitir cifrar y subir,
-pero impedir la ingestión posterior.
+You need `impact-tools`, a working `crypt4gh` executable, an Inbox account,
+and the **current Crypt4GH public key of the receiving service**. Confirm its
+fingerprint with the node administrator: an outdated key may still let you
+encrypt and upload files but prevent their subsequent ingestion.
 
-Estructura ilustrativa:
+Example input layout:
 
 ```text
 /data/delivery/
@@ -25,27 +25,26 @@ Estructura ilustrativa:
     └── SAMPLE_002.vcf.gz
 ```
 
-Prepara el fichero de selección con una línea por muestra:
+Create a selection file with one sample ID per line:
 
 ```bash
 mkdir -p /data/ega-runs/cohort-01
 printf '%s\n' SAMPLE_001 SAMPLE_002 > /data/ega-runs/cohort-01/samples.txt
 ```
 
-Con `--sample-list`, la herramienta exige
-exactamente un CRAM y un VCF por muestra y detiene el lote si faltan ficheros,
-están vacíos o hay candidatos ambiguos. Reutiliza **esa misma lista** al
-preparar los metadatos.
+With `--sample-list`, the tool requires exactly one CRAM and one VCF per
+sample. It stops before processing if files are missing or empty, or if
+multiple candidates match. Use **the same list** when preparing metadata.
 
-Comprueba que los originales son legibles y que el directorio de salida tiene
-espacio para otra copia del lote, además de informes. Para CRAM grandes, evita
-`/tmp` y usa almacenamiento persistente. No incluyas datos de pacientes en
-nombres o ejemplos compartidos.
+Check that source files are readable and that the output filesystem has room
+for another copy of the batch plus reports. For large CRAM files, avoid
+`/tmp` and use persistent storage. Do not put patient information in shared
+filenames or examples.
 
-## 2. Cifrar y subir solo lo seleccionado
+## 2. Encrypt and upload only the selected files
 
-Sustituye las rutas y parámetros de este ejemplo. La clave privada de LocalEGA
-**no** se usa en esta máquina.
+Replace the example paths and connection settings. The LocalEGA private key
+is **not** used on this machine.
 
 ```bash
 INPUT_DIR=/data/delivery
@@ -73,42 +72,42 @@ impact-tools ega encrypt-upload \
   --ask-password
 ```
 
-La contraseña se solicita interactivamente: no la pongas en argumentos o
-ficheros versionados. Verifica la huella SSH del Inbox antes de confiar en él.
-Para rechazar claves desconocidas, configura `ega.inbox.host_key_policy:
-reject` en la configuración de usuario; `encrypt-upload` lee esa opción de
-allí. Ante un cambio inesperado, detente y confirma la huella con el
-administrador.
+The password is requested interactively: do not put it in arguments or
+version-controlled files. Verify the Inbox SSH host-key fingerprint before
+trusting it. To reject unknown host keys, set `ega.inbox.host_key_policy` to
+`reject` in your user configuration; `encrypt-upload` reads that setting.
+If the fingerprint changes unexpectedly, stop and confirm it with the
+administrator.
 
-`--remote-layout relative` conserva la carpeta de muestra. La ruta remota
-esperada del CRAM es `/SAMPLE_001/SAMPLE_001.cram.c4gh`; debe coincidir con
-el borrador de submission. El comando combinado sube únicamente los resultados
-seleccionados para este lote, no cualquier `.c4gh` antiguo del directorio.
+`--remote-layout relative` preserves the sample directory. The expected
+remote CRAM path is `/SAMPLE_001/SAMPLE_001.cram.c4gh`; it must match the
+submission draft. The combined command uploads only outputs selected for
+this batch, not older `.c4gh` files in the output directory.
 
-## 3. Revisar el resultado
+## 3. Review the results
 
-Guarda `workflow_reports/`, sus manifiestos y el registro SQLite en un lugar
-persistente. Revisa el informe HTML y el manifiesto de subida:
+Keep `workflow_reports/`, its manifests, and the SQLite registry on persistent
+storage. Review the HTML report and upload manifest:
 
-- Debe haber dos entradas por muestra (CRAM y VCF), sin estado `failed`.
-- Contrasta ruta remota, tamaño y SHA-256 cifrado de cada `.c4gh`.
-- `skipped_existing` solo significa que ya había un fichero remoto: **no**
-  prueba que sea el correcto. `skipped_registered` debe corresponder al mismo
-  contenido y destino registrado previamente.
+- Expect two entries per sample (CRAM and VCF), with no `failed` status.
+- Compare remote path, size, and encrypted SHA-256 for each `.c4gh` file.
+- `skipped_existing` only means a remote file already exists; it **does not**
+  prove that the file is correct. Check that `skipped_registered` refers to
+  previously registered content at the same destination.
 
-La transferencia SFTP no equivale a ingestión. Antes de enviar metadatos,
-comprueba en el portal o su API que cada fichero está en estado `inbox`, con
-ruta exacta (incluida la barra inicial) y checksum concordante. El registro
-local acredita operaciones de cifrado/subida, no accesiones o release en CEGA.
+An SFTP transfer is not ingestion. Before submitting metadata, check in the
+portal or its API that each file is in `inbox` status, with the exact path
+(including its leading slash) and matching checksum. The local registry
+records encryption and upload operations, not CEGA accessions or release.
 
-| Síntoma | Qué comprobar |
+| Symptom | Check |
 | --- | --- |
-| No encuentra muestras | Nombres, carpetas y un CRAM + un VCF por ID de `samples.txt` |
-| Falla el cifrado | Ejecutable `crypt4gh`, clave pública vigente y espacio libre |
-| Falla SFTP | Cuenta, contraseña, estado del usuario y huella SSH |
-| Ya existe en remoto | Ruta, tamaño y checksum; no asumas que `skipped_existing` equivale a éxito |
-| No aparece en `/files` | Token, respuesta HTTP y prefijo con `/` inicial; espera la notificación del Inbox |
+| Samples not found | Names, directories, and one CRAM + one VCF per ID in `samples.txt` |
+| Encryption fails | `crypt4gh` executable, current public key, and free space |
+| SFTP fails | Account, password, user status, and SSH host-key fingerprint |
+| Remote file already exists | Path, size, and checksum; `skipped_existing` is not verified success |
+| File absent from `/files` | Token, HTTP response, leading `/` in prefix, and Inbox notification |
 
-Si separas las etapas entre máquinas, utiliza `ega encrypt` y `ega
-upload-inbox` con una selección explícita de ficheros. No lances
-`upload-inbox` contra una carpeta con lotes anteriores sin restringirla.
+If the stages run on different machines, use `ega encrypt` and
+`ega upload-inbox` with an explicit file selection. Do not run `upload-inbox`
+on a directory containing previous batches without restricting the selection.
