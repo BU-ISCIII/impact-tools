@@ -508,12 +508,23 @@ def apply_dataset_to_remote(
             user_list = None
 
             if permissions_level == "controlled" and config.permissions_email:
+                existing_users = (
+                    (existing_permissions or {})
+                    .get("permissions", {})
+                    .get("controlled", {})
+                    .get("user-list", [])
+                )
                 user_list = [
+                    user
+                    for user in existing_users
+                    if user.get("user_e-mail") != config.permissions_email
+                ]
+                user_list.append(
                     {
                         "user_e-mail": config.permissions_email,
                         "default_entry_types_granularity": config.granularity,
                     }
-                ]
+                )
 
             perms_status = mongo_set_dataset_permissions(
                 database,
