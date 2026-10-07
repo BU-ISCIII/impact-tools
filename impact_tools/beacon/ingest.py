@@ -1031,13 +1031,44 @@ def check_ritools_result(
         )
 
 
+def _discard_staging_variants(
+    deployment: BeaconDeploymentConfig,
+    staging_id: str,
+) -> None:
+    """Best-effort removal of a failed run's staging variants.
+
+    Never raises, so the original error is the one reported.
+    """
+    from impact_tools.beacon.mongo import (
+        managed_mongo,
+        mongo_delete_dataset_variants,
+    )
+
+    try:
+        with managed_mongo(deployment.mongo) as database:
+            deleted = mongo_delete_dataset_variants(database, staging_id)
+
+        LOGGER.warning(
+            "Ingest failed; deleted %d staging variants from %s.",
+            deleted,
+            staging_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.error(
+            "Ingest failed and staging variants could not be deleted. "
+            "Remove them manually: datasetId=%s (%s)",
+            staging_id,
+            exc,
+        )
+
+
 def list_old_variant_backups(
     database,
     dataset_id: str,
     *,
     older_than_days: int = 7,
 ) -> list[OldVariantBackup]:
-    """List MongoDB backups matching <dataset>_old_<timestamp>."""
+    """List MongoDB backups (<dataset>_old_<ts>) and leftover staging (<dataset>_staging_<ts>)."""
 
     from impact_tools.beacon.mongo import mongo_list_old_backups
 
@@ -1051,8 +1082,8 @@ def list_old_variant_backups(
 
     for row in rows:
         backup_id = row["datasetId"]
-        prefix = f"{dataset_id}_old_"
-        timestamp = backup_id[len(prefix):]
+        # <id>_old_<YYYYMMDD_HHMMSS> or <id>_staging_<YYYYMMDD_HHMMSS>
+        timestamp = backup_id[-15:]
 
         try:
             created_at = dt.datetime.strptime(
@@ -1179,7 +1210,7 @@ def offer_old_variant_backups_cleanup(
 
         click.echo()
         click.echo(
-            f"Old variant backups found for {dataset_id}:"
+            f"Old variant backups and leftover staging found for {dataset_id}:"
         )
         click.echo()
 
@@ -1422,30 +1453,35 @@ def apply_variants_to_remote(
     ritools_results: list[ritools.GenomicVariationsResult] = []
 
     # Run RI-tools locally against the directly exposed MongoDB.
-    for index, local_vcf in enumerate(
-        vcf_files,
-        start=1,
-    ):
-        LOGGER.info(
-            "Processing VCF %d/%d locally: %s",
-            index,
-            len(vcf_files),
-            local_vcf.name,
-        )
+    # Any failure (including Ctrl-C) discards the partial staging data.
+    try:
+        for index, local_vcf in enumerate(
+            vcf_files,
+            start=1,
+        ):
+            LOGGER.info(
+                "Processing VCF %d/%d locally: %s",
+                index,
+                len(vcf_files),
+                local_vcf.name,
+            )
 
-        ritools_result = ritools.run_genomic_variations_vcf(
-            mongo=deployment.mongo,
-            dataset_id=staging_id,
-            input_vcf=local_vcf,
-            reference_genome=config.reference_genome,
-        )
+            ritools_result = ritools.run_genomic_variations_vcf(
+                mongo=deployment.mongo,
+                dataset_id=staging_id,
+                input_vcf=local_vcf,
+                reference_genome=config.reference_genome,
+            )
 
-        check_ritools_result(
-            ritools_result,
-            vcf_count=vcf_counts[local_vcf],
-        )
+            check_ritools_result(
+                ritools_result,
+                vcf_count=vcf_counts[local_vcf],
+            )
 
-        ritools_results.append(ritools_result)
+            ritools_results.append(ritools_result)
+    except BaseException:
+        _discard_staging_variants(deployment, staging_id)
+        raise
 
     expected_mongo_count = sum(
         run.inserted
@@ -1531,11 +1567,15 @@ def apply_variants_to_remote(
             staging_id,
         )
 
-        check_variant_counts(
-            mongo_count=mongo_count,
-            vcf_count=expected_mongo_count,
-            dataset_id=staging_id,
-        )
+        try:
+            check_variant_counts(
+                mongo_count=mongo_count,
+                vcf_count=expected_mongo_count,
+                dataset_id=staging_id,
+            )
+        except RuntimeError:
+            _discard_staging_variants(deployment, staging_id)
+            raise
 
         old_count = mongo_rename_dataset_id(
             database,
