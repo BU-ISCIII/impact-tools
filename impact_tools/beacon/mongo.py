@@ -289,11 +289,11 @@ def mongo_list_old_backups(
     database: Database,
     dataset_id: str,
 ) -> list[dict[str, Any]]:
-    """List backups matching ``<dataset_id>_old_<timestamp>``."""
+    """List backups matching ``<dataset_id>_old_<ts>`` or leftover ``<dataset_id>_staging_<ts>``."""
 
     pattern = (
         rf"^{re.escape(dataset_id)}"
-        rf"_old_[0-9]{{8}}_[0-9]{{6}}$"
+        rf"_(old|staging)_[0-9]{{8}}_[0-9]{{6}}$"
     )
 
     backup_ids = database.genomicVariations.distinct(
