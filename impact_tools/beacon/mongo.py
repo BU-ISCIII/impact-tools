@@ -109,10 +109,13 @@ def mongo_import_datasets(
     database: Database,
     local_json: Path,
 ) -> int:
-    """Insert missing documents from datasets.json.
+    """Insert or update documents from datasets.json.
 
-    Documents already present with the same ``_id`` are preserved. The
-    returned value is the number of newly inserted documents.
+    New documents are inserted. For existing documents (same ``_id``) the
+    non-empty fields of the JSON are written, so a re-run can change name,
+    description or DUO; fields left empty (e.g. no description given) keep
+    their stored value. The returned value is the number of newly inserted
+    documents.
     """
 
     local_json = local_json.expanduser().resolve()
@@ -158,10 +161,16 @@ def mongo_import_datasets(
                 f"Dataset entry {index} does not contain a valid id."
             )
 
+        fields = {
+            key: value
+            for key, value in document.items()
+            if key != "_id" and value not in ("", None)
+        }
+
         operations.append(
             UpdateOne(
                 {"_id": document_id},
-                {"$setOnInsert": document},
+                {"$set": fields},
                 upsert=True,
             )
         )
@@ -172,6 +181,13 @@ def mongo_import_datasets(
     result = database.datasets.bulk_write(
         operations,
         ordered=True,
+    )
+
+    LOGGER.info(
+        "datasets: %d inserted, %d updated, %d unchanged",
+        result.upserted_count,
+        result.modified_count,
+        result.matched_count - result.modified_count,
     )
 
     return result.upserted_count
