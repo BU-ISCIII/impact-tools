@@ -2257,6 +2257,95 @@ def ingest_variants_cmd(
                 log.info("  %s: %d variants deleted", backup_id, deleted_count)
 
 
+@beacon.group("delete")
+def beacon_delete_group() -> None:
+    """Beacon deletion workflows."""
+
+
+@beacon_delete_group.command("dataset")
+@click.option("--dataset-id", required=True, help="Beacon dataset identifier.")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Show what would be deleted without deleting anything.",
+)
+@click.option(
+    "-y",
+    "--yes",
+    is_flag=True,
+    help="Do not ask for confirmation (required when stdin is not interactive).",
+)
+@click.pass_context
+def delete_dataset_cmd(
+    ctx: click.Context,
+    dataset_id: str,
+    dry_run: bool,
+    yes: bool,
+) -> None:
+    """Delete a dataset and all its documents from MongoDB."""
+    configure_module_logging(ctx, "beacon_delete_dataset")
+
+    from impact_tools.beacon.mongo import managed_mongo, mongo_dataset_footprint
+
+    try:
+        deployment = build_beacon_deployment_config(ctx.obj["configuration"])
+
+        with managed_mongo(deployment.mongo) as database:
+            footprint = mongo_dataset_footprint(database, dataset_id)
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(str(exc)) from exc
+
+    if not any(footprint.values()):
+        raise click.ClickException(
+            f"Nothing found for dataset '{dataset_id}' in MongoDB."
+        )
+
+    click.echo(f"Documents to delete for dataset '{dataset_id}':")
+    for collection, count in footprint.items():
+        if count:
+            click.echo(f"  {collection:<22} {count}")
+    click.echo("DUO terms in filtering_terms are shared and will be kept.")
+
+    if dry_run:
+        click.echo("Dry run: nothing deleted.")
+        return
+
+    if not yes:
+        if not click.get_text_stream("stdin").isatty():
+            raise click.UsageError(
+                "Use --yes to delete when stdin is not interactive."
+            )
+
+        typed = click.prompt(
+            "This cannot be undone. Type the dataset ID to confirm",
+            default="",
+            show_default=False,
+        )
+        if typed != dataset_id:
+            raise click.ClickException("Confirmation did not match. Nothing deleted.")
+
+    try:
+        deleted, still_visible = beacon_ingest.delete_dataset(
+            dataset_id,
+            deployment,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(str(exc)) from exc
+
+    for collection, count in deleted.items():
+        if count:
+            log.info("Deleted %d document(s) from %s", count, collection)
+
+    if still_visible:
+        log.warning(
+            "Dataset '%s' is still listed by the Beacon API. "
+            "Check the API logs or restart beaconprod if it caches datasets.",
+            dataset_id,
+        )
+    else:
+        log.info("Dataset '%s' deleted and no longer listed by the API.", dataset_id)
+
+
 @ega.command("encrypt-slurm")
 @click.option(
     "--config-file",

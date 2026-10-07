@@ -90,6 +90,16 @@ def _contains_id(
     return False
 
 
+def is_dataset_listed(
+    client: httpx.Client,
+    dataset_id: str,
+) -> bool:
+    """Return whether /api/datasets lists the dataset (no logging)."""
+
+    response = client.get("/api/datasets")
+    return _contains_id(_read_json_object(response), dataset_id)
+
+
 def verify_dataset_via_api(
     client: httpx.Client,
     dataset_id: str,
