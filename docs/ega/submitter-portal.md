@@ -42,9 +42,10 @@ Review `evidence.md`, `missing_fields.yaml`, `file_inventory.tsv`, and
    policy. IDs and enum values depend on the target API; they cannot be
    inferred from filenames.
 3. Each sample should have a CRAM Run and a VCF Analysis, and the Dataset
-   should link them all. Draft `files` names must match the uploaded `.c4gh`
-   files, including the sample directory when `--remote-layout relative` was
-   used.
+   should link them all. Generated draft `files` names use source paths such as
+   `SAMPLE_001/SAMPLE_001.cram` and `SAMPLE_001/SAMPLE_001.vcf.gz`, without
+   `.c4gh`. `submit-submission` adds that suffix for the Inbox lookup. Include
+   the sample directory when `--remote-layout relative` was used.
 4. Ensure no `EXAMPLE:` or other fictitious values remain in the draft.
 
 ## 2. Generate a plan without submitting
@@ -72,6 +73,7 @@ TOKEN_FILE=/secure/ega/access_token
 REMOTE_FILE=/SAMPLE_001/SAMPLE_001.cram.c4gh
 
 curl --fail-with-body --get --silent --show-error \
+  --write-out '\nHTTP %{http_code}\n' \
   --config <(printf 'header = "Authorization: Bearer %s"\n' "$(cat "$TOKEN_FILE")") \
   --data-urlencode 'status=inbox' \
   --data-urlencode "prefix=$REMOTE_FILE" \
