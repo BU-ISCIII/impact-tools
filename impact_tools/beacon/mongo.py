@@ -580,3 +580,98 @@ def mongo_upsert_duo_filtering_terms(
             changed += 1
 
     return changed
+
+
+# Entity collections whose documents carry a ``datasetId`` field.
+# genomicVariations also includes the <id>_old_<ts> / <id>_staging_<ts>
+# copies left by `ingest variants`.
+_DATASET_ID_COLLECTIONS = (
+    "genomicVariations",
+    "caseLevelData",
+    "targets",
+    "analyses",
+    "biosamples",
+    "cohorts",
+    "individuals",
+    "runs",
+)
+
+
+def _dataset_id_filter(collection: str, dataset_id: str) -> dict[str, Any]:
+    """Match a dataset's documents (and, for variants, its backups)."""
+
+    if collection != "genomicVariations":
+        return {"datasetId": dataset_id}
+
+    backups = rf"^{re.escape(dataset_id)}_(old|staging)_[0-9]{{8}}_[0-9]{{6}}$"
+
+    return {
+        "$or": [
+            {"datasetId": dataset_id},
+            {"datasetId": {"$regex": backups}},
+        ]
+    }
+
+
+def mongo_dataset_footprint(
+    database: Database,
+    dataset_id: str,
+) -> dict[str, int]:
+    """Count the documents that belong to a dataset, per collection."""
+
+    existing = set(database.list_collection_names())
+    footprint: dict[str, int] = {
+        "datasets": database.datasets.count_documents({"id": dataset_id}),
+        "datasetsConf": database.datasetsConf.count_documents(
+            {"_id": dataset_id}
+        ),
+        "datasetsPermissions": database.datasetsPermissions.count_documents(
+            {"_id": dataset_id}
+        ),
+    }
+
+    for collection in _DATASET_ID_COLLECTIONS:
+        if collection not in existing:
+            continue
+
+        footprint[collection] = database[collection].count_documents(
+            _dataset_id_filter(collection, dataset_id)
+        )
+
+    return footprint
+
+
+def mongo_delete_dataset(
+    database: Database,
+    dataset_id: str,
+) -> dict[str, int]:
+    """Delete every document of a dataset. Returns deleted counts.
+
+    Variants and other entity documents go first and the dataset record
+    last, so an interrupted run can simply be repeated.
+    DUO terms in filtering_terms are shared between datasets and are kept.
+    """
+
+    existing = set(database.list_collection_names())
+    deleted: dict[str, int] = {}
+
+    for collection in _DATASET_ID_COLLECTIONS:
+        if collection not in existing:
+            continue
+
+        result = database[collection].delete_many(
+            _dataset_id_filter(collection, dataset_id)
+        )
+        deleted[collection] = result.deleted_count
+
+    deleted["datasetsPermissions"] = database.datasetsPermissions.delete_one(
+        {"_id": dataset_id}
+    ).deleted_count
+    deleted["datasetsConf"] = database.datasetsConf.delete_one(
+        {"_id": dataset_id}
+    ).deleted_count
+    deleted["datasets"] = database.datasets.delete_many(
+        {"id": dataset_id}
+    ).deleted_count
+
+    return deleted

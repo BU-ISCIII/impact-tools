@@ -684,6 +684,36 @@ def ingest_dataset(
     return result
 
 
+def delete_dataset(
+    dataset_id: str,
+    deployment: BeaconDeploymentConfig,
+) -> tuple[dict[str, int], bool]:
+    """Delete a dataset from MongoDB and check it is gone from the API.
+
+    Returns the deleted counts and whether the API still lists the dataset.
+    """
+
+    from impact_tools.beacon.api import is_dataset_listed, managed_beacon_api
+    from impact_tools.beacon.mongo import (
+        managed_mongo,
+        mongo_delete_dataset,
+        mongo_reindex,
+    )
+
+    with managed_mongo(deployment.mongo) as database:
+        deleted = mongo_delete_dataset(database, dataset_id)
+        # Drops the cached counts collection, as after a variant ingest.
+        mongo_reindex(database)
+
+    with managed_beacon_api(deployment.api) as api_client:
+        still_visible = is_dataset_listed(api_client, dataset_id)
+
+    with BeaconRegistry() as registry:
+        registry.delete_dataset_registration(dataset_id)
+
+    return deleted, still_visible
+
+
 # ---------------------------------------------------------------------------
 # Remote orchestration: Variant ingestion helpers
 # ---------------------------------------------------------------------------

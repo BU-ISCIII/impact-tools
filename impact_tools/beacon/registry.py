@@ -166,6 +166,14 @@ class BeaconRegistry:
                 ),
             )
 
+    def delete_dataset_registration(self, dataset_id: str) -> None:
+        """Remove a dataset registration (no-op if it is not recorded)."""
+        with self.connection:
+            self.connection.execute(
+                "DELETE FROM dataset_registrations WHERE dataset_id = ?",
+                (dataset_id,),
+            )
+
     def find_dataset_registration(
         self,
         dataset_id: str,
