@@ -1933,13 +1933,19 @@ def beacon_ingest_group(
     "--is-test",
     type=click.Choice(["y", "n"], case_sensitive=False),
     default=None,
-    help="Whether this dataset is a test dataset: y/N.",
+    help=(
+        "Whether this dataset is a test dataset: y/n. New datasets default "
+        "to n; existing datasets keep their value unless this is given."
+    ),
 )
 @click.option(
     "--is-synthetic",
     is_flag=True,
     default=None,
-    help="Mark this dataset as synthetic.",
+    help=(
+        "Mark this dataset as synthetic. If omitted, an existing dataset "
+        "keeps its value."
+    ),
 )
 @click.option(
     "-b",
@@ -2045,8 +2051,8 @@ def ingest_dataset_cmd(
                 "when stdin is not interactive."
             )
 
-    test = (is_test or "n").lower() == "y"
-    synthetic = bool(is_synthetic)
+    test = None if is_test is None else is_test.lower() == "y"
+    synthetic = is_synthetic
 
     base_dir = base_dir.resolve()
 

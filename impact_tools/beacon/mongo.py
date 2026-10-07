@@ -393,26 +393,38 @@ def mongo_set_dataset_flags(
     database: Database,
     dataset_id: str,
     *,
-    is_test: bool,
+    is_test: bool | None,
     is_synthetic: bool | None = None,
 ) -> MongoApplyStatus:
     """Set dataset conf flags in db.datasetsConf.
+
+    A flag passed as None is left unchanged on an existing document and
+    defaults to False on a new one.
 
     Returns "created" if the conf document did not exist, "updated" if it
     existed and changed, "unchanged" if it was already identical.
     """
 
-    document: dict[str, Any] = {
-        "_id": dataset_id,
-        "isTest": bool(is_test),
-    }
+    to_set: dict[str, Any] = {}
+    defaults: dict[str, Any] = {}
 
-    if is_synthetic is not None:
-        document["isSynthetic"] = bool(is_synthetic)
+    for field, value in (("isTest", is_test), ("isSynthetic", is_synthetic)):
+        if value is None:
+            defaults[field] = False
+        else:
+            to_set[field] = bool(value)
 
-    result = database.datasetsConf.replace_one(
+    update: dict[str, Any] = {}
+
+    if to_set:
+        update["$set"] = to_set
+
+    if defaults:
+        update["$setOnInsert"] = defaults
+
+    result = database.datasetsConf.update_one(
         {"_id": dataset_id},
-        document,
+        update,
         upsert=True,
     )
 
