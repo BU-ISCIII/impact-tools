@@ -72,8 +72,8 @@ class DatasetIngestConfig:
     name: str
     description: str
     reference_genome: str = "GRCh38"
-    is_test: bool = False
-    is_synthetic: bool = False
+    is_test: bool | None = None
+    is_synthetic: bool | None = None
     base_dir: Path = Path(".")
     granularity: str = "record"
     permissions_level: str | None = None
@@ -485,6 +485,11 @@ def apply_dataset_to_remote(
             is_test=config.is_test,
             is_synthetic=config.is_synthetic,
         )
+        stored_flags = database.datasetsConf.find_one(
+            {"_id": config.dataset_id}
+        ) or {}
+        is_test = bool(stored_flags.get("isTest", False))
+        is_synthetic = bool(stored_flags.get("isSynthetic", False))
 
         permissions_level = config.permissions_level
         existing_permissions = mongo_get_dataset_permissions(
@@ -557,8 +562,8 @@ def apply_dataset_to_remote(
             name=config.name,
             description=config.description,
             reference_genome=config.reference_genome,
-            is_test=config.is_test,
-            is_synthetic=config.is_synthetic,
+            is_test=is_test,
+            is_synthetic=is_synthetic,
             granularity=config.granularity,
             base_dir=str(config.base_dir),
         )
