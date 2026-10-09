@@ -26,7 +26,13 @@ from impact_tools.beacon.config import build_beacon_deployment_config
 from impact_tools.beacon.registry import BeaconRegistry
 
 
-VCF_HEADER = "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+VCF_HEADER = (
+    "##fileformat=VCFv4.2\n"
+    '##INFO=<ID=AF,Number=A,Type=Float,Description="Allele frequency">\n'
+    '##INFO=<ID=AC,Number=A,Type=Integer,Description="Allele count">\n'
+    '##INFO=<ID=AN,Number=1,Type=Integer,Description="Allele number">\n'
+    "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+)
 
 
 def write_vcf(path: Path, records: int) -> Path:

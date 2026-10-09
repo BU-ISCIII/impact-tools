@@ -31,7 +31,7 @@ class RitoolsOutputTests(unittest.TestCase):
         with patch.object(ritools.subprocess, "run", return_value=completed):
             return ritools.run_genomic_variations_vcf(
                 mongo=mongo_config, dataset_id="DS1", input_vcf=vcf,
-                reference_genome="GRCh38",
+                reference_genome="GRCh38", output_dir=vcf.parent,
             )
 
     def test_counts_are_parsed(self) -> None:
@@ -93,7 +93,7 @@ class ApplyVariantsTests(BeaconTestCase):
 
         calls = iter(behaviours)
 
-        def run(*, mongo, dataset_id, input_vcf, reference_genome):
+        def run(*, mongo, dataset_id, input_vcf, reference_genome, output_dir):
             behaviour = next(calls)
             if behaviour == "ok":
                 self.db.genomicVariations.insert_many([{"datasetId": dataset_id} for _ in range(3)])
