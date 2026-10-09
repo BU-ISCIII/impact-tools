@@ -1471,6 +1471,7 @@ def apply_variants_to_remote(
                 dataset_id=staging_id,
                 input_vcf=local_vcf,
                 reference_genome=config.reference_genome,
+                output_dir=config.logs_dir,
             )
 
             check_ritools_result(
