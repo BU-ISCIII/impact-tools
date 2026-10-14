@@ -61,15 +61,71 @@ calling the API**. Check the sequence: Submission → Study → Samples →
 Experiments → file resolution → Runs → Analyses → Dataset. A plan does not
 prove that files exist in CEGA or that the server will accept the metadata.
 
-## 3. Verify the files in CEGA
+## 3. Obtain or refresh an API token
+
+The SFTP upload in the previous guide uses an interactive password, not this
+API token. Obtain a token before checking files or running
+`submit-submission --execute`, and refresh it if the API returns HTTP 401.
+Use the IdP token URL and OAuth client ID approved for the **same environment**
+as the Inbox and Submitter Portal API. The API base URL is not the browser URL
+of the Submitter Portal.
+
+Run this example with Bash after replacing the three values in angle brackets.
+It prompts for the password without echoing it or passing it in a `curl`
+argument. It writes only `access_token` to a private file, replacing an old
+token only after a successful response. Do not commit or share the file.
+
+```bash
+bash <<'BASH'
+set -euo pipefail
+
+EGA_TOKEN_URL='<approved-idp-token-url>'
+EGA_CLIENT_ID='<approved-oauth-client-id>'
+EGA_USER='<ega-account-email>'
+TOKEN_DIR="$HOME/.impact_tools"
+TOKEN_FILE="$TOKEN_DIR/ega_access_token"
+
+umask 077
+mkdir -p "$TOKEN_DIR"
+chmod 700 "$TOKEN_DIR"
+TOKEN_TMP=$(mktemp "$TOKEN_DIR/.ega_access_token.XXXXXX")
+trap 'rm -f "$TOKEN_TMP"' EXIT
+
+read -r -s -p 'EGA password: ' EGA_PASSWORD </dev/tty
+printf '\n'
+printf '%s' "$EGA_PASSWORD" |
+  curl --fail-with-body --silent --show-error \
+    --connect-timeout 10 --max-time 60 \
+    --data-urlencode 'password@-' \
+    --data-urlencode "username=$EGA_USER" \
+    --data 'grant_type=password' \
+    --data-urlencode "client_id=$EGA_CLIENT_ID" \
+    "$EGA_TOKEN_URL" |
+  python3 -c 'import json, sys; print(json.load(sys.stdin)["access_token"], end="")' \
+  > "$TOKEN_TMP"
+unset EGA_PASSWORD
+
+test -s "$TOKEN_TMP"
+chmod 600 "$TOKEN_TMP"
+mv -f "$TOKEN_TMP" "$TOKEN_FILE"
+trap - EXIT
+printf 'Token saved: %s\n' "$TOKEN_FILE"
+BASH
+```
+
+If authentication fails, confirm the account, environment, client ID, and
+credentials with your EGA administrator. Do not paste token responses or
+passwords into support requests. The following `curl` example expects the
+token file to contain **only the token string**, not the entire JSON response.
+
+## 4. Verify the files in CEGA
 
 Before the first `--execute`, query **each exact Inbox path**. This is a
-read-only example. Obtain a token using the authorised procedure for the
-target environment and protect its file with restrictive permissions.
+read-only example. Use a token for the same CEGA environment as the files.
 
 ```bash
 API_BASE='<submitter-portal-api-base>'
-TOKEN_FILE=/secure/ega/access_token
+TOKEN_FILE="$HOME/.impact_tools/ega_access_token"
 REMOTE_FILE=/SAMPLE_001/SAMPLE_001.cram.c4gh
 
 curl --fail-with-body --get --silent --show-error \
@@ -90,7 +146,7 @@ This check matters because `submit-submission` resolves files **after**
 creating the first metadata objects. If file resolution fails, the submission
 may be left partially created.
 
-## 4. Submit and preserve state
+## 5. Submit and preserve state
 
 Only after reviewing the draft, plan, and remote files:
 

@@ -100,14 +100,69 @@ portal or its API that each file is in `inbox` status, with the exact path
 (including its leading slash) and matching checksum. The local registry
 records encryption and upload operations, not CEGA accessions or release.
 
-| Symptom | Check |
-| --- | --- |
-| Samples not found | Names, directories, and one CRAM + one VCF per ID in `samples.txt` |
-| Encryption fails | `crypt4gh` executable, current public key, and free space |
-| SFTP fails | Account, password, user status, and SSH host-key fingerprint |
-| Remote file already exists | Path, size, and checksum; `skipped_existing` is not verified success |
-| File absent from `/files` | Token, HTTP response, leading `/` in prefix, and Inbox notification |
+## 4. Encrypt and upload on different machines
 
-If the stages run on different machines, use `ega encrypt` and
-`ega upload-inbox` with an explicit file selection. Do not run `upload-inbox`
-on a directory containing previous batches without restricting the selection.
+If the source files and the SFTP client are on different machines, run only
+encryption on the source machine. Use the same sample list and recipient key
+checks described above:
+
+```bash
+INPUT_DIR=/data/delivery
+RUN_DIR=/data/ega-runs/cohort-01
+
+impact-tools ega encrypt \
+  --input-dir "$INPUT_DIR" \
+  --sample-list "$RUN_DIR/samples.txt" \
+  --output-dir "$RUN_DIR/encrypted_c4gh" \
+  --recipient-pubkey /secure/localega/service.key.pub \
+  --crypt4gh-bin "$(command -v crypt4gh)" \
+  --registry-file "$RUN_DIR/encryption_registry.sqlite3"
+```
+
+Review the encryption manifest, then transfer the selected `.c4gh` files to
+the upload machine using an approved secure method. Preserve their relative
+`SAMPLE_001/...` paths. Do not transfer a private Crypt4GH key. On the upload
+machine, create an explicit list of the encrypted files for this batch:
+
+```bash
+RUN_DIR=/data/ega-runs/cohort-01
+ENCRYPTED_DIR="$RUN_DIR/encrypted_c4gh"
+UPLOAD_LIST="$RUN_DIR/upload_inputs.txt"
+INBOX_HOST='<inbox-host>'
+INBOX_PORT=2222
+EGA_USER='<ega-user>'
+
+printf '%s\n' \
+  'SAMPLE_001/SAMPLE_001.cram.c4gh' \
+  'SAMPLE_001/SAMPLE_001.vcf.gz.c4gh' \
+  'SAMPLE_002/SAMPLE_002.cram.c4gh' \
+  'SAMPLE_002/SAMPLE_002.vcf.gz.c4gh' > "$UPLOAD_LIST"
+
+impact-tools ega upload-inbox \
+  --input-dir "$ENCRYPTED_DIR" \
+  --input-list "$UPLOAD_LIST" \
+  --output-dir "$RUN_DIR/upload_reports" \
+  --host "$INBOX_HOST" \
+  --port "$INBOX_PORT" \
+  --username "$EGA_USER" \
+  --remote-dir / \
+  --remote-layout relative \
+  --registry-file "$RUN_DIR/upload_registry.sqlite3" \
+  --ask-password
+```
+
+Replace the listed filenames with those in the encryption manifest and
+confirm each file exists under `ENCRYPTED_DIR` before uploading. The upload
+machine must reach the Inbox for the same CEGA environment as the recipient
+key. Verify its SSH host-key fingerprint as in section 2. Never scan a shared
+directory containing previous batches without `--input-list`.
+
+## 5. Recover without duplicating work
+
+| Stage and symptom | Check first | Safe next step |
+| --- | --- | --- |
+| Sample selection or encryption fails | Names, one CRAM and VCF per ID, `crypt4gh`, recipient key, free space, and encryption manifest | Fix the input or environment, then retry with the same output directory and registry; do not force re-encryption of verified files. |
+| SFTP authentication or connection fails | Account status, password, network, and verified SSH host key | Correct the connection and retry only the selected batch. |
+| Upload stops or reports `skipped_existing` | Compare each exact remote path, size, and encrypted checksum with the manifest through the CEGA API | Retry missing files; stop and investigate any mismatch. An existing path is not proof of a complete upload. |
+| File is absent from `/files` | HTTP status, token environment, leading `/` in `prefix`, and Inbox notification | Wait or investigate the file registration before submitting metadata; do not assume SFTP success means API visibility. |
+| API submission fails or times out | Saved state and objects visible in the portal | Follow the [submission resumption procedure](submitter-portal.md#5-submit-and-preserve-state); do not start a fresh submission. |
