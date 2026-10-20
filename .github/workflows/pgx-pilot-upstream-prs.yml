@@ -1,0 +1,69 @@
+name: pgx_pilot upstream PR watcher
+
+# The bundled pgx_pilot workflow (impact_tools/beacon/resources/) currently
+# cherry-picks two still-open upstream PRs:
+#   - PR #5: uppercase reference + Beacon allele validation
+#   - PR #6: tag AC=0 variants as FAIL_AC
+# Once BOTH are merged upstream we should drop the cherry-picks and re-pin the
+# bundle to the first upstream commit/tag that contains both. This job polls the
+# upstream PRs daily and opens a single tracking issue when that happens.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  check-prs:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      UPSTREAM: Genome-of-Europe/pgx_pilot
+    steps:
+      - name: Open a tracking issue when PRs #5 and #6 are both merged
+        run: |
+          set -euo pipefail
+
+          merged5=$(gh api "repos/$UPSTREAM/pulls/5" --jq '.merged // false')
+          merged6=$(gh api "repos/$UPSTREAM/pulls/6" --jq '.merged // false')
+          echo "PR#5 merged=$merged5  PR#6 merged=$merged6"
+
+          if [ "$merged5" != "true" ] || [ "$merged6" != "true" ]; then
+            echo "Not both merged yet; nothing to do."
+            exit 0
+          fi
+
+          title="chore(pgx): re-pin bundled pgx_pilot (upstream PRs 5 and 6 merged)"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state all \
+            --search 'in:title "re-pin bundled pgx_pilot"' --json number --jq 'length')
+
+          if [ "$existing" != "0" ]; then
+            echo "Tracking issue already exists (open or closed); nothing to do."
+            exit 0
+          fi
+
+          merge6_sha=$(gh api "repos/$UPSTREAM/pulls/6" --jq '.merge_commit_sha // ""')
+          merge5_sha=$(gh api "repos/$UPSTREAM/pulls/5" --jq '.merge_commit_sha // ""')
+
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$(cat <<EOF
+          Upstream \`$UPSTREAM\` PRs **#5** and **#6** are now both merged.
+
+          Our bundle (\`impact_tools/beacon/resources/\`) cherry-picks their logic
+          while they were open. Clean this up:
+
+          - [ ] Re-pin the bundle to the first upstream commit/tag on \`main\` that
+            contains **both** PRs (merge SHAs: #5 \`$merge5_sha\`, #6 \`$merge6_sha\`).
+          - [ ] Drop the "cherry-picked PR #5/#6" notes and local deltas from the
+            bundled \`Snakefile\`, \`scripts/tag_variant_qc.py\` and
+            \`scripts/check_beacon_alleles.py\`, taking the upstream versions
+            (adapted to our pysam style where applicable).
+          - [ ] Update \`PGX_PILOT_COMMIT\` in \`impact_tools/beacon/pgx.py\`.
+          - [ ] Re-run \`pytest\` and a \`beacon pgx --dry-run\` smoke test.
+
+          Opened automatically by \`.github/workflows/pgx-pilot-upstream-prs.yml\`.
+          EOF
+          )"
+          echo "Tracking issue created."
