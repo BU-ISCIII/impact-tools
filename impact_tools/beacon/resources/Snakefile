@@ -1,15 +1,20 @@
 #ftype: python
 # Bundled from: https://github.com/Genome-of-Europe/pgx_pilot
-# Upstream commit: 2026-06-22 "Set default AF cutoff to 0.0"
+# Upstream commit: main @ e8bb2d4 (2026-09-18 "Disable plotting in PyPGx ...")
+# Cherry-picked (still-open) upstream PRs:
+#   - PR #5: uppercase reference + Beacon allele validation (check_beacon_alleles.py)
+#   - PR #6: tag AC=0 variants as FAIL_AC (scripts/tag_variant_qc.py)
 #
 # Local divergences from upstream:
-#   - select_regions: removed -S {sample_id_file} (per-sample selection).
-#     Input is the full multisample joint VCF for the batch; -R (regions BED)
-#     is the only selection applied.
-#   - local_resources.ref_fasta: used instead of downloading the reference.
-#   - download_reference_source / download_selection_bed: kept but only fire
-#     when the local path is absent; nodes must not access the internet.
-#   - output_prefix driven by batch_id, not sample_id.
+#   - generate_chr_map: chromosome-naming detection uses pysam instead of cyvcf2,
+#     to keep a single VCF library across the impact-tools bundle.
+#   - prepare_reference: writes an uppercase copy of the reference (PR #5), since
+#     bcftools norm otherwise copies soft-masked lowercase bases into REF/ALT,
+#     which Beacon rejects.
+#   - local_resources.ref_fasta: used instead of downloading the reference;
+#     download_reference_source only fires when the local path is absent
+#     (compute nodes must not access the internet).
+#   - output_prefix is driven by the release/batch id, not sample id.
 #
 # DO NOT introduce per-sample subsetting here. Allele frequencies, HWE,
 # missingness and stratified statistics must be computed over all samples
@@ -17,126 +22,123 @@
 
 configfile: "config.yaml"
 
-import os, sys
+import os
+from snakemake.exceptions import WorkflowError
+
+CANONICAL_CHRS="chr1,chr2,chr3,chr4,chr5,chr6,chr7,chr8,chr9,chr10,chr11,chr12,chr13,chr14,chr15,chr16,chr17,chr18,chr19,chr20,chr21,chr22,chrX,chrY,chrM"
 
 # --- Config Validation ---
-if not config.get("input_vcf") or not os.path.exists(config["input_vcf"]):
-    sys.exit(f"ERROR: input_vcf not found: '{config.get('input_vcf')}'.")
+if not config.get("input_vcf"):
+    raise WorkflowError("Configuration error: 'input_vcf' is not specified in config.yaml.")
 
-if not config.get("regions_bed"):
-    sys.exit("ERROR: 'regions_bed' is required in config.yaml.")
+# --- Intermediate Output Handling ---
+KEEP_INTERMEDIATE = config.get("keep_intermediate", False)
 
-# --- Helper Functions ---
-def get_ref_fasta(wildcards=None):
-    return (
-        config.get("local_resources", {}).get("ref_fasta")
-        or "resources/GRCh38.fa"
-    )
+def intermediate(path):
+    """Mark path as temp() unless keep_intermediate is set to True."""
+    return path if KEEP_INTERMEDIATE else temp(path)
 
-# --- Main Rule ---
+# --- Main Rules ---
 rule all:
     input:
-        expand("results/{prefix}.sites.all.vcf.gz",  prefix=config.get("output_prefix", "batch")),
-        expand("results/{prefix}.sites.pass.vcf.gz", prefix=config.get("output_prefix", "batch")),
-        expand("results/intermediate/{prefix}.full_sample_data.vcf.gz", prefix=config.get("output_prefix", "batch"))
+        expand("results/{prefix}.sites.all.vcf.gz", prefix=config.get("output_prefix", "cohort")),
+        expand("results/{prefix}.sites.pass.vcf.gz", prefix=config.get("output_prefix", "cohort")),
+        expand("results/{prefix}.full_sample_data.vcf.gz", prefix=config.get("output_prefix", "cohort"))
 
 # --- Resources & Common Steps ---
-rule index_vcf:
-    input: "{filename}.vcf.gz"
-    output: "{filename}.vcf.gz.tbi"
-    shell:
-        "tabix -pvcf {input}"
-
 rule prepare_reference:
-    input:
-        src=lambda w: (
-            config.get("local_resources", {}).get("ref_fasta")
-            or "resources/downloaded_GRCh38.fa.gz"
-        )
-    output:
-        fasta="resources/GRCh38.fa",
-        dct="resources/GRCh38.dict"
+    input: src=lambda w: config.get("local_resources", {}).get("ref_fasta") or "resources/downloaded_hg38.fa.gz"
+    output: fasta="resources/hg38.fa", fai="resources/hg38.fa.fai"
     shell:
         """
+        # Remove any old output first, so a previously symlinked hg38.fa never
+        # redirects the write into the source FASTA.
+        rm -f {output.fasta} {output.fasta}.tmp
+        # Uppercase the sequence (headers untouched): UCSC hg38 is soft-masked,
+        # and bcftools norm copies lowercase repeat bases into REF/ALT, which
+        # Beacon rejects.
         if [[ "{input.src}" == *.gz ]]; then
-            gunzip -c {input.src} > {output.fasta}
+            gunzip -c {input.src}
         else
-            ln -sf {input.src} {output.fasta}
-        fi
+            cat {input.src}
+        fi | awk '/^>/ {{ print; next }} {{ print toupper($0) }}' > {output.fasta}.tmp
+        mv {output.fasta}.tmp {output.fasta}
         samtools faidx {output.fasta}
-        samtools dict {output.fasta} > {output.dct}
         """
 
 rule download_reference_source:
-    output: "resources/downloaded_GRCh38.fa.gz"
-    params:
-        url=lambda w: config.get("resources", {}).get("ref_fasta_url", "")
+    output: "resources/downloaded_hg38.fa.gz"
+    params: url=lambda w: config.get("resources", {}).get("ref_fasta_url", "")
     shell:
         """
         if [ -z "{params.url}" ]; then
             echo "ERROR: resources.ref_fasta_url is not set and local_resources.ref_fasta was not available." >&2
             exit 1
         fi
-
         echo "WARNING: downloading reference from internet. Compute nodes should use local_resources.ref_fasta." >&2
         wget --tries=3 -O {output} {params.url}
         """
 
+rule generate_chr_map:
+    input:
+        vcf=config["input_vcf"]
+    output:
+        map_file="results/temp/chr_map.txt"
+    run:
+        import pysam
+        with pysam.VariantFile(input.vcf) as vcf:
+            has_chr = any(str(seq).startswith("chr") for seq in vcf.header.contigs)
+
+        with open(output.map_file, "w") as f:
+            if not has_chr:
+                # Write mapping from Ensembl to UCSC (e.g. "1 chr1")
+                for i in range(1, 23):
+                    f.write(f"{i}\tchr{i}\n")
+                f.write("X\tchrX\n")
+                f.write("Y\tchrY\n")
+                f.write("MT\tchrM\n")
+            else:
+                # No-op (empty map file means no renaming)
+                pass
+
 # --- Pipeline Rules ---
 rule select_regions:
     input:
-        vcf=lambda w: config["input_vcf"],
-    output:
-        "results/temp/01_selected.vcf.gz"
-    params:
-        bed_path=lambda w: (
-            "resources/selection_targets.bed"
-            if config.get("regions_bed", "").startswith(("http", "ftp"))
-            else config.get("regions_bed", "")
-        )
+        vcf=config["input_vcf"],
+        chr_map="results/temp/chr_map.txt"
+    output: vcf=intermediate("results/temp/01_selected.vcf.gz")
+    threads: 4
     shell:
         """
-        bcftools view \
-            -I \
-            -R {params.bed_path} \
-            -Ou \
-            {input.vcf} \
-        | bcftools view \
-            -e 'ALT="*"' \
-            -Oz \
-            -o {output}
-
-        tabix -p vcf {output}
+        # If the map file is not empty, rename chromosomes first
+        if [ -s {input.chr_map} ]; then
+            bcftools annotate --threads {threads} --rename-chrs {input.chr_map} {input.vcf} -Ou | \
+            bcftools view --threads {threads} -t {CANONICAL_CHRS} -Ou | \
+            bcftools view --threads {threads} -e 'ALT="*"' -O z -o {output.vcf}
+        else
+            bcftools view --threads {threads} -t {CANONICAL_CHRS} {input.vcf} -Ou | \
+            bcftools view --threads {threads} -e 'ALT="*"' -O z -o {output.vcf}
+        fi
         """
 
 rule normalize_and_split:
-    input:
-        vcf="results/temp/01_selected.vcf.gz",
-        ref=lambda w: get_ref_fasta()
-    output: "results/temp/02_normalized.vcf.gz"
+    input: vcf="results/temp/01_selected.vcf.gz", ref="resources/hg38.fa"
+    output: vcf=intermediate("results/temp/02_normalized.vcf.gz")
+    threads: 4
     shell:
         """
-        bcftools norm --force -m -any -f {input.ref} -Ou {input.vcf} | \
-        bcftools view -e 'ALT="."' -Ou | \
-        bcftools +setGT -Ou -- -t q -i 'GT~"[2-9]"' -n . | \
-        bcftools view -O z -o {output}
-        tabix -p vcf {output}
+        bcftools norm --threads {threads} --force -m -any -f {input.ref} -Ou {input.vcf} | \
+        bcftools annotate --threads {threads} -x ID -I +'%CHROM:%POS:%REF:%ALT' -Ou | \
+        bcftools norm --threads {threads} --rm-dup exact -Oz -o {output.vcf}
         """
 
-rule download_selection_bed:
-    output: "resources/selection_targets.bed"
-    params: url=config.get("regions_bed")
-    shell:
-        """
-        echo "WARNING: downloading targets BED from internet." >&2
-        wget --tries=3 -O {output} {params.url}
-        """
 
 # --- QC Workflow ---
 
 rule generate_groups_raw:
     input: samples=config["sample_info"]
-    output: groups="results/temp/groups_raw.txt"
+    output:
+        groups="results/temp/groups_raw.txt"
     params: suffix="raw"
     shell:
         "python scripts/generate_groups.py {input.samples} {output.groups} --suffix {params.suffix}"
@@ -145,63 +147,82 @@ rule annotate_raw_vcf:
     input:
         vcf="results/temp/02_normalized.vcf.gz",
         groups="results/temp/groups_raw.txt"
-    output: vcf="results/temp/03_raw_stats.vcf.gz"
+    output:
+        vcf=intermediate("results/temp/03_raw_stats.vcf.gz"),
+        tbi=intermediate("results/temp/03_raw_stats.vcf.gz.tbi")
+    threads: 4
     shell:
         """
-        bcftools +fill-tags {input.vcf} -Ou -- \
-            -S {input.groups} \
-            -t AC,AN,AF,AC_Het,AC_Hom,AC_Hemi,MAF,HWE,NS,F_MISSING,ExcHet | \
-        bcftools view -O z -o {output.vcf}
-        tabix -p vcf {output.vcf}
+        bcftools +fill-tags --threads {threads} {input.vcf} -Ou -- -S {input.groups} -t AC,AN,AF,AC_Het,AC_Hom,AC_Hemi,MAF,HWE,NS,F_MISSING,ExcHet | \
+        bcftools view --threads {threads} -O z -o {output.vcf}
+        bcftools index --threads {threads} -t {output.vcf}
         """
 
 rule genotype_masking:
     input: "results/temp/03_raw_stats.vcf.gz"
-    output: "results/temp/04_masked.vcf.gz"
+    output:
+        vcf=intermediate("results/temp/04_masked.vcf.gz"),
+        tbi=intermediate("results/temp/04_masked.vcf.gz.tbi")
+    threads: 4
     params:
         min_gq=config["qc_thresholds"]["min_gq"],
         min_dp=config["qc_thresholds"]["min_dp"],
         min_ab=config["qc_thresholds"]["ab_ratio"],
-        max_ab=1 - config["qc_thresholds"]["ab_ratio"]
+        max_ab = 1 - config["qc_thresholds"]["ab_ratio"]
     shell:
         """
-        if bcftools view -h {input} | grep -q '##FORMAT=<ID=GQ'; then
-            bcftools +setGT {input} -O z -o {output} -- \
-                -t q -n . \
-                -i 'FMT/GQ < {params.min_gq} | FMT/DP < {params.min_dp} | \
-                    (GT="het" & (FMT/AD[*:0] + FMT/AD[*:1]) > 0 & \
-                    ((FMT/AD[*:1])/(FMT/AD[*:0]+FMT/AD[*:1]) < {params.min_ab} | \
-                     (FMT/AD[*:1])/(FMT/AD[*:0]+FMT/AD[*:1]) > {params.max_ab}))'
-        else
-            cp {input} {output}
-        fi
-        tabix -p vcf {output}
+        bcftools +setGT --threads {threads} {input} -O z -o {output.vcf} -- -t q -n . -i 'FMT/GQ < {params.min_gq} | FMT/DP < {params.min_dp} | (GT="het" & (FMT/AD[*:0] + FMT/AD[*:1]) > 0 & ((FMT/AD[*:1])/(FMT/AD[*:0]+FMT/AD[*:1]) < {params.min_ab} | (FMT/AD[*:1])/(FMT/AD[*:0]+FMT/AD[*:1]) > {params.max_ab}))'
+        bcftools index --threads {threads} -t {output.vcf}
         """
 
 rule generate_groups_final:
     input: samples=config["sample_info"]
-    output: groups="results/temp/groups_final.txt"
+    output:
+        groups="results/temp/groups_final.txt"
     params: suffix=""
     shell:
         "python scripts/generate_groups.py {input.samples} {output.groups}"
 
-rule annotate_final_vcf:
+rule fix_ploidy:
     input:
         vcf="results/temp/04_masked.vcf.gz",
-        groups="results/temp/groups_final.txt"
-    output: vcf="results/temp/05_final_stats.vcf.gz"
+        samples=config["sample_info"],
+        ploidy="resources/ploidy_rules.txt"
+    output:
+        vcf=intermediate("results/temp/05_ploidy_fixed.vcf.gz"),
+        tbi=intermediate("results/temp/05_ploidy_fixed.vcf.gz.tbi"),
+        sex_map="results/temp/sex_map.txt"
+    threads: 4
     shell:
         """
-        bcftools +fill-tags {input.vcf} -Ou -- \
-            -S {input.groups} \
-            -t AC,AN,AF,AC_Het,AC_Hom,AC_Hemi,MAF,HWE,NS,F_MISSING,ExcHet | \
-        bcftools view -O z -o {output.vcf}
-        tabix -p vcf {output.vcf}
+        # Cleanly generate the standardized sex map
+        python scripts/generate_sex_map.py {input.samples} {output.sex_map}
+
+        bcftools +fixploidy --threads {threads} {input.vcf} -Oz -o {output.vcf} -- -s {output.sex_map} -p {input.ploidy}
+        bcftools index --threads {threads} -t {output.vcf}
+        """
+
+rule annotate_final_vcf:
+    input:
+        vcf="results/temp/05_ploidy_fixed.vcf.gz",
+        groups="results/temp/groups_final.txt"
+    output:
+        vcf=intermediate("results/temp/06_final_stats.vcf.gz"),
+        tbi=intermediate("results/temp/06_final_stats.vcf.gz.tbi")
+    threads: 4
+    shell:
+        """
+        bcftools +fill-tags --threads {threads} {input.vcf} -Ou -- -S {input.groups} -t AC,AN,AF,AC_Het,AC_Hom,AC_Hemi,MAF,HWE,NS,F_MISSING,ExcHet | \
+        bcftools view --threads {threads} -O z -o {output.vcf}
+        bcftools index --threads {threads} -t {output.vcf}
         """
 
 rule variant_qc_tagging:
-    input: "results/temp/05_final_stats.vcf.gz"
-    output: "results/intermediate/{prefix}.full_sample_data.vcf.gz"
+    input: "results/temp/06_final_stats.vcf.gz"
+    output:
+        vcf="results/{prefix}.full_sample_data.vcf.gz",
+        tbi="results/{prefix}.full_sample_data.vcf.gz.tbi"
+    threads: 4
     params:
         qual=config["qc_thresholds"]["qual"],
         qd=config["qc_thresholds"]["qd"],
@@ -209,38 +230,43 @@ rule variant_qc_tagging:
         fs=config["qc_thresholds"]["fs"],
         readpos=config["qc_thresholds"]["readpos"],
         hwe=config["qc_thresholds"]["hwe"],
-        maf=config["qc_thresholds"]["maf"],
         max_missing=config["qc_thresholds"]["max_missing"],
         min_dp=config["qc_thresholds"]["min_dp"],
         min_gq=config["qc_thresholds"]["min_gq"],
         ab_ratio=config["qc_thresholds"]["ab_ratio"]
     shell:
         """
-        python scripts/tag_variant_qc.py {input} {output} \
+        python scripts/tag_variant_qc.py {input} {output.vcf} \
             --qual {params.qual} \
             --qd {params.qd} \
             --mq {params.mq} \
             --fs {params.fs} \
             --readpos {params.readpos} \
             --hwe {params.hwe} \
-            --maf {params.maf} \
             --max_missing {params.max_missing} \
             --min_dp {params.min_dp} \
             --min_gq {params.min_gq} \
             --ab_ratio {params.ab_ratio}
-        tabix -p vcf {output}
+        bcftools index --threads {threads} -t {output.vcf}
         """
 
 rule create_sites_vcf:
-    input: "results/intermediate/{prefix}.full_sample_data.vcf.gz"
+    input: "results/{prefix}.full_sample_data.vcf.gz"
     output:
         all_sites="results/{prefix}.sites.all.vcf.gz",
-        pass_sites="results/{prefix}.sites.pass.vcf.gz"
+        all_sites_tbi="results/{prefix}.sites.all.vcf.gz.tbi",
+        pass_sites="results/{prefix}.sites.pass.vcf.gz",
+        pass_sites_tbi="results/{prefix}.sites.pass.vcf.gz.tbi"
+    threads: 4
     shell:
         """
-        bcftools view -G -O z -o {output.all_sites} {input}
-        tabix -p vcf {output.all_sites}
+        bcftools view --threads {threads} -G -O z -o {output.all_sites} {input}
+        bcftools index --threads {threads} -t {output.all_sites}
 
-        bcftools view -G -i 'INFO/QC_STATUS="PASS"' {input} -O z -o {output.pass_sites}
-        tabix -p vcf {output.pass_sites}
+        # Filter for PASS status.
+        bcftools view --threads {threads} -G -i 'INFO/QC_STATUS="PASS"' {input} -O z -o {output.pass_sites}
+        bcftools index --threads {threads} -t {output.pass_sites}
+
+        # Fail if any REF/ALT allele would be rejected by Beacon (e.g. lowercase bases).
+        python scripts/check_beacon_alleles.py {output.pass_sites}
         """

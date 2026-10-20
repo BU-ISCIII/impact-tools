@@ -34,6 +34,7 @@ where possible.
 - Migrated Beacon dataset and variant ingestion from SSH/container-based operations to direct MongoDB and Beacon API access, including MongoDB-backed dataset flags, permissions and DUO terms. [#18](https://github.com/BU-ISCIII/impact-tools/pull/18)
 - Added ASCII banner with IMPaCT branding printed on CLI startup. [#19](https://github.com/BU-ISCIII/impact-tools/pull/19)
 - Added automatic per-VCF `populations.json` generation and validation for `beacon ingest variants`.
+- Updated the bundled `pgx_pilot` workflow to upstream `main` @ e8bb2d4 (sex-aware ploidy fix, chr mapping, rm-dup, PR #5, PR #6 `FAIL_AC`).
 
 ## [0.1.0] - 2026-05-21
 

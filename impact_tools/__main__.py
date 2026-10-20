@@ -1534,19 +1534,17 @@ def liftover_cmd(
     ),
 )
 @click.option(
-    "--prepare",
-    is_flag=True,
-    help="Prepare the workspace and generate the launcher script; do not execute or submit.",
-)
-@click.option(
     "--dry-run",
     is_flag=True,
-    help="Validate inputs and print the plan without writing any files.",
+    help=(
+        "Prepare the workspace and generate the launcher script, then stop: "
+        "do not execute (local) or submit (hpc)."
+    ),
 )
 @click.option(
     "--force",
     is_flag=True,
-    help="Remove existing workspace and start fresh.",
+    help="Remove an existing workspace and start fresh (needed to reuse a --release-id).",
 )
 @click.option(
     "--pypgx",
@@ -1605,7 +1603,6 @@ def pgx_cmd(
     output_dir: Path | None,
     ref_fasta: Path | None,
     pgx_image: str | None,
-    prepare: bool,
     dry_run: bool,
     force: bool,
     pypgx: bool,
@@ -1614,11 +1611,13 @@ def pgx_cmd(
 ) -> None:
     """Run the pgx_pilot AF/QC pipeline for a DRAGEN gVCF batch.
 
-    ref_fasta, output_dir and pgx_image are required: pass them via
-    --ref-fasta / --output-dir / --pgx-image, or set them under the beacon.pgx
-    namespace in ~/.impact_tools/extra_config.json. Remaining infrastructure
-    (glnexus_image, slurm settings, ...) is read from config. See the README
-    for the full config schema.
+    Only --ref-fasta is required (pass it, or set beacon.pgx.ref_fasta in
+    ~/.impact_tools/extra_config.json). For --executor local the pgx_pilot image
+    defaults to the public ghcr.io/genome-of-europe/pgx_pilot:latest; for hpc a
+    local .sif must be given via --pgx-image / beacon.pgx.pgx_image. output_dir
+    defaults to the current directory. Remaining infrastructure (glnexus_image,
+    slurm settings, ...) is read from config. The optional PyPGx sub-workflow is
+    enabled with --pypgx. See the README for the full config schema.
     """
     configure_module_logging(ctx, "beacon_pgx")
 
@@ -1670,6 +1669,10 @@ def pgx_cmd(
         or pgx_conf.get("executor")
         or get_config_value(configuration, "beacon.pgx.executor", "local")
     )
+    # For local (Docker), default to the public pgx_pilot image so --pgx-image is
+    # optional. For hpc a local .sif is required, so there is no default.
+    if pgx_image_raw is None and resolved_executor == "local":
+        pgx_image_raw = beacon_pgx.PGX_DEFAULT_DOCKER_IMAGE
     pgx_image: Path | None = (
         Path(pgx_image_raw).expanduser().resolve()
         if pgx_image_raw is not None and resolved_executor == "hpc"
@@ -1705,7 +1708,8 @@ def pgx_cmd(
     if ref_fasta is None:
         missing.append("--ref-fasta / beacon.pgx.ref_fasta")
     if pgx_image is None:
-        missing.append("--pgx-image / beacon.pgx.pgx_image")
+        # Only reachable for --executor hpc (local defaults to the public image).
+        missing.append("--pgx-image / beacon.pgx.pgx_image (.sif required for hpc)")
     if missing:
         raise click.UsageError(
             "Required values are missing. Pass them on the command line, or add "
@@ -1743,7 +1747,6 @@ def pgx_cmd(
         snakemake_jobs=snakemake_jobs,
         no_pypgx=not pypgx,
         no_report=no_report,
-        prepare=prepare,
         dry_run=dry_run,
         force=force,
         cleanup_temp=cleanup_temp,
@@ -1768,33 +1771,19 @@ def pgx_cmd(
     log.info("  Output dir:  %s", config.workspace)
 
     try:
-        if dry_run:
-            # Validate but do not write anything
-            plan_warnings = beacon_pgx.validate_pre_job(config)
-            batch = beacon_pgx.build_batch(config)
-            log.info("[dry-run] Batch plan for %r: %d sample(s)", release_id, len(batch.samples))
-            for s in batch.samples:
-                log.info("  %s  sex=%s  country=%s", s.sample_id, s.sex, s.country_code)
-            log.info("[dry-run] No files written.")
-            return
-        
         batch, execution_script_path = beacon_pgx.plan_batch(config)
         status = "planned"
 
         log.info("Workspace:        %s", batch.workspace)
         log.info("Execution script: %s", execution_script_path)
+        log.info("Batch plan for %r: %d sample(s)", release_id, len(batch.samples))
+        for s in batch.samples:
+            log.info("  %s  sex=%s  country=%s", s.sample_id, s.sex, s.country_code)
 
-        if prepare:
-            if resolved_executor == "hpc":
-                log.info(
-                    "--prepare: workspace ready. Submit with: sbatch %s",
-                    execution_script_path,
-                )
-            else:
-                log.info(
-                    "--prepare: workspace ready. Run with: bash %s",
-                    execution_script_path,
-                )
+        if dry_run:
+            verb = "Submit with: sbatch" if resolved_executor == "hpc" else "Run with: bash"
+            log.info("--dry-run: workspace ready, not executed. %s %s",
+                     verb, execution_script_path)
             return
 
         if resolved_executor == "hpc":

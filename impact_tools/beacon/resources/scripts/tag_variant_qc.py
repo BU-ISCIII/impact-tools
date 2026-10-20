@@ -39,6 +39,32 @@ def _any_above(value: Any, threshold: float) -> bool:
     return any(item > threshold for item in _numeric_values(value))
 
 
+def _all_positive(value: Any) -> bool:
+    """Return True only when every available value is numeric and above zero.
+
+    Returns False when the value is missing, empty, non-numeric, or has any
+    element <= 0. Used to flag AC: genotype masking and ploidy fixing can remove
+    every ALT call (AC = 0), leaving an allele that no sample carries. Such sites
+    must not be exported to sites.pass.
+    """
+    if value is None:
+        return False
+
+    raw_values = value if isinstance(value, (tuple, list)) else (value,)
+
+    if not raw_values:
+        return False
+
+    for item in raw_values:
+        try:
+            if item is None or float(item) <= 0:
+                return False
+        except (TypeError, ValueError):
+            return False
+
+    return True
+
+
 def validate_thresholds(
     *,
     qual: float,
@@ -46,7 +72,6 @@ def validate_thresholds(
     mq: float,
     fs: float,
     hwe: float,
-    maf: float,
     min_dp: int,
     min_gq: int,
     ab_ratio: float,
@@ -69,9 +94,6 @@ def validate_thresholds(
 
     if not 0 <= hwe <= 1:
         errors.append("--hwe must be between 0 and 1.")
-
-    if not 0 <= maf <= 0.5:
-        errors.append("--maf must be between 0 and 0.5.")
 
     if min_dp < 0:
         errors.append("--min_dp must be >= 0.")
@@ -102,7 +124,6 @@ def tag_variant_qc(
     fs: float,
     readpos: float,
     hwe: float,
-    maf: float,
     min_dp: int,
     min_gq: int,
     ab_ratio: float,
@@ -119,8 +140,13 @@ def tag_variant_qc(
     - INFO/ReadPosRankSum
     - INFO/DP
     - INFO/HWE
-    - INFO/MAF
     - INFO/F_MISSING
+    - INFO/AC
+
+    MAF is still computed by bcftools +fill-tags and declared in the header, but
+    it is no longer used as a QC filter (upstream set the AF cutoff to 0.0).
+    Frequency-based exclusion is handled instead by FAIL_AC, which drops only
+    variants with no alternate allele left in the cohort (AC = 0 or absent).
 
     Genotype-level GQ, DP and allele-balance masking is performed earlier by
     the Snakefile. ``min_gq`` and ``ab_ratio`` are accepted here to preserve
@@ -132,7 +158,6 @@ def tag_variant_qc(
         mq=mq,
         fs=fs,
         hwe=hwe,
-        maf=maf,
         min_dp=min_dp,
         min_gq=min_gq,
         ab_ratio=ab_ratio,
@@ -234,14 +259,17 @@ def tag_variant_qc(
                 if "HWE" in info and _any_below(info["HWE"], hwe):
                     reasons.append("FAIL_HWE")
 
-                if "MAF" in info and _any_below(info["MAF"], maf):
-                    reasons.append("FAIL_MAF")
-
                 if (
                     "F_MISSING" in info
                     and _any_above(info["F_MISSING"], max_missing)
                 ):
                     reasons.append("FAIL_MISSING")
+
+                # Genotype masking and ploidy fixing can remove every ALT call
+                # (AC = 0, or AC absent). Such alleles are not observed in the
+                # cohort and must never reach sites.pass.
+                if not _all_positive(info.get("AC")):
+                    reasons.append("FAIL_AC")
 
                 if reasons:
                     record.info["QC_STATUS"] = ",".join(reasons)
@@ -277,7 +305,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fs", type=float, default=60.0)
     parser.add_argument("--readpos", type=float, default=-8.0)
     parser.add_argument("--hwe", type=float, default=1e-6)
-    parser.add_argument("--maf", type=float, default=0.0)
     parser.add_argument("--min_dp", type=int, default=10)
     parser.add_argument("--min_gq", type=int, default=20)
     parser.add_argument("--ab_ratio", type=float, default=0.2)
@@ -298,7 +325,6 @@ def main() -> None:
         fs=args.fs,
         readpos=args.readpos,
         hwe=args.hwe,
-        maf=args.maf,
         min_dp=args.min_dp,
         min_gq=args.min_gq,
         ab_ratio=args.ab_ratio,

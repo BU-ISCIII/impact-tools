@@ -1,0 +1,62 @@
+name: pgx_pilot release watcher
+
+# Notify (via a tracking issue) when upstream pgx_pilot publishes a new tag or
+# release, so we can evaluate re-pinning the bundled workflow to a stable version.
+
+on:
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  check-release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      UPSTREAM: Genome-of-Europe/pgx_pilot
+    steps:
+      - name: Open a tracking issue when a new tag/release appears
+        run: |
+          set -euo pipefail
+
+          # Prefer the latest published release; fall back to the newest tag.
+          latest=$(gh api "repos/$UPSTREAM/releases/latest" --jq '.tag_name' 2>/dev/null || true)
+          if [ -z "${latest:-}" ]; then
+            latest=$(gh api "repos/$UPSTREAM/tags" --jq '.[0].name // empty')
+          fi
+
+          if [ -z "${latest:-}" ]; then
+            echo "Upstream has no tags/releases yet; nothing to do."
+            exit 0
+          fi
+          echo "Latest upstream tag/release: $latest"
+
+          title="chore(pgx): new pgx_pilot release $latest available"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state all \
+            --search "in:title \"$latest\"" --json number --jq 'length')
+
+          if [ "$existing" != "0" ]; then
+            echo "Issue for $latest already exists; nothing to do."
+            exit 0
+          fi
+
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$(cat <<EOF
+          Upstream \`$UPSTREAM\` published **$latest**.
+
+          The bundled pgx_pilot workflow is pinned via \`PGX_PILOT_COMMIT\` in
+          \`impact_tools/beacon/pgx.py\`. Evaluate re-pinning the bundle to this
+          release:
+
+          - [ ] Review the release notes / diff against our current pin.
+          - [ ] Re-vendor the bundled \`Snakefile\`, \`Snakefile.pypgx\` and
+            \`scripts/\` as needed, preserving our documented local divergences.
+          - [ ] Update \`PGX_PILOT_COMMIT\`.
+          - [ ] Re-run \`pytest\` and a \`beacon pgx --dry-run\` smoke test.
+
+          Opened automatically by \`.github/workflows/pgx-pilot-new-release.yml\`.
+          EOF
+          )"
+          echo "Tracking issue created for $latest."

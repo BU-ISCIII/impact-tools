@@ -407,26 +407,26 @@ The command first checks genome builds of all input VCFs. If all are already GRC
 
 Runs the pgx_pilot AF/QC pipeline over a cohort of DRAGEN gVCF files. It performs joint genotyping with GLnexus, validates the resulting multi-sample VCF, and executes the Snakemake AF/QC (and optional PyPGx) workflows inside a container.
 
-With `--executor local` the pipeline runs directly via Docker. With `--executor hpc` an `sbatch` script is generated for SLURM using Singularity; submit it manually (or with `--prepare` it is only written, not submitted).
+With `--executor local` the pipeline runs directly via Docker (the pgx_pilot image defaults to `ghcr.io/genome-of-europe/pgx_pilot:latest`). With `--executor hpc` an `sbatch` script is generated for SLURM using Singularity; submit it manually (or with `--dry-run` it is only written, not submitted).
 
 ```bash
-# Prepare the workspace and launcher without running/submitting
+# Run locally (Docker); pgx_image defaults to the public ghcr image
 impact-tools beacon pgx \
   --samples-tsv /data/IMPACT_BATCH_001.samples.tsv \
   --gvcf-dir /data/gvcfs/ \
-  --executor hpc \
-  --prepare
+  --ref-fasta /refs/GRCh38.fa
 
-# Pass gVCF paths explicitly instead of a directory scan
+# Prepare the workspace + launcher without running/submitting (e.g. for local execution in WS)
 impact-tools beacon pgx \
   --samples-tsv /data/IMPACT_BATCH_001.samples.tsv \
   --gvcf-list /data/batch001.list \
-  --prepare
+  --executor local \
+  --dry-run
 ```
 
-Exactly one gVCF source is required: `--gvcf-dir` (recursive scan for `*.hard-filtered.gvcf.gz`) or `--gvcf-list` (explicit `sample_id<TAB>path` file). `--release-id` is auto-derived from the TSV filename when omitted (e.g. `IMPACT_BATCH_001.samples.tsv` → `IMPACT_BATCH_001`).
+Exactly one gVCF source is required: `--gvcf-dir` (recursive scan for `*.hard-filtered.gvcf.gz`) or `--gvcf-list` (explicit `sample_id<TAB>path` file). `--release-id` is auto-derived from the TSV filename when omitted (e.g. `IMPACT_BATCH_001.samples.tsv` → `IMPACT_BATCH_001`); each run is a release numbered `<base>_BATCHNNN`.
 
-`ref_fasta`, `output_dir` and `pgx_image` are required; each may be provided via its CLI flag or under the `beacon.pgx` config namespace. Remaining infrastructure (`glnexus_image`, `slurm` settings, ...) is read from config.
+Only `--ref-fasta` is required (or `beacon.pgx.ref_fasta`). For `--executor local` the pgx_pilot image defaults to the public ghcr image; for `--executor hpc` a local `.sif` must be given via `--pgx-image` / `beacon.pgx.pgx_image`. `output_dir` defaults to the current directory. Remaining infrastructure (`glnexus_image`, `slurm` settings, ...) is read from config.
 
 ### Key options
 
@@ -438,22 +438,22 @@ Exactly one gVCF source is required: `--gvcf-dir` (recursive scan for `*.hard-fi
 | `--release-id` | Release identifier. Auto-derived from the `--samples-tsv` filename if omitted. |
 | `--executor` | `local` (Docker) or `hpc` (SLURM sbatch via Singularity). Defaults to `beacon.pgx.executor`, else `local`. |
 | `--ref-fasta` | Reference genome FASTA. Required (or set `beacon.pgx.ref_fasta`). |
-| `--pgx-image` | pgx_pilot container image: a `.sif` path for `--executor hpc`, or a Docker image reference for `--executor local`. Required (or set `beacon.pgx.pgx_image`). |
+| `--pgx-image` | pgx_pilot container image. Optional for `--executor local` (defaults to `ghcr.io/genome-of-europe/pgx_pilot:latest`); a `.sif` path is required for `--executor hpc`. May be set via `beacon.pgx.pgx_image`. |
 | `-o/--output-dir` | Root output directory (`pgx_runs/` is created inside). Defaults to `beacon.pgx.output_dir`, else current directory. |
-| `--prepare` | Prepare the workspace and launcher script; do not execute or submit. |
-| `--dry-run` | Validate inputs and print the plan without writing any files. |
-| `--force` | Remove an existing workspace and start fresh. |
-| `--pypgx` | Enable the optional PyPGx pharmacogenomics sub-workflow. |
+| `--dry-run` | Prepare the workspace and launcher script, then stop. |
+| `--force` | Remove an existing workspace and start fresh (needed to reuse a `--release-id`). |
+| `--pypgx` | Enable the optional PyPGx pharmacogenomics sub-workflow (PyPGx v0.27.0; downloads its bundle from GitHub, so the running node needs internet). |
 | `--cleanup` | Remove the `results/temp` scratch intermediates after a successful run (prompts unless `--force`). |
 | `--no-report` | Skip HTML report generation (metrics JSON always written). |
 
 ### What the generated script does
 
-1. **GLnexus joint genotyping** — all gVCFs are merged into a single multi-sample VCF.
+1. **GLnexus joint genotyping** — all gVCFs are joint-genotyped into a single multi-sample VCF, restricted to the bundled pharmacogene `targets.bed`.
 2. **Sample validation** — the VCF sample list is diffed against `expected_samples.txt`; the script aborts on mismatch.
-3. **Snakemake AF/QC pipeline** — normalisation, masking, allele-frequency calculation and QC tagging, producing a sites-only PASS VCF ready for Beacon ingestion.
-4. **PyPGx** (optional, `--pypgx`) — per-sample pharmacogenomic allele, genotype and phenotype calls.
-5. **Cleanup** (optional, `--cleanup`) — removes the `results/temp` scratch intermediates. Runs only after the steps above succeed, so failures leave the temp files in place for debugging.
+3. **Resource staging** — verbatim upstream files (`ploidy_rules.txt`, `generate_sex_map.py`, and the PyPGx gene list/scripts when `--pypgx`) are copied out of the pinned pgx_pilot image into the workspace.
+4. **Snakemake AF/QC pipeline** — chromosome-name harmonisation, normalisation + exact-duplicate removal, allele-frequency/HWE/missingness tagging, genotype masking, sex-aware ploidy correction (`bcftools +fixploidy`), and variant QC tagging. Sites with no observed alternate allele after masking are tagged `FAIL_AC` and kept out of `sites.pass`. The exported `sites.pass` is checked for Beacon-invalid (e.g. lowercase) alleles and the run fails if any are found. Produces a sites-only PASS VCF ready for Beacon ingestion.
+5. **PyPGx** (optional, `--pypgx`) — per-sample pharmacogenomic allele, genotype and phenotype calls.
+6. **Cleanup** (optional, `--cleanup`) — removes the `results/temp` scratch intermediates. Runs only after the steps above succeed, so failures leave the temp files in place for debugging.
 
 ### Artifacts
 
@@ -470,8 +470,8 @@ Exactly one gVCF source is required: `--gvcf-dir` (recursive scan for `*.hard-fi
     slurm/pgx_<release_id>.sbatch        ← .sh for --executor local
     data/<release_id>.joint.vcf.gz       ← GLnexus multi-sample VCF
     results/<release_id>.sites.pass.vcf.gz   ← sites-only, PASS QC, with AF (Beacon-ready)
-    results/<release_id>.sites.all.vcf.gz    ← sites-only, all variants
-    results/intermediate/<release_id>.full_sample_data.vcf.gz
+    results/<release_id>.sites.all.vcf.gz    ← sites-only, all variants (incl. FAIL_* tagged)
+    results/<release_id>.full_sample_data.vcf.gz   ← per-sample genotypes with QC_STATUS
     results/pgx/                         ← PyPGx CSVs (when --pypgx is used)
     logs/                                ← SLURM stdout/stderr, metrics JSON and HTML report
 ```
