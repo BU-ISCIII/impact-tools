@@ -193,6 +193,49 @@ def mongo_import_datasets(
     return result.upserted_count
 
 
+def mongo_replace_dataset_documents(
+    database: Database,
+    collection: str,
+    dataset_id: str,
+    local_json: Path,
+) -> int:
+    """Replace a dataset's documents in one entity collection.
+
+    The dataset's existing documents are deleted and those of ``local_json``
+    inserted, so re-running an ingest never duplicates them. Every document
+    must belong to ``dataset_id``; this is checked before anything is deleted.
+    Returns the number of inserted documents.
+    """
+
+    documents = json.loads(local_json.read_text(encoding="utf-8"))
+
+    if not isinstance(documents, list):
+        raise ValueError(f"Expected a JSON array in {local_json}.")
+
+    for index, document in enumerate(documents, start=1):
+        if not isinstance(document, dict) or document.get("datasetId") != dataset_id:
+            raise ValueError(
+                f"{collection} entry {index} in {local_json} does not "
+                f"belong to dataset '{dataset_id}'."
+            )
+
+    deleted = database[collection].delete_many(
+        {"datasetId": dataset_id}
+    ).deleted_count
+
+    if documents:
+        database[collection].insert_many(documents)
+
+    LOGGER.info(
+        "%s: %d deleted, %d inserted",
+        collection,
+        deleted,
+        len(documents),
+    )
+
+    return len(documents)
+
+
 def mongo_count_variants(
     database: Database,
     dataset_id: str,
