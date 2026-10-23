@@ -132,7 +132,9 @@ Current focus:
 5. Infer sample sex from non-ref chrY variant counts.
 6. Prepare per-sample pgx_pilot workspaces (symlinks, config, samples.tsv).
 7. Run the pgx_pilot Snakemake pipeline via Docker to produce sites-only VCFs.
-8. Register Beacon datasets end-to-end: generate dataset artifacts locally,
+8. Build the RI-tools metadata CSVs (individuals, biosamples, runs, analyses,
+   cohorts, datasets) from DRAGEN output, for dataset ingestion.
+9. Register Beacon datasets end-to-end: generate dataset artifacts locally,
    import dataset metadata into MongoDB, store dataset flags and permissions in
    MongoDB, register dataset-scoped DUO filtering terms, and verify dataset
    visibility via `/api/datasets`.
@@ -156,14 +158,19 @@ impact-tools beacon pgx
         |  pgx_runs/<release_id>/      (shared workspace)
         |  <release_id>.sites.pass.vcf.gz  (Beacon-ready, PASS QC, with AF)
         v
-impact-tools beacon ingest dataset
+impact-tools beacon prepare-metadata   (reads the same DRAGEN output batch)
         |
-        |  datasets.csv                (dataset metadata)
-        |  datasets.json               (BFF for MongoDB import)
+        |  individuals.csv biosamples.csv runs.csv analyses.csv
+        |  cohorts.csv datasets.csv    (full RI-tools template columns)
+        v
+impact-tools beacon ingest dataset   (--metadata-dir <csv dir>)
+        |
+        |  datasets.csv / datasets.json (dataset metadata, BFF import)
         |  db.datasets                 (dataset metadata)
         |  db.datasetsConf             (isTest / isSynthetic flags)
         |  db.datasetsPermissions      (access level and granularity)
         |  db.filtering_terms          (dataset-scoped DUO terms)
+        |  db.cohorts individuals runs analyses   (from --metadata-dir)
         v
 Beacon dataset registered (visible via /api/datasets)
         |
@@ -365,10 +372,59 @@ successful run (prompts for confirmation unless `--force` is given).
 | `pgx_runs/<release_id>/logs/` | SLURM stdout/stderr, metrics JSON and HTML report. |
 
 
+### Prepare Metadata from DRAGEN Output
+
+The `beacon prepare-metadata` command builds the RI-tools metadata CSVs
+(`individuals`, `biosamples`, `runs`, `analyses`, plus `cohorts` and
+`datasets`) from a batch of DRAGEN germline output folders, one per sample.
+Its output feeds `beacon ingest dataset --metadata-dir`, which loads the
+`cohorts`, `individuals`, `runs` and `analyses` documents into MongoDB
+alongside the dataset.
+
+```bash
+impact-tools beacon prepare-metadata \
+  -i /path/to/dragen_batch/ \
+  --sample-list samples.txt \
+  -o /path/to/metadata_out/
+```
+
+`-i/--input-dir` must contain one DRAGEN output folder per sample
+(`<input-dir>/<sample_id>/`); `--sample-list` lists one sample ID per line.
+Each CSV is written with the **full RI-tools template columns**: the command
+fills what it can derive from DRAGEN and leaves every other column empty, to be
+completed by hand before ingest.
+
+Values derived per sample from DRAGEN:
+
+- `karyotypicSex` from `*.ploidy_estimation_metrics.csv`, and `sex` inferred from it.
+- `libraryLayout` from `*.mapping_metrics.csv`.
+- `runDate` / `analysisDate` from the DRAGEN date in the `*.hard-filtered.vcf.gz` header.
+- run / analysis `info` (QC metrics, enabled DRAGEN modules) from the mapping and coverage CSVs and the `*-replay.json` command line.
+
+Fields DRAGEN does not record are set to fixed project defaults:
+`libraryStrategy=WGS`, `librarySelection=RANDOM`, `librarySource=genomic source`,
+`platform=Illumina`, `cohortType=study-defined`. If a sample was run with
+`--vc-target-bed` (targeted/exome calling, i.e. not WGS), the command logs a
+warning so the hardcoded `WGS` can be reviewed.
+
+Column names and allowed values were taken from the RI-tools CSV templates and
+the GA4GH Beacon v2 models/enumerations of
+[beacon2-ri-tools-v2](https://github.com/BU-ISCIII/beacon2-ri-tools-v2) and
+[beacon2-pi-api](https://github.com/BU-ISCIII/beacon2-pi-api) (BU-ISCIII).
+
+> **Where to run it.** `prepare-metadata` only reads local DRAGEN files and
+> writes CSVs — no network — so it is best run **on the VM** where the DRAGEN
+> output lives, and the generated CSV directory then copied to the place where 
+> running `ingest dataset` and `ingest variants`.
+
 ### Register Beacon Datasets into MongoDB
 
 The `beacon ingest dataset` command registers dataset metadata in the Beacon v2
-deployment using direct MongoDB and Beacon API access.
+deployment using direct MongoDB and Beacon API access. When
+`--metadata-dir <csv dir>` points at the output of `beacon prepare-metadata`,
+it also loads that dataset's `cohorts`, `individuals`, `runs` and `analyses`
+documents into MongoDB (`biosamples` is skipped: its required
+`biosampleStatus`/`sampleOriginType` are not available from DRAGEN).
 
 The command:
 
@@ -376,8 +432,8 @@ The command:
 2. Imports the dataset document into `db.datasets`.
 3. Stores dataset flags in `db.datasetsConf`.
 4. Stores dataset permissions in `db.datasetsPermissions`.
-5. Injects DUO data-use conditions into `dataUseConditions.duoDataUse` when
-   `--duo-code` is provided.
+5. Collects DUO data-use conditions for `dataUseConditions.duoDataUse` from the
+   `--metadata-dir` `datasets.csv` columns and/or `--duo-code`, combining both.
 6. Upserts dataset-scoped DUO terms into `db.filtering_terms`.
 7. Verifies that the dataset is visible through `/api/datasets`.
 
@@ -407,7 +463,8 @@ impact-tools beacon ingest dataset \
   --set-permissions public \
   --duo-code DUO:0000042
 ```
-`--duo-code` is repeatable when more than one DUO term applies.
+`--duo-code` is repeatable, and combines with any DUO terms already present in
+the `--metadata-dir` `datasets.csv`.
 
 The command writes dataset-specific working files under `<base-dir>/config/`,
 `<base-dir>/work/` and `<base-dir>/inputs/`. It also writes a metrics JSON file

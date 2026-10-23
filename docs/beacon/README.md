@@ -15,6 +15,7 @@ DATASET["Register dataset in MongoDB"]
 VARIANTS["Ingest variants into a dataset"]
 LIFTOVER["VCF liftover"]
 PGX["PGx AF/QC pipeline"]
+METADATA["Prepare metadata CSVs (DRAGEN → RI-tools CSVs)"]
 
 SERVICES["Shared services: MongoDB, Beacon API, RI-tools, Registry"]
 RESOURCES["Resources: Snakefile and templates"]
@@ -23,9 +24,12 @@ REPORTS["Reports and validation"]
 CLI --> |"impact-tools beacon ingest"| INGEST
 CLI --> |"impact-tools beacon liftover"| LIFTOVER
 CLI --> |"impact-tools beacon pgx"| PGX
+CLI --> |"impact-tools beacon prepare-metadata"| METADATA
 
 INGEST --> |"dataset"| DATASET
 INGEST --> |"variants"| VARIANTS
+
+METADATA --> |"--metadata-dir CSVs"| DATASET
 
 DATASET --> SERVICES
 VARIANTS --> SERVICES
@@ -184,6 +188,61 @@ The generic Beacon filtering-terms extractor is **not** run by impact-tools. Onl
 | `--run-profile` | `liftover`, `ingest` | Execution environment label (`local`, `ws`, `hpc`) recorded in metrics. Does not affect execution. Can also be set via `beacon.execution.profile` in the config file. On `ingest` it is set on the group: `impact-tools beacon ingest --run-profile ws variants ...`. |
 
 
+## Metadata preparation
+
+Builds the RI-tools metadata CSVs from a batch of DRAGEN germline output folders (one per sample). The output is consumed by `ingest dataset --metadata-dir` to load `cohorts`, `individuals`, `runs` and `analyses` documents into MongoDB alongside the dataset.
+
+```bash
+impact-tools beacon prepare-metadata \
+  -i /path/to/dragen_batch/ \
+  --sample-list samples.txt \
+  -o /path/to/metadata_out/
+```
+
+Each CSV (`datasets`, `cohorts`, `individuals`, `biosamples`, `runs`, `analyses`) is written with the **full RI-tools template columns**. The command fills the values it can derive from DRAGEN and leaves every other column empty, for manual completion before ingest.
+
+This step is optional. The minimal fields required by the API for datasets (`dataset_id` and `name`) are still requested in the `ingest dataset` step.
+
+### Where to run it
+
+`prepare-metadata` only reads local DRAGEN files and writes CSVs, it needs no network, so ideally it should be run where the DRAGEN output lives (**on the VM**), and the generated CSV directory can be then copied to the location where `ingest dataset` and `ingest variants` will be run.
+
+### Field provenance
+
+Derived per sample from DRAGEN:
+
+| Field | Source |
+|---|---|
+| `karyotypicSex`, `sex` | `*.ploidy_estimation_metrics.csv` (sex inferred from karyotype) |
+| `libraryLayout` | `*.mapping_metrics.csv` |
+| `runDate` / `analysisDate` | DRAGEN date in the `*.hard-filtered.vcf.gz` header |
+| run / analysis `info` | QC metrics (`*.mapping_metrics.csv`, `*.wgs_coverage_metrics.csv`) and enabled modules from `*-replay.json` |
+
+Fixed project defaults (not recorded by DRAGEN): `libraryStrategy=WGS`, `librarySelection=RANDOM`, `librarySource=genomic source` (`GENEPIO:0001966`), `platform=Illumina`, `cohortType=study-defined`, `cohortDataTypes=whole genome sequencing assay` (`OBI:0002117`). When a sample's `*-replay.json` command line contains `--vc-target-bed` (targeted/exome calling, not WGS), the command logs a warning so the hardcoded `WGS` can be reviewed.
+
+Column names and allowed values follow the RI-tools CSV templates and the GA4GH Beacon v2 models/enumerations of [beacon2-ri-tools-v2](https://github.com/BU-ISCIII/beacon2-ri-tools-v2) and [beacon2-pi-api](https://github.com/BU-ISCIII/beacon2-pi-api) (BU-ISCIII).
+
+### Key options
+
+| Option | Description |
+|---|---|
+| `-i/--input-dir` | Directory with one DRAGEN output folder per sample (`<input-dir>/<sample_id>/`). Required. |
+| `--sample-list` | Text file of sample IDs, one per line. Required. |
+| `-o/--output-dir` | Directory where the CSVs are written. Required. |
+
+### Artifacts
+
+```
+<output-dir>/
+  datasets.csv      ← id/name/description filled by `ingest dataset`
+  cohorts.csv
+  individuals.csv
+  biosamples.csv    ← generated, but not loaded by ingest (see below)
+  runs.csv
+  analyses.csv
+```
+
+
 ## Dataset ingestion
 
 Registers a new dataset in the Beacon deployment using direct MongoDB and Beacon API access. Must be run before variant ingestion.
@@ -213,7 +272,7 @@ impact-tools beacon ingest dataset \
    work/<dataset_id>/
    inputs/<dataset_id>/
    ```
-3. **Generates `datasets.json`** by replicating the `csv_to_bff.py` hashing logic from beacon2-ri-tools-v2 (`_id = sha256(dataset_id + id)`). When `--duo-code` is given, `dataUseConditions.duoDataUse` is injected into the document.
+3. **Generates `datasets.json`** by replicating the `csv_to_bff.py` hashing logic from beacon2-ri-tools-v2 (`_id = sha256(dataset_id + id)`). `dataUseConditions.duoDataUse` is populated from the `--metadata-dir` `datasets.csv` columns and/or `--duo-code`.
 4. **Imports `datasets.json` into `db.datasets`** via PyMongo (`$setOnInsert` upsert — existing documents are never overwritten).
 5. **Verifies** that the document is present in the `datasets` collection.
 6. **Stores dataset flags** `isTest`/`isSynthetic` in `db.datasetsConf`.
@@ -238,7 +297,8 @@ No SSH access, remote `podman exec`, remote YAML edits or API container restart 
 | `--set-email` | Controlled-user e-mail. Only used with `--set-permissions controlled`. |
 | `--is-test` | Mark the dataset as a test dataset: `y`/`n` (default: `n`). Stored in `db.datasetsConf`. |
 | `--is-synthetic` | Flag marking the dataset as synthetic. Stored in `db.datasetsConf`. |
-| `--duo-code` | Data Use Ontology code (e.g. `DUO:0000042`). Repeatable. Labels are resolved automatically. |
+| `--duo-code` | Data Use Ontology code (e.g. `DUO:0000042`). Repeatable. Combined with any DUO terms in the `--metadata-dir` `datasets.csv`. Labels resolved automatically. |
+| `--metadata-dir` | Directory of `beacon prepare-metadata` CSVs. Loads the dataset's `cohorts`, `individuals`, `runs` and `analyses` into MongoDB (`biosamples` is skipped). |
 | `--base-dir` | Working directory where config files and logs are written (default: current directory). |
 | `--dry-run` | Validate inputs and build the execution plan without writing files, metrics, reports or MongoDB records. |
 

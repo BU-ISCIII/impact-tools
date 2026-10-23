@@ -291,7 +291,8 @@ def run_csv_to_bff(config: CsvToBffConfig) -> Path:
 
     Currently only `entity == 'datasets'` is supported. Replicates the `_id`
     hashing logic of ri-tools' csv_to_bff.py so the output is interchangeable
-    with what the upstream CLI would produce.
+    with what the upstream CLI would produce. Each row becomes a document
+    through :func:`impact_tools.beacon.metadata.dataset_document`.
 
     Returns
     -------
@@ -312,17 +313,161 @@ def run_csv_to_bff(config: CsvToBffConfig) -> Path:
     with config.input_csv.open(newline="") as f:
         rows = list(csv.DictReader(f))
 
+    # Imported here: metadata imports this module.
+    from impact_tools.beacon.metadata import dataset_document
+
     docs = []
     for row in rows:
-        row["_id"] = get_hash(config.dataset_id + row["id"])
-        docs.append(row)
+        doc = dataset_document(row)
+        doc["_id"] = get_hash(config.dataset_id + row["id"])
+        docs.append(doc)
 
     output_path.write_text(json.dumps(docs, indent=2))
     return output_path
 
 
+# Metadata entities loaded by `ingest dataset --metadata-dir`. biosamples is
+# not loaded: its required biosampleStatus/sampleOriginType are not available.
+METADATA_ENTITIES = ("cohorts", "individuals", "runs", "analyses")
+
+
+def run_metadata_csv_to_bff(
+    *,
+    entity: str,
+    input_csv: Path,
+    output_dir: Path,
+    dataset_id: str,
+) -> Path:
+    """Convert one metadata CSV with RI-tools csv_to_bff and restore ``info``.
+
+    csv_to_bff runs ``parse_args()`` at import time, so it is launched as a
+    subprocess. It builds documents from its deref schema, where free-form
+    objects (``info``, cohort ``distribution``) are empty, so those columns
+    are silently dropped, and it stores cohort counts as strings or floats.
+    Those values are restored from the CSV and every document is
+    re-validated with the RI-tools model.
+
+    Returns the path of the generated ``<entity>.json``.
+    """
+    if entity not in METADATA_ENTITIES:
+        raise ValueError(f"Unsupported metadata entity: {entity}")
+
+    if not input_csv.is_file():
+        raise FileNotFoundError(f"Metadata CSV not found: {input_csv}")
+
+    spec = importlib.util.find_spec("csv_to_bff")
+    if spec is None or not spec.origin:
+        raise RuntimeError(
+            "Could not locate the installed beacon2-ri-tools-v2 "
+            "'csv_to_bff' module."
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            spec.origin,
+            "-i",
+            str(input_csv),
+            "-e",
+            entity,
+            "-d",
+            dataset_id,
+            "-o",
+            str(output_dir),
+        ],
+        cwd=output_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"RI-tools csv_to_bff failed for {entity}.\n"
+            f"Input CSV: {input_csv}\n"
+            f"Exit code: {completed.returncode}\n"
+            f"STDERR: {completed.stderr}"
+        )
+
+    output_json = output_dir / f"{entity}.json"
+    documents = json.loads(output_json.read_text(encoding="utf-8"))
+
+    with input_csv.open(newline="", encoding="utf-8") as f:
+        rows_by_id = {row["id"]: row for row in csv.DictReader(f)}
+
+    model = _ritools_model(entity)
+    for document in documents:
+        _restore_dropped_fields(entity, document, rows_by_id[document["id"]])
+        try:
+            model(**{
+                key: value
+                for key, value in document.items()
+                if key not in ("_id", "datasetId")
+            })
+        except ValueError as exc:
+            raise ValueError(
+                f"{entity} '{document['id']}' is not valid for RI-tools: {exc}"
+            ) from exc
+
+    output_json.write_text(
+        json.dumps(documents, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return output_json
+
+
+def ritools_csv_headers(entity: str) -> list[str]:
+    """Return the CSV columns RI-tools accepts for ``entity``.
+
+    Read from the installed ``files/headers/<entity>.txt``, the list
+    csv_to_bff checks every header against (same columns as
+    ``csv/templates/<entity>.csv``).
+    """
+    from importlib import resources
+
+    text = resources.files("files.headers").joinpath(f"{entity}.txt").read_text(
+        encoding="utf-8"
+    )
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _restore_dropped_fields(entity: str, document: dict, row: dict[str, str]) -> None:
+    """Put back the values csv_to_bff drops or mistypes (see caller)."""
+    if row.get("info"):
+        document["info"] = json.loads(row["info"])
+
+    if entity != "cohorts":
+        return
+
+    document["cohortSize"] = int(row["cohortSize"])
+    event = document["collectionEvents"][0]
+    event["eventSize"] = int(row["collectionEvents|eventSize"])
+    for key in ("eventGenders", "eventDataTypes"):
+        prefix = f"collectionEvents|{key}"
+        event[key]["availabilityCount"] = int(row[f"{prefix}|availabilityCount"])
+        event[key]["distribution"] = json.loads(row[f"{prefix}|distribution"])
+
+
+def _ritools_model(entity: str):
+    """Return the RI-tools pydantic model that validates ``entity``."""
+    from validators.analyses import Analyses
+    from validators.cohorts import Cohorts
+    from validators.datasets import Datasets
+    from validators.individuals import Individuals
+    from validators.runs import Runs
+
+    return {
+        "datasets": Datasets,
+        "cohorts": Cohorts,
+        "individuals": Individuals,
+        "runs": Runs,
+        "analyses": Analyses,
+    }[entity]
+
+
 def validate_datasets_json(path: Path, dataset_id: str) -> None:
-    """Validate that datasets.json exists and contains the expected dataset id."""
+    """Validate datasets.json: expected dataset id and RI-tools Datasets model."""
     if not path.exists():
         raise FileNotFoundError(f"datasets.json was not created: {path}")
 
@@ -337,6 +482,19 @@ def validate_datasets_json(path: Path, dataset_id: str) -> None:
         raise ValueError(
             f"Dataset {dataset_id} was not found in generated datasets.json: {path}"
         )
+
+    model = _ritools_model("datasets")
+    for item in data:
+        try:
+            model(**{
+                key: value
+                for key, value in item.items()
+                if key != "_id" and value not in ("", None)
+            })
+        except ValueError as exc:
+            raise ValueError(
+                f"datasets '{item.get('id')}' is not valid for RI-tools: {exc}"
+            ) from exc
 
 
 if __name__ == "__main__":
