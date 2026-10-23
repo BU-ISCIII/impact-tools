@@ -78,10 +78,11 @@ class DatasetIngestConfig:
     granularity: str = "record"
     permissions_level: str | None = None
     permissions_email: str | None = None
-    duo_codes: tuple[str, ...] = ()
     output_dir: Path | None = None
     dry_run: bool = False
     generate_report: bool = True
+    metadata_dir: Path | None = None
+    duo_codes: tuple[str, ...] = ()
 
     @property
     def logs_dir(self) -> Path:
@@ -176,17 +177,61 @@ def render_datasets_csv(config: DatasetIngestConfig) -> str:
     # csv module avoids malformed CSV if name/description contain commas.
     from io import StringIO
 
-    output = StringIO()
-    writer = csv.DictWriter(output, fieldnames=["id", "name", "description"])
-    writer.writeheader()
-    writer.writerow(
+    fieldnames = ["id", "name", "description"]
+    row: dict[str, str] = {}
+
+    # Merge into the DRAGEN-derived datasets.csv from `beacon prepare-metadata`.
+    if config.metadata_dir is not None:
+        fieldnames, row = _read_metadata_row(config.metadata_dir / "datasets.csv")
+
+    row.update(
         {
             "id": config.dataset_id,
             "name": config.name,
             "description": config.description,
         }
     )
+
+    output = StringIO()
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerow(row)
     return output.getvalue()
+
+
+def _merge_metadata_cohorts_csv(
+    config: DatasetIngestConfig,
+    paths: BeaconIngestPaths,
+) -> Path:
+    """Write cohorts.csv: the DRAGEN cohort row with the dataset id and name."""
+    fieldnames, row = _read_metadata_row(config.metadata_dir / "cohorts.csv")
+    row.update({"id": config.dataset_id, "name": config.name})
+
+    target = paths.dataset_config_dir / "cohorts.csv"
+    with target.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerow(row)
+
+    return target
+
+
+def _read_metadata_row(metadata_csv: Path) -> tuple[list[str], dict[str, str]]:
+    """Return (columns, single row) of a `beacon prepare-metadata` CSV."""
+    if not metadata_csv.is_file():
+        raise FileNotFoundError(f"Metadata CSV not found: {metadata_csv}")
+
+    with metadata_csv.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        fieldnames = list(reader.fieldnames or [])
+
+    if len(rows) != 1 or not {"id", "name"} <= set(fieldnames):
+        raise ValueError(
+            f"Expected exactly one row with 'id' and 'name' columns in {metadata_csv}"
+        )
+
+    return fieldnames, rows[0]
 
 
 def prepare_dataset_artifacts(config: DatasetIngestConfig) -> DatasetIngestResult:
@@ -214,7 +259,27 @@ def prepare_dataset_artifacts(config: DatasetIngestConfig) -> DatasetIngestResul
     generated_files.append(paths.datasets_csv)
 
     generate_datasets_json(config, paths)
+    if config.duo_codes:
+        _merge_duo_into_datasets_json(paths.datasets_json, config.duo_codes)
     generated_files.append(paths.datasets_json)
+
+    if config.metadata_dir is not None:
+        cohorts_csv = _merge_metadata_cohorts_csv(config, paths)
+        generated_files.append(cohorts_csv)
+
+        for entity in ritools.METADATA_ENTITIES:
+            generated_files.append(
+                ritools.run_metadata_csv_to_bff(
+                    entity=entity,
+                    input_csv=(
+                        cohorts_csv
+                        if entity == "cohorts"
+                        else config.metadata_dir / f"{entity}.csv"
+                    ),
+                    output_dir=paths.dataset_config_dir,
+                    dataset_id=config.dataset_id,
+                )
+            )
 
     return DatasetIngestResult(
         dataset_id=config.dataset_id,
@@ -223,50 +288,54 @@ def prepare_dataset_artifacts(config: DatasetIngestConfig) -> DatasetIngestResul
     )
 
 
-def _inject_duo_into_datasets_json(
+def dataset_duo_terms(datasets_json: Path) -> list[dict[str, str]]:
+    """Return the DUO terms (dataUseConditions.duoDataUse) of datasets.json."""
+    if not datasets_json.is_file():
+        return []
+
+    documents = json.loads(datasets_json.read_text(encoding="utf-8"))
+
+    return [
+        term
+        for document in documents
+        for term in document.get("dataUseConditions", {}).get("duoDataUse", [])
+    ]
+
+
+def _merge_duo_into_datasets_json(
     datasets_json: Path,
     duo_codes: tuple[str, ...],
 ) -> None:
-    """Inject dataUseConditions.duoDataUse into the generated datasets.json.
+    """Merge --duo-code terms into datasets.json dataUseConditions.duoDataUse.
 
-    csv_to_bff generates the base document; DUO is added here because a
-    single CSV row cannot express a list of DUO objects (ri-tools emits one
-    document per row). Labels come from the embedded DUO_LABELS table.
+    csv_to_bff may already have produced duoDataUse entries from the
+    dataUseConditions|duoDataUse|* columns of datasets.csv. The CLI codes are
+    added on top, skipping any id already present, so both sources combine.
+    Labels come from the embedded DUO_LABELS table.
     """
     documents = json.loads(datasets_json.read_text(encoding="utf-8"))
 
-    duo_block = {
-        "duoDataUse": [
-            {"id": code, "label": DUO_LABELS[code], "version": DUO_VERSION}
-            for code in duo_codes
-        ]
-    }
+    cli_terms = [
+        {"id": code, "label": DUO_LABELS[code], "version": DUO_VERSION}
+        for code in duo_codes
+    ]
+
+    def _merge(doc: dict) -> None:
+        conditions = doc.setdefault("dataUseConditions", {})
+        existing = conditions.setdefault("duoDataUse", [])
+        present = {term.get("id") for term in existing}
+        existing.extend(term for term in cli_terms if term["id"] not in present)
 
     if isinstance(documents, list):
         for doc in documents:
-            doc["dataUseConditions"] = duo_block
+            _merge(doc)
     else:
-        documents["dataUseConditions"] = duo_block
+        _merge(documents)
 
     datasets_json.write_text(
         json.dumps(documents, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-
-
-def build_duo_filtering_terms(
-    duo_codes: tuple[str, ...],
-) -> list[dict[str, str]]:
-    """Build dataset-scoped DUO filtering terms for db.filtering_terms."""
-
-    return [
-        {
-            "id": code,
-            "label": DUO_LABELS[code],
-            "version": DUO_VERSION,
-        }
-        for code in duo_codes
-    ]
 
 
 def generate_datasets_json(
@@ -281,8 +350,6 @@ def generate_datasets_json(
         dataset_id=config.dataset_id,
     )
     ritools.run_csv_to_bff(csv_to_bff_cfg)
-    if config.duo_codes:
-        _inject_duo_into_datasets_json(paths.datasets_json, config.duo_codes)
     ritools.validate_datasets_json(paths.datasets_json, config.dataset_id)
 
 
@@ -345,7 +412,10 @@ def write_dataset_ingest_metrics(
             "granularity": config.granularity,
             "permissions_level": config.permissions_level,
             "permissions_email": config.permissions_email,
-            "duo_codes": list(config.duo_codes),
+            "duo_codes": [
+                term.get("id")
+                for term in dataset_duo_terms(result.paths.datasets_json)
+            ] if result is not None else [],
             "dry_run": config.dry_run,
         },
         "environment": {
@@ -457,6 +527,7 @@ def apply_dataset_to_remote(
         mongo_count_dataset,
         mongo_get_dataset_permissions,
         mongo_import_datasets,
+        mongo_replace_dataset_documents,
         mongo_set_dataset_flags,
         mongo_set_dataset_permissions,
         mongo_upsert_duo_filtering_terms,
@@ -541,11 +612,12 @@ def apply_dataset_to_remote(
         )
 
         duo_terms_changed = 0
+        duo_terms = dataset_duo_terms(paths.datasets_json)
 
-        if config.duo_codes:
+        if duo_terms:
             duo_terms_changed = mongo_upsert_duo_filtering_terms(
                 database,
-                build_duo_filtering_terms(config.duo_codes),
+                duo_terms,
             )
 
         LOGGER.info(
@@ -553,6 +625,15 @@ def apply_dataset_to_remote(
             config.dataset_id,
             duo_terms_changed,
         )
+
+        if config.metadata_dir is not None:
+            for entity in ritools.METADATA_ENTITIES:
+                mongo_replace_dataset_documents(
+                    database,
+                    entity,
+                    config.dataset_id,
+                    paths.dataset_config_dir / f"{entity}.json",
+                )
 
 
     with managed_beacon_api(deployment.api) as api_client:

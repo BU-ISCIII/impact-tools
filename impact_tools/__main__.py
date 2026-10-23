@@ -17,6 +17,7 @@ from impact_tools import __version__
 
 from impact_tools.beacon import ingest as beacon_ingest
 from impact_tools.beacon import liftover as beacon_liftover
+from impact_tools.beacon import metadata as beacon_metadata
 from impact_tools.beacon import pgx as beacon_pgx
 from impact_tools.beacon.config import build_beacon_deployment_config
 
@@ -1858,6 +1859,56 @@ def pgx_cmd(
             except Exception as metrics_exc:  # noqa: BLE001
                 log.warning("Could not write metrics: %s", metrics_exc)
 
+
+@beacon.command("prepare-metadata")
+@click.option(
+    "-i",
+    "--input-dir",
+    type=click.Path(path_type=Path, file_okay=False, exists=True),
+    required=True,
+    help="Directory containing one DRAGEN output folder per sample (<input-dir>/<sample_id>/).",
+)
+@click.option(
+    "--sample-list",
+    type=click.Path(path_type=Path, dir_okay=False, exists=True),
+    required=True,
+    help="Text file of sample identifiers, one per line.",
+)
+@click.option(
+    "-o",
+    "--output-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    required=True,
+    help="Directory where individuals/biosamples/runs/analyses CSVs are written.",
+)
+@click.pass_context
+def beacon_prepare_metadata_cmd(
+    ctx: click.Context,
+    input_dir: Path,
+    sample_list: Path,
+    output_dir: Path,
+) -> None:
+    """Build RI-tools metadata CSVs from DRAGEN germline output folders."""
+    configure_module_logging(ctx, "beacon_prepare_metadata")
+    try:
+        result = beacon_metadata.prepare_metadata(
+            beacon_metadata.PrepareMetadataConfig(
+                input_dir=input_dir,
+                sample_list=sample_list,
+                output_dir=output_dir,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - CLI boundary
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Samples: {result.sample_count}")
+    click.echo(f"Datasets: {result.datasets}")
+    click.echo(f"Cohorts: {result.cohorts}")
+    click.echo(f"Individuals: {result.individuals}")
+    click.echo(f"Biosamples: {result.biosamples}")
+    click.echo(f"Runs: {result.runs}")
+    click.echo(f"Analyses: {result.analyses}")
+
+
 @beacon.group("ingest")
 @click.option(
     "--run-profile",
@@ -1892,7 +1943,7 @@ def beacon_ingest_group(
     "duo_codes",
     multiple=True,
     help="Data Use Ontology code for dataUseConditions, e.g. DUO:0000042. "
-         "Repeatable. Optional. Labels resolved automatically.",
+         "Optional. Combined with any DUO terms in the datasets.csv.",
 )
 @click.option(
     "--ref-genome",
@@ -1959,6 +2010,14 @@ def beacon_ingest_group(
     help="Directory for metrics and logs (default: <base-dir>/logs/).",
 )
 @click.option(
+    "--metadata-dir",
+    type=click.Path(path_type=Path, file_okay=False, exists=True),
+    default=None,
+    help=(
+        "Directory with individuals/runs/analyses CSVs for the dataset."
+    ),
+)
+@click.option(
     "--dry-run",
     is_flag=True,
     help="Discover artifacts without writing files.",
@@ -1974,15 +2033,16 @@ def ingest_dataset_cmd(
     dataset_id: str | None,
     name: str | None,
     description: str | None,
+    duo_codes: tuple[str, ...],
     reference_genome: str | None,
     permissions_level: str | None,
     permissions_email: str | None,
-    duo_codes: tuple[str, ...],
     is_test: str | None,
     is_synthetic: bool | None,
     base_dir: Path,
     granularity: str,
     output_dir: Path | None,
+    metadata_dir: Path | None,
     dry_run: bool,
     no_report: bool,
 ) -> None:
@@ -2005,11 +2065,7 @@ def ingest_dataset_cmd(
         else:
             description = ""
 
-    duo_codes = tuple(
-        code.strip().upper()
-        for code in duo_codes
-    )
-
+    duo_codes = tuple(code.strip().upper() for code in duo_codes)
     for code in duo_codes:
         if code not in beacon_ingest.DUO_LABELS:
             raise click.UsageError(
@@ -2056,10 +2112,11 @@ def ingest_dataset_cmd(
         granularity=granularity,
         permissions_level=permissions_level,
         permissions_email=permissions_email,
-        duo_codes=duo_codes,
         output_dir=output_dir.resolve() if output_dir is not None else None,
         dry_run=dry_run,
         generate_report=(not no_report and not dry_run),
+        metadata_dir=metadata_dir.resolve() if metadata_dir is not None else None,
+        duo_codes=duo_codes,
     )
 
     try:
